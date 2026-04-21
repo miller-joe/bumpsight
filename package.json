@@ -1,0 +1,58 @@
+{
+  "name": "bumpsight",
+  "version": "0.0.1",
+  "description": "Docker image update advisor for self-hosters. Lints your compose files, checks for new image tags, and summarizes breaking changes in upstream release notes using a local LLM.",
+  "license": "MIT",
+  "author": "Joe Miller <joe@indivision.net> (https://github.com/miller-joe)",
+  "type": "module",
+  "bin": {
+    "bumpsight": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx src/cli.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/miller-joe/bumpsight.git"
+  },
+  "bugs": {
+    "url": "https://github.com/miller-joe/bumpsight/issues"
+  },
+  "homepage": "https://github.com/miller-joe/bumpsight#readme",
+  "keywords": [
+    "docker",
+    "docker-compose",
+    "homelab",
+    "selfhosted",
+    "cli",
+    "linter",
+    "watchtower",
+    "diun",
+    "container",
+    "updates",
+    "llm",
+    "ollama"
+  ]
+}
