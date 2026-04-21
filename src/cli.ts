@@ -9,28 +9,39 @@ const HELP = `bumpsight — Docker image update advisor for self-hosters
 Usage:
   bumpsight doctor  <compose-file>   Lint a docker-compose file for common
                                      homelab anti-patterns.
-  bumpsight scan    <compose-file>   List the images referenced by a
-                                     compose file. Remote tag-freshness
-                                     lookup is coming in 0.1.
-  bumpsight advise  <image>          Summarize breaking changes between
-                                     two image tags using a local LLM.
-                                     (shipping in 0.1)
+  bumpsight scan    <compose-file>   List images and check Docker Hub / GHCR
+                                     for newer tags in the same family.
+  bumpsight advise  <image> --to <tag> [--from <tag>]
+                                     Summarize breaking changes between two
+                                     image tags using a local LLM (Ollama).
 
-Options:
+Shared options:
   --json                   Output as JSON instead of text.
+  --offline                scan: skip the remote tag lookup.
+  --timeout <ms>           Per-image network timeout (default 8000).
   -h, --help               Show this help.
   -v, --version            Print the installed version.
 
+advise-specific options:
+  --to <tag>               Target tag (required).
+  --from <tag>             Current tag. Defaults to the tag in <image>.
+  --repo <owner>/<name>    Override upstream GitHub repo mapping.
+  --compose <file>         Compose file, so advise knows your service config.
+  --service <name>         Compose service name for --compose context.
+  --ollama-host <url>      Ollama base URL (default: http://127.0.0.1:11434
+                           or $OLLAMA_HOST).
+  --model <name>           Ollama model (default: llama3.2 or
+                           $BUMPSIGHT_MODEL).
+  --github-token <token>   GitHub API token (or $GITHUB_TOKEN).
+
 Examples:
   bumpsight doctor compose.yaml
-  bumpsight scan /mnt/ramjet/docker/stacks/jellyfin/compose.yaml --json
+  bumpsight scan compose.yaml
+  bumpsight advise linuxserver/sonarr:4.0.14 --to 4.1.0 \\
+    --compose compose.yaml --service sonarr
 `;
 
-function version(): string {
-  // Replaced at build time by consumers; for now we print a static placeholder
-  // so CI doesn't need a separate step.
-  return "0.0.1";
-}
+const VERSION = "0.1.0";
 
 async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
@@ -40,6 +51,16 @@ async function main(argv: string[]): Promise<number> {
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
       json: { type: "boolean" },
+      offline: { type: "boolean" },
+      timeout: { type: "string" },
+      to: { type: "string" },
+      from: { type: "string" },
+      repo: { type: "string" },
+      compose: { type: "string" },
+      service: { type: "string" },
+      "ollama-host": { type: "string" },
+      model: { type: "string" },
+      "github-token": { type: "string" },
     },
   });
 
@@ -48,12 +69,13 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (values.version) {
-    process.stdout.write(version() + "\n");
+    process.stdout.write(VERSION + "\n");
     return 0;
   }
 
   const [sub, ...rest] = positionals;
   const format: "text" | "json" = values.json ? "json" : "text";
+  const timeoutMs = values.timeout ? Number(values.timeout) : undefined;
 
   switch (sub) {
     case "doctor": {
@@ -72,7 +94,12 @@ async function main(argv: string[]): Promise<number> {
         process.stderr.write("bumpsight scan: missing <compose-file>\n");
         return 2;
       }
-      const { exitCode, output } = runScan({ file, format });
+      const { exitCode, output } = await runScan({
+        file,
+        format,
+        offline: values.offline,
+        timeoutMs,
+      });
       process.stdout.write(output);
       return exitCode;
     }
@@ -82,7 +109,19 @@ async function main(argv: string[]): Promise<number> {
         process.stderr.write("bumpsight advise: missing <image>\n");
         return 2;
       }
-      const { exitCode, output } = runAdvise({ image, format });
+      const { exitCode, output } = await runAdvise({
+        image,
+        from: values.from,
+        to: values.to,
+        repo: values.repo,
+        composeFile: values.compose,
+        serviceName: values.service,
+        ollamaHost: values["ollama-host"],
+        model: values.model,
+        githubToken: values["github-token"],
+        format,
+        timeoutMs,
+      });
       process.stdout.write(output);
       return exitCode;
     }
