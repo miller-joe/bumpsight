@@ -2,33 +2,32 @@
 
 All notable changes to bumpsight are documented here.
 
-## Unreleased — v0.2 foundation
+## Unreleased — v0.2
 
-Daemon-mode foundation. Apply step + HTTP approve/deny + Docker image are landing in a follow-up commit before the v0.2.0 tag.
+Daemon-mode release. Watchtower-replacement scope.
 
 ### Added
 
-- **`bumpsight daemon`** subcommand: long-lived process that periodically rescans configured compose files, classifies new tags as `patch` / `minor` / `major` / `unknown` against the same family detection used by `scan`, and routes each bump through a per-stack policy.
-- **Auto-apply policy engine** (`patch` / `minor` / `major` / `notify` / `none`) configurable globally via `--auto-apply` / `BUMPSIGHT_AUTO_APPLY` and per-stack via a `/config/bumpsight.yaml` file. Unknown bumps are always held for human approval, regardless of policy.
-- **SQLite state layer** (`better-sqlite3`) tracking every discovered bump through the `pending → notified → approved/denied → applied/failed` lifecycle. Idempotent on rescans — repeat discoveries don't duplicate rows or re-spam notifications.
+- **`bumpsight daemon`** subcommand: long-lived process that periodically rescans configured compose files, classifies new tags as `patch` / `minor` / `major` / `unknown`, and routes each through a per-stack policy.
+- **Auto-apply policy engine** (`patch` / `minor` / `major` / `notify` / `none`) — global default + per-stack overrides via `/config/bumpsight.yaml`. Unknown bumps are always held for human approval regardless of policy.
+- **Compose-file rewriter** that swaps only the tag of the targeted service via the yaml CST API, preserving comments, formatting, and other services. Race-safe — refuses to rewrite when the on-disk tag has drifted from what was scanned.
+- **`docker compose pull` + `up -d`** apply step running against the host's Docker socket. Combined output captured into the apply log.
+- **Approve / deny HTTP server** (port 9100 by default): GET `/approve/<token>` marks approved + kicks off apply in the background; GET `/deny/<token>` marks denied. Idempotent on re-clicks. Tokens are 24-byte random strings stored alongside each pending update.
+- **SQLite state layer** (`better-sqlite3`) tracking every discovered bump through the `pending → notified → approved/denied → applied/failed` lifecycle. Idempotent on rescans.
 - **Notifier framework** with two drivers shipped:
-    - **SMTP** via nodemailer (`smtp://` and `smtps://` URIs) — username/password, multiple `?to=` recipients, plain-text body.
-    - **Apprise** via HTTP POST to an existing apprise-api endpoint (`apprise://` and `apprises://` URIs) — Markdown-formatted body, inherits Apprise's 70+ channels (Discord, ntfy, Slack, Gotify, …) without bringing them into the bumpsight container.
-    - Multiple notifiers via comma-separated `--notify` / `BUMPSIGHT_NOTIFY` URIs.
+    - **SMTP** / **SMTPS** via nodemailer — `?to=` (multiple recipients), `?from=` required.
+    - **Apprise** via HTTP POST to an existing apprise-api endpoint (`apprise://` / `apprises://`). Inherits Apprise's 70+ channels without embedding them in bumpsight.
+    - Comma-separated stacking via `BUMPSIGHT_NOTIFY`. Per-channel failures don't block delivery to the others.
+- **Approve / deny links** are embedded directly in held notifications when `BUMPSIGHT_PUBLIC_URL` is set.
+- **GHCR image** `ghcr.io/miller-joe/bumpsight` built for `linux/amd64` and `linux/arm64`, published on every `v*` tag push by the new release workflow.
+- **Dockerfile** — multi-stage build, `node:20-alpine` runtime with `docker-cli` + `docker-cli-compose` so the daemon can shell out to `docker compose` against the mounted host socket. `tini` for signal forwarding.
 - **`--once`** flag for daemon — single scan pass; useful for cron-driven setups and tests.
 - **Duration parser** for human-friendly intervals (`30s`, `10m`, `6h`, `1d`).
+- **README rewrite** that leads with the daemon drop-in.
 
 ### Changed
 
 - `--version` now actually prints the version when called without a subcommand (previously fell through to help).
-
-### Coming in v0.2.0
-
-- Docker-socket integration to actually `compose pull && up -d` for queued auto-applies and approved holds.
-- HTTP server with signed approve/deny URLs, embedded in approval emails.
-- Docker image (GHCR) published on tag push, with a single drop-in compose snippet.
-- Weekly digest report (applied / pending / failed) via the same notifier list.
-- README rewrite reflecting the daemon-mode workflow.
 
 ## 0.1.0 — 2026-04-21
 

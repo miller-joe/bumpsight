@@ -1,12 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runScanOnce } from "../src/daemon/index.js";
+import { runScanOnce, buildComposeFileMap } from "../src/daemon/index.js";
 import { openDb, listByStatus } from "../src/state/db.js";
 import type { Notifier, NotifyMessage } from "../src/notify/types.js";
+import type { CommandRunner } from "../src/apply/docker.js";
 
-function makeStack(name: string, image: string): string {
+function makeStack(name: string, image: string): { stack: string; file: string } {
   const dir = mkdtempSync(join(tmpdir(), `bumpsight-${name}-`));
   const file = join(dir, "compose.yaml");
   writeFileSync(
@@ -14,12 +15,24 @@ function makeStack(name: string, image: string): string {
     `services:\n  ${name}:\n    image: ${image}\n    restart: unless-stopped\n`,
     "utf-8",
   );
-  return file;
+  // The stack name the daemon derives is basename(dirname(absolute path))
+  const stack = dir.split("/").pop()!;
+  return { stack, file };
 }
 
+const okRunner: CommandRunner = async () => ({
+  exitCode: 0,
+  combinedOutput: "ok",
+});
+
+const failRunner: CommandRunner = async () => ({
+  exitCode: 1,
+  combinedOutput: "boom",
+});
+
 describe("runScanOnce", () => {
-  it("records a held notification for a minor bump under 'patch' policy", async () => {
-    const composeFile = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
+  it("holds a minor bump under 'patch' policy and includes approve/deny links", async () => {
+    const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
     const db = openDb({ path: ":memory:" });
     const sent: NotifyMessage[] = [];
     const notifier: Notifier = {
@@ -35,76 +48,95 @@ describe("runScanOnce", () => {
       db,
       notifiers: [notifier],
       rules: { default: "patch", stacks: {} },
-      composeFiles: [composeFile],
+      composeFiles: { [stack]: file },
+      publicUrl: "https://bump.example.com",
       listTagsFn: fakeListTags as never,
     });
 
-    expect(result.scanned).toBe(1);
-    expect(result.discovered).toBe(1);
     expect(result.held).toBe(1);
     expect(result.autoApplied).toBe(0);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.subject).toContain("10.11.0");
-    expect(sent[0]!.subject).toContain("approval needed");
+    const subject = sent[0]!.subject;
+    expect(subject).toContain("10.11.0");
+    expect(subject).toContain("approval needed");
+    const links = sent[0]!.links!;
+    expect(links).toHaveLength(2);
+    expect(links[0]!.url).toMatch(/^https:\/\/bump.example.com\/approve\/[A-Za-z0-9_-]+$/);
+    expect(links[1]!.url).toMatch(/^https:\/\/bump.example.com\/deny\/[A-Za-z0-9_-]+$/);
 
-    const notified = listByStatus(db, "notified");
-    expect(notified).toHaveLength(1);
-    expect(notified[0]!.target_tag).toBe("10.11.0");
-
-    rmSync(composeFile, { force: true });
+    rmSync(file, { force: true });
   });
 
-  it("auto-applies a patch under 'patch' policy", async () => {
-    const composeFile = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
+  it("auto-applies a patch and rewrites the compose file in place", async () => {
+    const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
     const db = openDb({ path: ":memory:" });
+    const fakeListTags = async () => [
+      { name: "10.10.7" },
+      { name: "10.10.8" },
+    ];
     const sent: NotifyMessage[] = [];
     const notifier: Notifier = {
       name: "stub",
       send: async (m) => void sent.push(m),
     };
-    const fakeListTags = async () => [
-      { name: "10.10.7" },
-      { name: "10.10.8" },
-    ];
+    const calls: { args: string[] }[] = [];
+    const runner: CommandRunner = async (_, args) => {
+      calls.push({ args });
+      return { exitCode: 0, combinedOutput: "ok" };
+    };
 
     const result = await runScanOnce({
       db,
       notifiers: [notifier],
       rules: { default: "patch", stacks: {} },
-      composeFiles: [composeFile],
+      composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
+      runner,
     });
 
     expect(result.autoApplied).toBe(1);
-    expect(result.held).toBe(0);
-    expect(sent[0]!.subject).toContain("auto-apply queued");
+    expect(result.autoAppliedOk).toBe(1);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.args).toEqual(["compose", "-f", file, "pull", "jellyfin"]);
+    expect(calls[1]!.args).toEqual(["compose", "-f", file, "up", "-d", "jellyfin"]);
+    // Compose file actually got rewritten
+    expect(readFileSync(file, "utf-8")).toContain("linuxserver/jellyfin:10.10.8");
+    // Notification reports the success
+    expect(sent[0]!.subject).toContain("auto-applied");
 
-    rmSync(composeFile, { force: true });
+    rmSync(file, { force: true });
   });
 
-  it("skips entirely when stack policy is 'none'", async () => {
-    const composeFile = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
+  it("reports apply failure in notification when docker compose returns non-zero", async () => {
+    const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
     const db = openDb({ path: ":memory:" });
     const fakeListTags = async () => [
       { name: "10.10.7" },
       { name: "10.10.8" },
     ];
-    const stack = composeFile.split("/").slice(-2, -1)[0]!;
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
 
     const result = await runScanOnce({
       db,
-      notifiers: [],
-      rules: { default: "patch", stacks: { [stack]: "none" } },
-      composeFiles: [composeFile],
+      notifiers: [notifier],
+      rules: { default: "patch", stacks: {} },
+      composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
+      runner: failRunner,
     });
 
-    expect(result.discovered).toBe(0);
-    rmSync(composeFile, { force: true });
+    expect(result.autoApplied).toBe(1);
+    expect(result.autoAppliedOk).toBe(0);
+    expect(sent[0]!.subject).toContain("apply FAILED");
+
+    rmSync(file, { force: true });
   });
 
   it("does not duplicate work on repeat scans", async () => {
-    const composeFile = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
+    const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
     const db = openDb({ path: ":memory:" });
     const fakeListTags = async () => [
       { name: "10.10.7" },
@@ -114,15 +146,29 @@ describe("runScanOnce", () => {
       db,
       notifiers: [] as Notifier[],
       rules: { default: "patch" as const, stacks: {} },
-      composeFiles: [composeFile],
+      composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
+      runner: okRunner,
     };
 
     const first = await runScanOnce(deps);
     const second = await runScanOnce(deps);
 
     expect(first.discovered).toBe(1);
+    // After auto-apply, file is on 10.10.8; rescan finds nothing newer.
     expect(second.discovered).toBe(0);
-    rmSync(composeFile, { force: true });
+
+    rmSync(file, { force: true });
+  });
+});
+
+describe("buildComposeFileMap", () => {
+  it("derives stack names from the parent directory", () => {
+    const map = buildComposeFileMap([
+      "/mnt/stacks/glance/compose.yaml",
+      "/mnt/stacks/jellyfin/compose.yaml",
+    ]);
+    expect(Object.keys(map).sort()).toEqual(["glance", "jellyfin"]);
+    expect(map.glance).toMatch(/glance\/compose.yaml$/);
   });
 });

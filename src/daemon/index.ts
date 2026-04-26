@@ -14,15 +14,19 @@ import {
   type UpdateRow,
 } from "../state/db.js";
 import { notifyAll } from "../notify/index.js";
-import type { Notifier, NotifyMessage } from "../notify/types.js";
+import type { Notifier, NotifyMessage, NotifyLink } from "../notify/types.js";
+import { applyOne } from "../apply/index.js";
+import type { CommandRunner } from "../apply/docker.js";
 
 export interface ScanRunResult {
   /** Number of services examined across all compose files. */
   scanned: number;
   /** Number of new bumps discovered (not seen in DB before). */
   discovered: number;
-  /** Number of bumps queued for auto-apply. */
+  /** Number of bumps that auto-apply ran on. */
   autoApplied: number;
+  /** Number of auto-applies that succeeded. */
+  autoAppliedOk: number;
   /** Number of bumps held for human approval. */
   held: number;
   /** Errors encountered, keyed by image ref. */
@@ -33,17 +37,21 @@ export interface ScanRunDeps {
   db: DB;
   notifiers: Notifier[];
   rules: RulesConfig;
-  composeFiles: string[];
-  /** For tests: inject a tag lister. Defaults to the real registry client. */
+  /** Stack → compose file path. */
+  composeFiles: Record<string, string>;
+  /** Optional base URL for approve/deny links inside notifications. */
+  publicUrl?: string;
+  /** Test seam — defaults to the real registry client. */
   listTagsFn?: typeof listTags;
-  /** For tests: inject a clock. Defaults to Date.now. */
-  now?: () => number;
+  /** Test seam — defaults to the real spawn-based docker runner. */
+  runner?: CommandRunner;
 }
 
 /**
- * One pass of the daemon: scan every configured compose file, record any
- * new bumps in the DB, dispatch hold-for-approval notifications, and
- * leave auto-applies queued for the apply loop (Phase B).
+ * One pass of the daemon: scan every configured compose file, record
+ * any new bumps, dispatch hold-for-approval notifications with embedded
+ * approve/deny links, and run apply inline for matches that fall under
+ * the auto-apply policy.
  */
 export async function runScanOnce(
   deps: ScanRunDeps,
@@ -52,13 +60,13 @@ export async function runScanOnce(
     scanned: 0,
     discovered: 0,
     autoApplied: 0,
+    autoAppliedOk: 0,
     held: 0,
     errors: {},
   };
   const lister = deps.listTagsFn ?? listTags;
 
-  for (const composePath of deps.composeFiles) {
-    const stack = stackNameFromPath(composePath);
+  for (const [stack, composePath] of Object.entries(deps.composeFiles)) {
     let compose: ReturnType<typeof loadComposeFile>;
     try {
       compose = loadComposeFile(composePath);
@@ -99,28 +107,29 @@ export async function runScanOnce(
         image: ref.raw,
         currentTag: ref.tag,
         targetTag: latest,
-        family: undefined,
         bump,
         approvalToken: token,
       });
 
       const row = findUpdate(deps.db, id);
-      if (!row || row.status !== "pending") {
-        // Already seen and decided — don't re-spam.
-        continue;
-      }
+      if (!row || row.status !== "pending") continue;
       result.discovered += 1;
 
       if (decision === "auto-apply") {
         result.autoApplied += 1;
-        // Apply step lands in Phase B. For now we leave the row pending and
-        // let a human or the future apply loop pick it up. We still send a
-        // courtesy notification so the admin sees what's queued.
-        await dispatchHoldNotification(deps.notifiers, row, "auto-apply queued");
-        setNotified(deps.db, row.id);
+        const after = await applyOne(
+          {
+            db: deps.db,
+            composeFiles: deps.composeFiles,
+            runner: deps.runner,
+          },
+          row.id,
+        );
+        if (after.status === "applied") result.autoAppliedOk += 1;
+        await dispatchAppliedNotification(deps.notifiers, after);
       } else {
         result.held += 1;
-        await dispatchHoldNotification(deps.notifiers, row, "approval needed");
+        await dispatchHoldNotification(deps.notifiers, row, deps.publicUrl);
         setNotified(deps.db, row.id);
       }
     }
@@ -128,32 +137,60 @@ export async function runScanOnce(
   return result;
 }
 
-function stackNameFromPath(path: string): string {
-  return basename(dirname(resolve(path)));
+function buildLinks(row: UpdateRow, publicUrl?: string): NotifyLink[] {
+  if (!publicUrl || !row.approval_token) return [];
+  const base = publicUrl.replace(/\/+$/, "");
+  return [
+    { label: "Approve", url: `${base}/approve/${row.approval_token}` },
+    { label: "Deny", url: `${base}/deny/${row.approval_token}` },
+  ];
 }
 
 async function dispatchHoldNotification(
   notifiers: Notifier[],
   row: UpdateRow,
-  banner: string,
+  publicUrl?: string,
 ): Promise<void> {
   if (notifiers.length === 0) return;
-  const msg: NotifyMessage = {
-    subject: `[bumpsight] ${row.stack}/${row.service}: ${row.image} → ${row.target_tag} (${row.bump}, ${banner})`,
-    body: [
-      `Stack:   ${row.stack}`,
-      `Service: ${row.service}`,
-      `Image:   ${row.image}`,
-      `From:    ${row.current_tag}`,
-      `To:      ${row.target_tag}`,
-      `Kind:    ${row.bump} bump`,
-      ``,
-      banner === "approval needed"
-        ? `This bump is held for approval. Approve / deny links arrive in v0.3 (HTTP approval server).`
-        : `This bump matches your auto-apply policy and will be applied by the apply loop (v0.3).`,
-    ].join("\n"),
-  };
-  await notifyAll(notifiers, msg);
+  const subject = `[bumpsight] ${row.stack}/${row.service}: ${row.image} → ${row.target_tag} (${row.bump} — approval needed)`;
+  const body = [
+    `Stack:   ${row.stack}`,
+    `Service: ${row.service}`,
+    `Image:   ${row.image}`,
+    `From:    ${row.current_tag}`,
+    `To:      ${row.target_tag}`,
+    `Kind:    ${row.bump} bump`,
+    ``,
+    publicUrl
+      ? `Click Approve to pull + restart, or Deny to leave the stack on its current tag.`
+      : `Approval URLs are not configured (set BUMPSIGHT_PUBLIC_URL).`,
+  ].join("\n");
+  await notifyAll(notifiers, {
+    subject,
+    body,
+    links: buildLinks(row, publicUrl),
+  });
+}
+
+async function dispatchAppliedNotification(
+  notifiers: Notifier[],
+  row: UpdateRow,
+): Promise<void> {
+  if (notifiers.length === 0) return;
+  const banner = row.status === "applied" ? "auto-applied" : "apply FAILED";
+  const subject = `[bumpsight] ${row.stack}/${row.service}: ${row.image} → ${row.target_tag} (${row.bump} — ${banner})`;
+  const body = [
+    `Stack:   ${row.stack}`,
+    `Service: ${row.service}`,
+    `From:    ${row.current_tag}`,
+    `To:      ${row.target_tag}`,
+    `Status:  ${row.status}`,
+    ``,
+    row.apply_log ? `Last log:\n${row.apply_log}` : ``,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  await notifyAll(notifiers, { subject, body });
 }
 
 export interface DaemonRuntime {
@@ -161,16 +198,24 @@ export interface DaemonRuntime {
   stop(): Promise<void>;
 }
 
+export interface StartDaemonDeps {
+  db: DB;
+  notifiers: Notifier[];
+  composeFiles: Record<string, string>;
+  publicUrl?: string;
+  log: (msg: string) => void;
+  /** Test seams. */
+  listTagsFn?: typeof listTags;
+  runner?: CommandRunner;
+}
+
 /**
  * Start the daemon scheduler. Invokes runScanOnce immediately and then
- * every `intervalMs`. Reports progress via the `log` callback so the
- * caller can route to stdout, journal, etc.
+ * every `intervalMs`. Reports progress via the `log` callback.
  */
 export function startDaemon(
   cfg: DaemonConfig,
-  deps: Omit<ScanRunDeps, "composeFiles" | "rules"> & {
-    log: (msg: string) => void;
-  },
+  deps: StartDaemonDeps,
 ): DaemonRuntime {
   let stopping = false;
   let inFlight: Promise<void> = Promise.resolve();
@@ -185,13 +230,15 @@ export function startDaemon(
           db: deps.db,
           notifiers: deps.notifiers,
           rules: cfg.rules,
-          composeFiles: cfg.composeFiles,
+          composeFiles: deps.composeFiles,
+          publicUrl: deps.publicUrl,
           listTagsFn: deps.listTagsFn,
-          now: deps.now,
+          runner: deps.runner,
         });
         const ms = Date.now() - started;
         deps.log(
-          `scan: ${result.scanned} services, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held), ${ms}ms`,
+          `scan: ${result.scanned} services, ${result.discovered} new ` +
+            `(${result.autoApplied} auto, ${result.autoAppliedOk} applied ok, ${result.held} held), ${ms}ms`,
         );
         for (const [k, v] of Object.entries(result.errors)) {
           deps.log(`scan-error: ${k}: ${v}`);
@@ -215,4 +262,13 @@ export function startDaemon(
       await inFlight;
     },
   };
+}
+
+export function buildComposeFileMap(paths: string[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const p of paths) {
+    const stack = basename(dirname(resolve(p)));
+    map[stack] = resolve(p);
+  }
+  return map;
 }

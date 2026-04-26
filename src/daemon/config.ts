@@ -13,6 +13,13 @@ export interface DaemonConfig {
   notifyUris: string[];
   /** Bump policy. */
   rules: RulesConfig;
+  /** Bind port for the approve/deny HTTP server. */
+  httpPort: number;
+  /** Bind interface for the HTTP server (default 0.0.0.0). */
+  httpHost: string;
+  /** Public-facing base URL embedded in approve/deny links inside notifications.
+   *  When unset, links are omitted from notifications. */
+  publicUrl?: string;
   /** Optional Ollama base URL for advise; if unset advise is skipped. */
   ollamaHost?: string;
   /** Ollama model name when advise runs. */
@@ -26,6 +33,9 @@ export interface FileConfigShape {
   interval?: string;
   db_path?: string;
   notify?: string[];
+  http_port?: number;
+  http_host?: string;
+  public_url?: string;
   ollama?: { host?: string; model?: string };
 }
 

@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { startDaemon } from "../daemon/index.js";
+import { startDaemon, runScanOnce, buildComposeFileMap } from "../daemon/index.js";
 import {
   buildRulesConfig,
   loadConfigFile,
@@ -8,6 +8,7 @@ import {
 import { parseDuration } from "../util/duration.js";
 import { openDb } from "../state/db.js";
 import { buildNotifiers, parseNotifyEnv } from "../notify/index.js";
+import { startHttpServer } from "../server/http.js";
 
 export interface DaemonCliOptions {
   /** Path to the daemon config file. Defaults to /config/bumpsight.yaml. */
@@ -63,12 +64,23 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     opts.autoApply ?? process.env.BUMPSIGHT_AUTO_APPLY,
   );
 
+  const httpPort = Number(
+    process.env.BUMPSIGHT_HTTP_PORT ?? fileShape.http_port ?? 9100,
+  );
+  const httpHost =
+    process.env.BUMPSIGHT_HTTP_HOST ?? fileShape.http_host ?? "0.0.0.0";
+  const publicUrl =
+    process.env.BUMPSIGHT_PUBLIC_URL ?? fileShape.public_url ?? undefined;
+
   const cfg: DaemonConfig = {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
     intervalMs,
     notifyUris,
     rules,
+    httpPort,
+    httpHost,
+    publicUrl,
     ollamaHost: fileShape.ollama?.host ?? process.env.OLLAMA_HOST,
     ollamaModel: fileShape.ollama?.model ?? process.env.BUMPSIGHT_MODEL,
   };
@@ -77,20 +89,22 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
   const notifiers = buildNotifiers(cfg.notifyUris);
   const log = (msg: string) =>
     process.stdout.write(`[${new Date().toISOString()}] ${msg}\n`);
+  const composeMap = buildComposeFileMap(cfg.composeFiles);
 
   log(
     `daemon starting: ${cfg.composeFiles.length} compose file(s), ` +
       `interval=${intervalRaw}, notifiers=${notifiers.length}, ` +
-      `default=${cfg.rules.default}, db=${cfg.dbPath}`,
+      `default=${cfg.rules.default}, db=${cfg.dbPath}, ` +
+      `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}`,
   );
 
   if (opts.once) {
-    const { runScanOnce } = await import("../daemon/index.js");
     const result = await runScanOnce({
       db,
       notifiers,
       rules: cfg.rules,
-      composeFiles: cfg.composeFiles,
+      composeFiles: composeMap,
+      publicUrl: cfg.publicUrl,
     });
     log(
       `scan: ${result.scanned} services, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held)`,
@@ -102,11 +116,26 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     return 0;
   }
 
-  const runtime = startDaemon(cfg, { db, notifiers, log });
+  const httpHandle = await startHttpServer({
+    db,
+    composeFiles: composeMap,
+    port: cfg.httpPort,
+    host: cfg.httpHost,
+    log,
+  });
+
+  const runtime = startDaemon(cfg, {
+    db,
+    notifiers,
+    composeFiles: composeMap,
+    publicUrl: cfg.publicUrl,
+    log,
+  });
 
   const shutdown = async (signal: string) => {
     log(`received ${signal}, draining…`);
     await runtime.stop();
+    await httpHandle.stop();
     db.close();
     process.exit(0);
   };

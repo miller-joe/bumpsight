@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.github
+*.log
+.env
+.env.local
+test
+coverage
+.vscode
+.idea
+*.md
+!README.md
+!CHANGELOG.md
+!LICENSE
