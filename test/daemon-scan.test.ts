@@ -56,8 +56,10 @@ describe("runScanOnce", () => {
     expect(result.held).toBe(1);
     expect(result.autoApplied).toBe(0);
     const subject = sent[0]!.subject;
+    expect(subject).toContain("linuxserver/jellyfin:10.10.7");
     expect(subject).toContain("10.11.0");
-    expect(subject).toContain("approval needed");
+    expect(sent[0]!.body).toContain("Click Approve to pull");
+    expect(sent[0]!.body).toContain("Kind:    minor bump");
     const links = sent[0]!.links!;
     expect(links).toHaveLength(2);
     expect(links[0]!.url).toMatch(/^https:\/\/bump.example.com\/approve\/[A-Za-z0-9_-]+$/);
@@ -100,8 +102,8 @@ describe("runScanOnce", () => {
     expect(calls[1]!.args).toEqual(["compose", "-f", file, "up", "-d", "jellyfin"]);
     // Compose file actually got rewritten
     expect(readFileSync(file, "utf-8")).toContain("linuxserver/jellyfin:10.10.8");
-    // Notification reports the success
-    expect(sent[0]!.subject).toContain("auto-applied");
+    // Notification reports the success in the body
+    expect(sent[0]!.body).toContain("Status:  applied");
 
     rmSync(file, { force: true });
   });
@@ -130,7 +132,7 @@ describe("runScanOnce", () => {
 
     expect(result.autoApplied).toBe(1);
     expect(result.autoAppliedOk).toBe(0);
-    expect(sent[0]!.subject).toContain("apply FAILED");
+    expect(sent[0]!.body).toContain("Status:  failed");
 
     rmSync(file, { force: true });
   });

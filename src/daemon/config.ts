@@ -20,10 +20,13 @@ export interface DaemonConfig {
   /** Public-facing base URL embedded in approve/deny links inside notifications.
    *  When unset, links are omitted from notifications. */
   publicUrl?: string;
-  /** Optional Ollama base URL for advise; if unset advise is skipped. */
-  ollamaHost?: string;
-  /** Ollama model name when advise runs. */
-  ollamaModel?: string;
+  /** OpenAI-compatible LLM endpoint URL (ends in /v1). When unset, advise is skipped.
+   *  Works with Ollama (built-in OpenAI compat) and LiteLLM. */
+  llmUrl?: string;
+  /** Optional bearer token for the LLM endpoint. Required for LiteLLM, OpenAI, etc. */
+  llmKey?: string;
+  /** Model name to send. For Ollama: e.g. `qwen2.5:14b-instruct`. For LiteLLM: an alias like `smart`. */
+  llmModel?: string;
   /** Optional GitHub token used by advise to fetch upstream release notes
    *  without hitting the unauthenticated-rate-limit. */
   githubToken?: string;

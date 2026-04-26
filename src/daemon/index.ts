@@ -42,10 +42,12 @@ export interface ScanRunDeps {
   composeFiles: Record<string, string>;
   /** Optional base URL for approve/deny links inside notifications. */
   publicUrl?: string;
-  /** Optional Ollama base URL. When set, held-bump emails get LLM advise. */
-  ollamaHost?: string;
-  /** Ollama model used for advise. Defaults to the advise-CLI default. */
-  ollamaModel?: string;
+  /** Optional OpenAI-compat LLM URL (Ollama /v1 or LiteLLM). When set, held-bump emails get LLM advise. */
+  llmUrl?: string;
+  /** Optional bearer token for the LLM endpoint. */
+  llmKey?: string;
+  /** Model name for the LLM call. */
+  llmModel?: string;
   /** GitHub token for advise's release-notes fetch. */
   githubToken?: string;
   /** Test seam — defaults to the real registry client. */
@@ -138,7 +140,7 @@ export async function runScanOnce(
         await dispatchAppliedNotification(deps.notifiers, after);
       } else {
         result.held += 1;
-        const advise = deps.ollamaHost
+        const advise = deps.llmUrl
           ? await safeAdvise(
               {
                 image: ref.raw,
@@ -146,8 +148,9 @@ export async function runScanOnce(
                 to: latest,
                 composeFile: composePath,
                 serviceName,
-                ollamaHost: deps.ollamaHost,
-                model: deps.ollamaModel,
+                llmUrl: deps.llmUrl,
+                llmKey: deps.llmKey,
+                model: deps.llmModel,
                 githubToken: deps.githubToken,
               },
               deps.adviseFn,
@@ -182,7 +185,7 @@ async function dispatchHoldNotification(
   advise?: AdviseSummary | null,
 ): Promise<void> {
   if (notifiers.length === 0) return;
-  const subject = `[bumpsight] ${row.stack}/${row.service}: ${row.image} → ${row.target_tag} (${row.bump} — approval needed)`;
+  const subject = `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`;
   const lines: string[] = [
     `Stack:   ${row.stack}`,
     `Service: ${row.service}`,
@@ -190,10 +193,6 @@ async function dispatchHoldNotification(
     `From:    ${row.current_tag}`,
     `To:      ${row.target_tag}`,
     `Kind:    ${row.bump} bump`,
-    ``,
-    publicUrl
-      ? `Click Approve to pull + restart, or Deny to leave the stack on its current tag.`
-      : `Approval URLs are not configured (set BUMPSIGHT_PUBLIC_URL).`,
   ];
   if (advise) {
     lines.push("");
@@ -212,6 +211,12 @@ async function dispatchHoldNotification(
       );
     }
   }
+  lines.push("");
+  lines.push(
+    publicUrl
+      ? `Click Approve to pull + restart, or Deny to leave the stack on its current tag.`
+      : `Approval URLs are not configured (set BUMPSIGHT_PUBLIC_URL).`,
+  );
   await notifyAll(notifiers, {
     subject,
     body: lines.join("\n"),
@@ -235,13 +240,13 @@ async function dispatchAppliedNotification(
   row: UpdateRow,
 ): Promise<void> {
   if (notifiers.length === 0) return;
-  const banner = row.status === "applied" ? "auto-applied" : "apply FAILED";
-  const subject = `[bumpsight] ${row.stack}/${row.service}: ${row.image} → ${row.target_tag} (${row.bump} — ${banner})`;
+  const subject = `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`;
   const body = [
     `Stack:   ${row.stack}`,
     `Service: ${row.service}`,
     `From:    ${row.current_tag}`,
     `To:      ${row.target_tag}`,
+    `Kind:    ${row.bump} bump`,
     `Status:  ${row.status}`,
     ``,
     row.apply_log ? `Last log:\n${row.apply_log}` : ``,
@@ -261,8 +266,9 @@ export interface StartDaemonDeps {
   notifiers: Notifier[];
   composeFiles: Record<string, string>;
   publicUrl?: string;
-  ollamaHost?: string;
-  ollamaModel?: string;
+  llmUrl?: string;
+  llmKey?: string;
+  llmModel?: string;
   githubToken?: string;
   log: (msg: string) => void;
   /** Test seams. */
@@ -294,8 +300,9 @@ export function startDaemon(
           rules: cfg.rules,
           composeFiles: deps.composeFiles,
           publicUrl: deps.publicUrl,
-          ollamaHost: deps.ollamaHost,
-          ollamaModel: deps.ollamaModel,
+          llmUrl: deps.llmUrl,
+          llmKey: deps.llmKey,
+          llmModel: deps.llmModel,
           githubToken: deps.githubToken,
           listTagsFn: deps.listTagsFn,
           runner: deps.runner,

@@ -72,6 +72,15 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
   const publicUrl =
     process.env.BUMPSIGHT_PUBLIC_URL ?? fileShape.public_url ?? undefined;
 
+  // Backward compat: if BUMPSIGHT_LLM_URL is unset but OLLAMA_HOST is, derive
+  // the OpenAI-compat URL from Ollama's host (Ollama supports /v1 natively).
+  const ollamaHostEnv = fileShape.ollama?.host ?? process.env.OLLAMA_HOST;
+  const llmUrl =
+    process.env.BUMPSIGHT_LLM_URL ??
+    (ollamaHostEnv ? `${ollamaHostEnv.replace(/\/+$/, "")}/v1` : undefined);
+  const llmKey = process.env.BUMPSIGHT_LLM_KEY;
+  const llmModel = fileShape.ollama?.model ?? process.env.BUMPSIGHT_MODEL;
+
   const cfg: DaemonConfig = {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
@@ -81,8 +90,9 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     httpPort,
     httpHost,
     publicUrl,
-    ollamaHost: fileShape.ollama?.host ?? process.env.OLLAMA_HOST,
-    ollamaModel: fileShape.ollama?.model ?? process.env.BUMPSIGHT_MODEL,
+    llmUrl,
+    llmKey,
+    llmModel,
     githubToken: process.env.GITHUB_TOKEN,
   };
 
@@ -97,7 +107,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       `interval=${intervalRaw}, notifiers=${notifiers.length}, ` +
       `default=${cfg.rules.default}, db=${cfg.dbPath}, ` +
       `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}, ` +
-      `advise=${cfg.ollamaHost ? "on (" + (cfg.ollamaModel ?? "default-model") + ")" : "off"}`,
+      `advise=${cfg.llmUrl ? `on @ ${cfg.llmUrl} (${cfg.llmModel ?? "default-model"})` : "off"}`,
   );
 
   if (opts.once) {
@@ -107,8 +117,9 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       rules: cfg.rules,
       composeFiles: composeMap,
       publicUrl: cfg.publicUrl,
-      ollamaHost: cfg.ollamaHost,
-      ollamaModel: cfg.ollamaModel,
+      llmUrl: cfg.llmUrl,
+      llmKey: cfg.llmKey,
+      llmModel: cfg.llmModel,
       githubToken: cfg.githubToken,
     });
     log(
@@ -134,8 +145,9 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     notifiers,
     composeFiles: composeMap,
     publicUrl: cfg.publicUrl,
-    ollamaHost: cfg.ollamaHost,
-    ollamaModel: cfg.ollamaModel,
+    llmUrl: cfg.llmUrl,
+    llmKey: cfg.llmKey,
+    llmModel: cfg.llmModel,
     githubToken: cfg.githubToken,
     log,
   });

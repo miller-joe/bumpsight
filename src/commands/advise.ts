@@ -6,7 +6,7 @@ import {
   resolveUpstreamRepo,
   type GithubRelease,
 } from "../releases/github.js";
-import { chat, type ChatMessage } from "../llm/ollama.js";
+import { chat, type ChatMessage } from "../llm/chat.js";
 
 export interface AdviseOptions {
   image: string;
@@ -15,7 +15,12 @@ export interface AdviseOptions {
   repo?: string;
   composeFile?: string;
   serviceName?: string;
+  /** Legacy: Ollama base URL. Prefer llmUrl for OpenAI-compat endpoints. */
   ollamaHost?: string;
+  /** OpenAI-compatible base URL (ends in /v1). Used by Ollama, LiteLLM, etc. */
+  llmUrl?: string;
+  /** Optional bearer token for the LLM endpoint. */
+  llmKey?: string;
   model?: string;
   githubToken?: string;
   format?: "text" | "json";
@@ -89,8 +94,12 @@ export async function getAdviseSummary(
   const prompt = buildPrompt(opts.image, from, opts.to, between, serviceConfig);
 
   try {
+    const baseUrl =
+      opts.llmUrl ??
+      (opts.ollamaHost ? `${opts.ollamaHost.replace(/\/+$/, "")}/v1` : undefined);
     const summary = await chat(prompt, {
-      host: opts.ollamaHost,
+      baseUrl,
+      apiKey: opts.llmKey,
       model: opts.model,
       timeoutMs: opts.timeoutMs,
     });
@@ -164,8 +173,12 @@ export async function runAdvise(
   const prompt = buildPrompt(opts.image, from, opts.to, between, serviceConfig);
   let summary: string;
   try {
+    const baseUrl =
+      opts.llmUrl ??
+      (opts.ollamaHost ? `${opts.ollamaHost.replace(/\/+$/, "")}/v1` : undefined);
     summary = await chat(prompt, {
-      host: opts.ollamaHost,
+      baseUrl,
+      apiKey: opts.llmKey,
       model: opts.model,
       timeoutMs: opts.timeoutMs,
     });
