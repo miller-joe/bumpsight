@@ -35,6 +35,9 @@ export interface AdviseSummary {
   repo?: string;
   /** Number of GitHub releases the LLM was given. */
   releaseCount?: number;
+  /** When the LLM generated an opinion-only read (no release notes were
+   *  available), the body explains why and labels itself as such. */
+  source?: "release-notes" | "general-knowledge";
   /** Short reason on failure — for the daemon log, not for users. */
   error?: string;
 }
@@ -53,39 +56,66 @@ export async function getAdviseSummary(
   const ref = parseImageRef(opts.image);
   const from = opts.from ?? ref.tag;
 
-  let coords: Awaited<ReturnType<typeof resolveUpstreamRepo>>;
+  const serviceConfig =
+    opts.composeFile && opts.serviceName
+      ? extractServiceConfig(opts.composeFile, opts.serviceName)
+      : null;
+  const baseUrl =
+    opts.llmUrl ??
+    (opts.ollamaHost ? `${opts.ollamaHost.replace(/\/+$/, "")}/v1` : undefined);
+
+  // Try to resolve an upstream repo + fetch releases. If anything along
+  // that path comes up empty, fall through to opinion-only mode below.
+  let coords: Awaited<ReturnType<typeof resolveUpstreamRepo>> = null;
   try {
     coords = await resolveUpstreamRepo(ref, opts.repo);
-  } catch (err) {
-    return { ok: false, error: `repo resolve: ${(err as Error).message}` };
-  }
-  if (!coords) {
-    return { ok: false, error: "no upstream repo mapping" };
+  } catch {
+    coords = null;
   }
 
-  let releases: GithubRelease[];
-  try {
-    releases = await fetchReleases(coords, {
-      token: opts.githubToken ?? process.env.GITHUB_TOKEN,
-    });
-  } catch (err) {
-    return {
-      ok: false,
-      repo: `${coords.owner}/${coords.repo}`,
-      error: `github releases: ${(err as Error).message}`,
-    };
+  let allBetween: GithubRelease[] = [];
+  if (coords) {
+    try {
+      const releases = await fetchReleases(coords, {
+        token: opts.githubToken ?? process.env.GITHUB_TOKEN,
+      });
+      allBetween = releasesBetween(releases, from, opts.to).filter(
+        (r) => !r.draft,
+      );
+    } catch {
+      // fetch failure → fall through to opinion-only
+      allBetween = [];
+    }
   }
-  const allBetween = releasesBetween(releases, from, opts.to).filter(
-    (r) => !r.draft,
-  );
+
   if (allBetween.length === 0) {
-    return {
-      ok: false,
-      repo: `${coords.owner}/${coords.repo}`,
-      releaseCount: 0,
-      error: "no releases between tags",
-    };
+    // Opinion-only fallback. The LLM is good at general guidance for
+    // well-known images even without per-release notes.
+    try {
+      const prompt = buildOpinionPrompt(opts.image, from, opts.to, serviceConfig);
+      const summary = await chat(prompt, {
+        baseUrl,
+        apiKey: opts.llmKey,
+        model: opts.model,
+        timeoutMs: opts.timeoutMs,
+      });
+      return {
+        ok: true,
+        summary: summary.trim(),
+        repo: coords ? `${coords.owner}/${coords.repo}` : undefined,
+        releaseCount: 0,
+        source: "general-knowledge",
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        repo: coords ? `${coords.owner}/${coords.repo}` : undefined,
+        releaseCount: 0,
+        error: `llm (opinion-only): ${(err as Error).message}`,
+      };
+    }
   }
+
   // Cap the prompt size: take the most-recent N releases. Repos like
   // hashicorp/vault publish dozens of releases between major versions and
   // sending them all to the LLM blows context and triggers timeouts.
@@ -94,17 +124,9 @@ export async function getAdviseSummary(
     allBetween.length > MAX_RELEASES_IN_PROMPT
       ? allBetween.slice(0, MAX_RELEASES_IN_PROMPT)
       : allBetween;
-
-  const serviceConfig =
-    opts.composeFile && opts.serviceName
-      ? extractServiceConfig(opts.composeFile, opts.serviceName)
-      : null;
   const prompt = buildPrompt(opts.image, from, opts.to, between, serviceConfig);
 
   try {
-    const baseUrl =
-      opts.llmUrl ??
-      (opts.ollamaHost ? `${opts.ollamaHost.replace(/\/+$/, "")}/v1` : undefined);
     const summary = await chat(prompt, {
       baseUrl,
       apiKey: opts.llmKey,
@@ -114,13 +136,14 @@ export async function getAdviseSummary(
     return {
       ok: true,
       summary: summary.trim(),
-      repo: `${coords.owner}/${coords.repo}`,
+      repo: `${coords!.owner}/${coords!.repo}`,
       releaseCount: allBetween.length,
+      source: "release-notes",
     };
   } catch (err) {
     return {
       ok: false,
-      repo: `${coords.owner}/${coords.repo}`,
+      repo: `${coords!.owner}/${coords!.repo}`,
       releaseCount: allBetween.length,
       error: `llm: ${(err as Error).message}`,
     };
@@ -130,8 +153,7 @@ export async function getAdviseSummary(
 export async function runAdvise(
   opts: AdviseOptions,
 ): Promise<{ exitCode: number; output: string }> {
-  const ref = parseImageRef(opts.image);
-  const from = opts.from ?? ref.tag;
+  const from = opts.from ?? parseImageRef(opts.image).tag;
   if (!opts.to) {
     return {
       exitCode: 2,
@@ -140,94 +162,32 @@ export async function runAdvise(
     };
   }
 
-  const coords = await resolveUpstreamRepo(ref, opts.repo);
-  if (!coords) {
-    return {
-      exitCode: 2,
-      output: [
-        `bumpsight advise: couldn't map ${opts.image} to an upstream GitHub repo.`,
-        "Pass --repo <owner>/<name> explicitly.",
-        "",
-      ].join("\n"),
-    };
-  }
-
-  let releases: GithubRelease[];
-  try {
-    releases = await fetchReleases(coords, {
-      token: opts.githubToken ?? process.env.GITHUB_TOKEN,
-    });
-  } catch (err) {
-    return {
-      exitCode: 1,
-      output: `bumpsight advise: ${(err as Error).message}\n`,
-    };
-  }
-
-  const between = releasesBetween(releases, from, opts.to).filter(
-    (r) => !r.draft,
-  );
-  if (between.length === 0) {
-    return {
-      exitCode: 0,
-      output: `${coords.owner}/${coords.repo}: no releases found between ${from} and ${opts.to}. Either the tag names don't match GitHub releases, or nothing was released.\n`,
-    };
-  }
-
-  const serviceConfig = opts.composeFile && opts.serviceName
-    ? extractServiceConfig(opts.composeFile, opts.serviceName)
-    : null;
-
-  const prompt = buildPrompt(opts.image, from, opts.to, between, serviceConfig);
-  let summary: string;
-  try {
-    const baseUrl =
-      opts.llmUrl ??
-      (opts.ollamaHost ? `${opts.ollamaHost.replace(/\/+$/, "")}/v1` : undefined);
-    summary = await chat(prompt, {
-      baseUrl,
-      apiKey: opts.llmKey,
-      model: opts.model,
-      timeoutMs: opts.timeoutMs,
-    });
-  } catch (err) {
-    return {
-      exitCode: 1,
-      output: `bumpsight advise: LLM call failed: ${(err as Error).message}\n`,
-    };
-  }
+  // Reuse the daemon's path so the CLI gets opinion-fallback for free when
+  // there's no upstream repo or no releases between tags.
+  const result = await getAdviseSummary(opts);
 
   if (opts.format === "json") {
     return {
-      exitCode: 0,
-      output: JSON.stringify(
-        {
-          image: opts.image,
-          from,
-          to: opts.to,
-          repo: `${coords.owner}/${coords.repo}`,
-          releases: between.map((r) => ({
-            tag: r.tagName,
-            publishedAt: r.publishedAt,
-            url: r.url,
-          })),
-          summary,
-        },
-        null,
-        2,
-      ),
+      exitCode: result.ok ? 0 : 1,
+      output: JSON.stringify(result, null, 2) + "\n",
     };
   }
 
-  const lines: string[] = [
-    `${opts.image}  ${from} → ${opts.to}`,
-    `upstream: https://github.com/${coords.owner}/${coords.repo} (${coords.source})`,
-    `releases in range: ${between.length}`,
-    "",
-    summary.trim(),
-    "",
-  ];
-  return { exitCode: 0, output: lines.join("\n") };
+  if (result.ok && result.summary) {
+    const heading =
+      result.source === "general-knowledge"
+        ? `${opts.image}  ${from} → ${opts.to}\n(LLM general-knowledge opinion — no upstream release notes available${result.repo ? `; checked github.com/${result.repo}` : ""})`
+        : `${opts.image}  ${from} → ${opts.to}\nupstream: https://github.com/${result.repo}\nreleases in range: ${result.releaseCount}`;
+    return {
+      exitCode: 0,
+      output: `${heading}\n\n${result.summary}\n`,
+    };
+  }
+
+  return {
+    exitCode: 1,
+    output: `bumpsight advise: ${result.error ?? "no summary produced"}\n`,
+  };
 }
 
 function extractServiceConfig(composePath: string, serviceName: string): ServiceDef | null {
@@ -294,6 +254,69 @@ function buildPrompt(
       `Release notes between ${from} (exclusive) and ${to} (inclusive):`,
       "",
       releasesBlock,
+    ].join("\n"),
+  };
+
+  return [systemMessage, userMessage];
+}
+
+/**
+ * Build a prompt that asks the LLM for an opinion-only read when no per-release
+ * notes are available. The model has general knowledge of well-known Docker
+ * images and version-bump conventions; even without specific release notes it
+ * can produce a useful "is this generally safe to update?" read.
+ */
+function buildOpinionPrompt(
+  image: string,
+  from: string,
+  to: string,
+  serviceConfig: ServiceDef | null,
+): ChatMessage[] {
+  const systemMessage: ChatMessage = {
+    role: "system",
+    content: [
+      "You are a docker image upgrade advisor for self-hosted services.",
+      "You are being asked about a specific image bump WITHOUT access to the",
+      "upstream's release notes. Answer based on your general knowledge of the",
+      "image, the version-bump convention it appears to use, and any of the",
+      "user's compose service config provided. If you don't recognize the",
+      "image at all, say so explicitly and stop.",
+      "",
+      "Produce these exact sections in this order:",
+      "",
+      "Likely risk level:",
+      "- one of: low / moderate / high / unknown",
+      "- one short clause explaining why (e.g. 'major version of a database — historical migration risk', 'patch within a stable LTS line').",
+      "",
+      "What this typically changes:",
+      "- 1-3 bullets on what bumps of this kind usually bring for this image.",
+      "- if the user's service config references something likely to change (e.g. a known-deprecated env var), call it out.",
+      "",
+      "Recommended action:",
+      "- one short, opinionated recommendation: approve / approve-after-quick-check / hold-for-review / hold-for-thorough-review.",
+      "- one sentence justifying the recommendation.",
+      "",
+      "Rules:",
+      "- No fluff. No greetings. No sign-offs.",
+      "- Be honest about uncertainty — if you don't know the image, say 'risk: unknown'.",
+      "- Do not invent breaking changes you can't substantiate.",
+    ].join("\n"),
+  };
+
+  const configBlock = serviceConfig
+    ? `\nUser's compose service config for this image:\n\`\`\`yaml\n${yamlishStringify(serviceConfig)}\n\`\`\`\n`
+    : "";
+
+  const userMessage: ChatMessage = {
+    role: "user",
+    content: [
+      `Image: ${image}`,
+      `Current version: ${from}`,
+      `Target version: ${to}`,
+      "",
+      "Note: I could not retrieve upstream release notes for this bump.",
+      "Give me your best general-knowledge read.",
+      configBlock,
     ].join("\n"),
   };
 

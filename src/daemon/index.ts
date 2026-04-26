@@ -212,16 +212,23 @@ async function dispatchHoldNotification(
   text.push(`Kind:    ${row.bump} bump`);
   if (advise) {
     text.push("");
-    text.push("───── Upstream release-note summary ─────");
     if (advise.ok && advise.summary) {
-      text.push(
-        `Source: github.com/${advise.repo} · ${advise.releaseCount} release(s) in range`,
-      );
+      const heading =
+        advise.source === "general-knowledge"
+          ? "───── LLM opinion (no upstream release notes) ─────"
+          : "───── Upstream release-note summary ─────";
+      text.push(heading);
+      const sourceLine =
+        advise.source === "general-knowledge"
+          ? `Source: model general knowledge${advise.repo ? ` · upstream checked: github.com/${advise.repo}` : ""}`
+          : `Source: github.com/${advise.repo} · ${advise.releaseCount} release(s) in range`;
+      text.push(sourceLine);
       text.push("");
       text.push(advise.summary);
     } else {
+      text.push("───── Advice ─────");
       text.push(
-        `(advise skipped: ${advise.error ?? "unknown reason"}` +
+        `(skipped: ${advise.error ?? "unknown reason"}` +
           (advise.repo ? ` · upstream: ${advise.repo}` : "") +
           `)`,
       );
@@ -273,15 +280,24 @@ function buildHoldHtml(opts: HoldHtmlOpts): string {
 
   const adviseSection = advise
     ? advise.ok && advise.summary
-      ? `
+      ? (() => {
+          const isOpinion = advise.source === "general-knowledge";
+          const heading = isOpinion
+            ? "LLM opinion (no upstream release notes)"
+            : "Upstream release-note summary";
+          const sourceLine = isOpinion
+            ? `Source: model general knowledge${advise.repo ? ` · upstream checked: github.com/${e(advise.repo)}` : ""}`
+            : `Source: github.com/${e(advise.repo ?? "")} · ${advise.releaseCount ?? 0} release(s) in range`;
+          return `
       <div style="margin-top:24px;">
-        <h3 style="margin:0 0 4px 0;font-size:14px;color:#1e293b;">Upstream release-note summary</h3>
-        <div style="font-size:12px;color:#64748b;margin-bottom:12px;">Source: github.com/${e(advise.repo ?? "")} · ${advise.releaseCount ?? 0} release(s) in range</div>
+        <h3 style="margin:0 0 4px 0;font-size:14px;color:#1e293b;">${heading}</h3>
+        <div style="font-size:12px;color:#64748b;margin-bottom:12px;">${sourceLine}</div>
         <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:13px;line-height:1.5;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;white-space:pre-wrap;">${e(advise.summary)}</div>
-      </div>`
+      </div>`;
+        })()
       : `
       <div style="margin-top:24px;font-size:13px;color:#94a3b8;font-style:italic;">
-        Release-note summary skipped: ${e(advise.error ?? "unknown reason")}${advise.repo ? ` · upstream: github.com/${e(advise.repo)}` : ""}
+        Advice skipped: ${e(advise.error ?? "unknown reason")}${advise.repo ? ` · upstream: github.com/${e(advise.repo)}` : ""}
       </div>`
     : "";
 

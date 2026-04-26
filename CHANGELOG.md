@@ -2,7 +2,7 @@
 
 All notable changes to bumpsight are documented here.
 
-## Unreleased — v0.2
+## 0.2.0 — 2026-04-26
 
 Daemon-mode release. Watchtower-replacement scope.
 
@@ -28,6 +28,13 @@ Daemon-mode release. Watchtower-replacement scope.
 ### Changed
 
 - `--version` now actually prints the version when called without a subcommand (previously fell through to help).
+- LLM client switched from Ollama-native to **OpenAI-compatible** at the protocol level. Same client works with LiteLLM (recommended for cloud fan-out), Ollama (`/v1` since 0.1.40), OpenAI, vLLM, llama.cpp, and any other gateway exposing `/v1/chat/completions`. Configured via `BUMPSIGHT_LLM_URL` and `BUMPSIGHT_LLM_KEY`; legacy `OLLAMA_HOST` still accepted.
+- Email subject simplified to `stack/service: image → tag` — no more `[bumpsight]` prefix or `(bump — banner)` suffix. Body grew the action card (instruction + styled Approve/Deny buttons) at the top; metadata + LLM summary follow.
+- Hold notifications now ship as HTML with a multipart text fallback. Action card is a colored box, buttons are real styled `<a>` elements (green Approve, slate Deny), metadata in a clean table, LLM summary in a soft monospace block.
+- Daemon now **auto-discovers** every `<stacks_dir>/<name>/compose.{yaml,yml}` by default (root configurable via `BUMPSIGHT_STACKS_DIR`). The opt-out model: per-stack policy `none` excludes a stack from scanning. The legacy `compose_files:` allowlist still works when set.
+- `advise` upstream-repo resolution gained a curated table for Docker Official images (node, postgres, redis, nginx, vault, …) so the LLM gets real release notes instead of empty wrapper-repo results. Tag-name matching now does prefix and substring fallback, so an image pinned to `8.0` finds a release tagged `8.0.40`.
+- `advise` caps the prompt at the 25 most-recent releases in range to keep cloud-LLM round-trips under the timeout for active repos like hashicorp/vault.
+- Default LLM call timeout dropped from 120s to 60s — cloud routers reply in single-digit seconds, and 60s prevents one stuck call from wedging a 48-stack scan.
 
 ## 0.1.0 — 2026-04-21
 

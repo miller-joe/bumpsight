@@ -66,7 +66,7 @@ Examples:
     --auto-apply patch
 `;
 
-const VERSION = "0.2.0-dev";
+const VERSION = "0.2.0";
 
 async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
