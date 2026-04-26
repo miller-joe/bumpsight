@@ -17,6 +17,7 @@ import { notifyAll } from "../notify/index.js";
 import type { Notifier, NotifyMessage, NotifyLink } from "../notify/types.js";
 import { applyOne } from "../apply/index.js";
 import type { CommandRunner } from "../apply/docker.js";
+import { getAdviseSummary, type AdviseSummary } from "../commands/advise.js";
 
 export interface ScanRunResult {
   /** Number of services examined across all compose files. */
@@ -41,10 +42,18 @@ export interface ScanRunDeps {
   composeFiles: Record<string, string>;
   /** Optional base URL for approve/deny links inside notifications. */
   publicUrl?: string;
+  /** Optional Ollama base URL. When set, held-bump emails get LLM advise. */
+  ollamaHost?: string;
+  /** Ollama model used for advise. Defaults to the advise-CLI default. */
+  ollamaModel?: string;
+  /** GitHub token for advise's release-notes fetch. */
+  githubToken?: string;
   /** Test seam — defaults to the real registry client. */
   listTagsFn?: typeof listTags;
   /** Test seam — defaults to the real spawn-based docker runner. */
   runner?: CommandRunner;
+  /** Test seam — override advise. Returns null to skip the LLM section. */
+  adviseFn?: typeof getAdviseSummary;
 }
 
 /**
@@ -129,7 +138,27 @@ export async function runScanOnce(
         await dispatchAppliedNotification(deps.notifiers, after);
       } else {
         result.held += 1;
-        await dispatchHoldNotification(deps.notifiers, row, deps.publicUrl);
+        const advise = deps.ollamaHost
+          ? await safeAdvise(
+              {
+                image: ref.raw,
+                from: ref.tag,
+                to: latest,
+                composeFile: composePath,
+                serviceName,
+                ollamaHost: deps.ollamaHost,
+                model: deps.ollamaModel,
+                githubToken: deps.githubToken,
+              },
+              deps.adviseFn,
+            )
+          : null;
+        await dispatchHoldNotification(
+          deps.notifiers,
+          row,
+          deps.publicUrl,
+          advise,
+        );
         setNotified(deps.db, row.id);
       }
     }
@@ -150,10 +179,11 @@ async function dispatchHoldNotification(
   notifiers: Notifier[],
   row: UpdateRow,
   publicUrl?: string,
+  advise?: AdviseSummary | null,
 ): Promise<void> {
   if (notifiers.length === 0) return;
   const subject = `[bumpsight] ${row.stack}/${row.service}: ${row.image} → ${row.target_tag} (${row.bump} — approval needed)`;
-  const body = [
+  const lines: string[] = [
     `Stack:   ${row.stack}`,
     `Service: ${row.service}`,
     `Image:   ${row.image}`,
@@ -164,12 +194,40 @@ async function dispatchHoldNotification(
     publicUrl
       ? `Click Approve to pull + restart, or Deny to leave the stack on its current tag.`
       : `Approval URLs are not configured (set BUMPSIGHT_PUBLIC_URL).`,
-  ].join("\n");
+  ];
+  if (advise) {
+    lines.push("");
+    lines.push("───── Upstream release-note summary ─────");
+    if (advise.ok && advise.summary) {
+      lines.push(
+        `Source: github.com/${advise.repo} · ${advise.releaseCount} release(s) in range`,
+      );
+      lines.push("");
+      lines.push(advise.summary);
+    } else {
+      lines.push(
+        `(advise skipped: ${advise.error ?? "unknown reason"}` +
+          (advise.repo ? ` · upstream: ${advise.repo}` : "") +
+          `)`,
+      );
+    }
+  }
   await notifyAll(notifiers, {
     subject,
-    body,
+    body: lines.join("\n"),
     links: buildLinks(row, publicUrl),
   });
+}
+
+async function safeAdvise(
+  opts: Parameters<typeof getAdviseSummary>[0],
+  fn?: typeof getAdviseSummary,
+): Promise<AdviseSummary> {
+  try {
+    return await (fn ?? getAdviseSummary)(opts);
+  } catch (err) {
+    return { ok: false, error: `advise threw: ${(err as Error).message}` };
+  }
 }
 
 async function dispatchAppliedNotification(
@@ -203,10 +261,14 @@ export interface StartDaemonDeps {
   notifiers: Notifier[];
   composeFiles: Record<string, string>;
   publicUrl?: string;
+  ollamaHost?: string;
+  ollamaModel?: string;
+  githubToken?: string;
   log: (msg: string) => void;
   /** Test seams. */
   listTagsFn?: typeof listTags;
   runner?: CommandRunner;
+  adviseFn?: typeof getAdviseSummary;
 }
 
 /**
@@ -232,8 +294,12 @@ export function startDaemon(
           rules: cfg.rules,
           composeFiles: deps.composeFiles,
           publicUrl: deps.publicUrl,
+          ollamaHost: deps.ollamaHost,
+          ollamaModel: deps.ollamaModel,
+          githubToken: deps.githubToken,
           listTagsFn: deps.listTagsFn,
           runner: deps.runner,
+          adviseFn: deps.adviseFn,
         });
         const ms = Date.now() - started;
         deps.log(

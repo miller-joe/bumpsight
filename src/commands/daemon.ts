@@ -83,6 +83,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     publicUrl,
     ollamaHost: fileShape.ollama?.host ?? process.env.OLLAMA_HOST,
     ollamaModel: fileShape.ollama?.model ?? process.env.BUMPSIGHT_MODEL,
+    githubToken: process.env.GITHUB_TOKEN,
   };
 
   const db = openDb({ path: cfg.dbPath });
@@ -95,7 +96,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     `daemon starting: ${cfg.composeFiles.length} compose file(s), ` +
       `interval=${intervalRaw}, notifiers=${notifiers.length}, ` +
       `default=${cfg.rules.default}, db=${cfg.dbPath}, ` +
-      `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}`,
+      `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}, ` +
+      `advise=${cfg.ollamaHost ? "on (" + (cfg.ollamaModel ?? "default-model") + ")" : "off"}`,
   );
 
   if (opts.once) {
@@ -105,6 +107,9 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       rules: cfg.rules,
       composeFiles: composeMap,
       publicUrl: cfg.publicUrl,
+      ollamaHost: cfg.ollamaHost,
+      ollamaModel: cfg.ollamaModel,
+      githubToken: cfg.githubToken,
     });
     log(
       `scan: ${result.scanned} services, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held)`,
@@ -129,6 +134,9 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     notifiers,
     composeFiles: composeMap,
     publicUrl: cfg.publicUrl,
+    ollamaHost: cfg.ollamaHost,
+    ollamaModel: cfg.ollamaModel,
+    githubToken: cfg.githubToken,
     log,
   });
 

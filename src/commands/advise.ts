@@ -22,6 +22,94 @@ export interface AdviseOptions {
   timeoutMs?: number;
 }
 
+export interface AdviseSummary {
+  ok: boolean;
+  /** The structured LLM-generated text body. */
+  summary?: string;
+  /** owner/repo of the resolved upstream, when found. */
+  repo?: string;
+  /** Number of GitHub releases the LLM was given. */
+  releaseCount?: number;
+  /** Short reason on failure — for the daemon log, not for users. */
+  error?: string;
+}
+
+/**
+ * Programmatic entry point — same logic as runAdvise but returns a structured
+ * result instead of CLI-formatted text. Used by the daemon to embed the LLM
+ * read of breaking changes inline in held-bump notification emails. Never
+ * throws — returns {ok:false, error} so callers can fall through gracefully
+ * when Ollama is down or the upstream repo can't be resolved.
+ */
+export async function getAdviseSummary(
+  opts: AdviseOptions,
+): Promise<AdviseSummary> {
+  if (!opts.to) return { ok: false, error: "missing target tag" };
+  const ref = parseImageRef(opts.image);
+  const from = opts.from ?? ref.tag;
+
+  let coords: Awaited<ReturnType<typeof resolveUpstreamRepo>>;
+  try {
+    coords = await resolveUpstreamRepo(ref, opts.repo);
+  } catch (err) {
+    return { ok: false, error: `repo resolve: ${(err as Error).message}` };
+  }
+  if (!coords) {
+    return { ok: false, error: "no upstream repo mapping" };
+  }
+
+  let releases: GithubRelease[];
+  try {
+    releases = await fetchReleases(coords, {
+      token: opts.githubToken ?? process.env.GITHUB_TOKEN,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      repo: `${coords.owner}/${coords.repo}`,
+      error: `github releases: ${(err as Error).message}`,
+    };
+  }
+  const between = releasesBetween(releases, from, opts.to).filter(
+    (r) => !r.draft,
+  );
+  if (between.length === 0) {
+    return {
+      ok: false,
+      repo: `${coords.owner}/${coords.repo}`,
+      releaseCount: 0,
+      error: "no releases between tags",
+    };
+  }
+
+  const serviceConfig =
+    opts.composeFile && opts.serviceName
+      ? extractServiceConfig(opts.composeFile, opts.serviceName)
+      : null;
+  const prompt = buildPrompt(opts.image, from, opts.to, between, serviceConfig);
+
+  try {
+    const summary = await chat(prompt, {
+      host: opts.ollamaHost,
+      model: opts.model,
+      timeoutMs: opts.timeoutMs,
+    });
+    return {
+      ok: true,
+      summary: summary.trim(),
+      repo: `${coords.owner}/${coords.repo}`,
+      releaseCount: between.length,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      repo: `${coords.owner}/${coords.repo}`,
+      releaseCount: between.length,
+      error: `llm: ${(err as Error).message}`,
+    };
+  }
+}
+
 export async function runAdvise(
   opts: AdviseOptions,
 ): Promise<{ exitCode: number; output: string }> {

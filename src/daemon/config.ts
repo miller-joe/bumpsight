@@ -24,6 +24,9 @@ export interface DaemonConfig {
   ollamaHost?: string;
   /** Ollama model name when advise runs. */
   ollamaModel?: string;
+  /** Optional GitHub token used by advise to fetch upstream release notes
+   *  without hitting the unauthenticated-rate-limit. */
+  githubToken?: string;
 }
 
 export interface FileConfigShape {
