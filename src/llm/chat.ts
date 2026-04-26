@@ -57,7 +57,11 @@ export async function chat(
   const controller = new AbortController();
   const timeout = setTimeout(
     () => controller.abort(),
-    opts.timeoutMs ?? 120_000,
+    // 60s is generous for OpenAI-compat gateways. Cloud routers (LiteLLM,
+    // Cerebras, Groq) typically reply in 1–10s; local Ollama is slower
+    // but should still complete within a minute on modest hardware.
+    // Override via `timeoutMs` for the rare 14B-on-CPU case.
+    opts.timeoutMs ?? 60_000,
   );
 
   const headers: Record<string, string> = {

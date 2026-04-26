@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { startDaemon, runScanOnce, buildComposeFileMap } from "../daemon/index.js";
 import {
   buildRulesConfig,
@@ -32,16 +33,29 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     opts.configFile ?? process.env.BUMPSIGHT_CONFIG ?? "/config/bumpsight.yaml";
   const fileShape = loadConfigFile(configPath);
 
-  const composeFiles =
-    opts.composeFiles && opts.composeFiles.length > 0
-      ? opts.composeFiles
-      : (fileShape.compose_files ?? []);
-  if (composeFiles.length === 0) {
-    process.stderr.write(
-      `bumpsight daemon: no compose files configured. ` +
-        `Pass paths as positional arguments or set compose_files in ${configPath}.\n`,
-    );
-    return 2;
+  // Compose-file resolution. Three sources, first wins:
+  //   1. CLI positional args
+  //   2. compose_files: list in bumpsight.yaml (explicit allowlist)
+  //   3. auto-discovery: every <stacksDir>/<name>/compose.{yaml,yml}
+  // Auto-discovery is the default — bumpsight is opt-out, not opt-in.
+  // To exclude a stack, set its per-stack policy to `none` in bumpsight.yaml.
+  const stacksDir =
+    process.env.BUMPSIGHT_STACKS_DIR ?? fileShape.stacks_dir ?? "/stacks";
+  let composeFiles: string[];
+  if (opts.composeFiles && opts.composeFiles.length > 0) {
+    composeFiles = opts.composeFiles;
+  } else if (fileShape.compose_files && fileShape.compose_files.length > 0) {
+    composeFiles = fileShape.compose_files;
+  } else {
+    composeFiles = autoDiscoverComposeFiles(stacksDir);
+    if (composeFiles.length === 0) {
+      process.stderr.write(
+        `bumpsight daemon: no compose files found. Either pass paths as ` +
+          `positional arguments, set compose_files in ${configPath}, or mount ` +
+          `your compose tree at ${stacksDir} (configurable via BUMPSIGHT_STACKS_DIR).\n`,
+      );
+      return 2;
+    }
   }
 
   const intervalRaw =
@@ -102,8 +116,14 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     process.stdout.write(`[${new Date().toISOString()}] ${msg}\n`);
   const composeMap = buildComposeFileMap(cfg.composeFiles);
 
+  const discoveryHint =
+    opts.composeFiles && opts.composeFiles.length > 0
+      ? "(from CLI args)"
+      : fileShape.compose_files && fileShape.compose_files.length > 0
+        ? "(from compose_files in config)"
+        : `(auto-discovered under ${stacksDir})`;
   log(
-    `daemon starting: ${cfg.composeFiles.length} compose file(s), ` +
+    `daemon starting: ${cfg.composeFiles.length} compose file(s) ${discoveryHint}, ` +
       `interval=${intervalRaw}, notifiers=${notifiers.length}, ` +
       `default=${cfg.rules.default}, db=${cfg.dbPath}, ` +
       `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}, ` +
@@ -165,4 +185,40 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
   return await new Promise<number>(() => {
     /* daemon runs until SIGINT/SIGTERM */
   });
+}
+
+/**
+ * Auto-discover compose files under a stacks directory, one level deep.
+ *
+ *   <root>/<stack>/compose.yaml
+ *   <root>/<stack>/compose.yml
+ *
+ * Hidden directories (starting with `.`) are skipped — that gives users a
+ * dot-prefix archive convention to opt-out without editing config.
+ */
+function autoDiscoverComposeFiles(root: string): string[] {
+  if (!existsSync(root)) return [];
+  const out: string[] = [];
+  let entries;
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name.startsWith(".")) continue;
+    for (const name of ["compose.yaml", "compose.yml"]) {
+      const candidate = join(root, entry.name, name);
+      try {
+        if (statSync(candidate).isFile()) {
+          out.push(candidate);
+          break;
+        }
+      } catch {
+        // not present — try next
+      }
+    }
+  }
+  return out.sort();
 }

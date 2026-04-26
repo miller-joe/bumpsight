@@ -75,10 +75,10 @@ export async function getAdviseSummary(
       error: `github releases: ${(err as Error).message}`,
     };
   }
-  const between = releasesBetween(releases, from, opts.to).filter(
+  const allBetween = releasesBetween(releases, from, opts.to).filter(
     (r) => !r.draft,
   );
-  if (between.length === 0) {
+  if (allBetween.length === 0) {
     return {
       ok: false,
       repo: `${coords.owner}/${coords.repo}`,
@@ -86,6 +86,14 @@ export async function getAdviseSummary(
       error: "no releases between tags",
     };
   }
+  // Cap the prompt size: take the most-recent N releases. Repos like
+  // hashicorp/vault publish dozens of releases between major versions and
+  // sending them all to the LLM blows context and triggers timeouts.
+  const MAX_RELEASES_IN_PROMPT = 25;
+  const between =
+    allBetween.length > MAX_RELEASES_IN_PROMPT
+      ? allBetween.slice(0, MAX_RELEASES_IN_PROMPT)
+      : allBetween;
 
   const serviceConfig =
     opts.composeFile && opts.serviceName
@@ -107,13 +115,13 @@ export async function getAdviseSummary(
       ok: true,
       summary: summary.trim(),
       repo: `${coords.owner}/${coords.repo}`,
-      releaseCount: between.length,
+      releaseCount: allBetween.length,
     };
   } catch (err) {
     return {
       ok: false,
       repo: `${coords.owner}/${coords.repo}`,
-      releaseCount: between.length,
+      releaseCount: allBetween.length,
       error: `llm: ${(err as Error).message}`,
     };
   }

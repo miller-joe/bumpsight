@@ -35,7 +35,10 @@ export interface DaemonConfig {
 export interface FileConfigShape {
   default?: BumpAction;
   stacks?: Record<string, BumpAction>;
+  /** Optional explicit allowlist. When set, overrides auto-discovery. */
   compose_files?: string[];
+  /** Root directory scanned by auto-discovery. Defaults to /stacks. */
+  stacks_dir?: string;
   interval?: string;
   db_path?: string;
   notify?: string[];
