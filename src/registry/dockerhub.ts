@@ -40,8 +40,14 @@ export async function listDockerHubTags(
   const maxTags = opts.maxTags ?? 200;
 
   const tags: RemoteTag[] = [];
+  // Docker Hub's `ordering` parameter has reversed semantics from the DRF
+  // convention: `last_updated` (no minus) returns most-recent first,
+  // `-last_updated` returns oldest first. Confirmed empirically against
+  // hub.docker.com on 2026-04-26. We want newest first so that the most
+  // relevant tags arrive within the first `maxTags` cap on heavily-tagged
+  // repos like linuxserver/jellyfin (12k+ tags).
   let url: string | null =
-    `${HUB_BASE}/repositories/${encodeURIComponent(namespace)}/${encodeURIComponent(ref.name)}/tags/?page_size=100&ordering=-last_updated`;
+    `${HUB_BASE}/repositories/${encodeURIComponent(namespace)}/${encodeURIComponent(ref.name)}/tags/?page_size=100&ordering=last_updated`;
 
   while (url && tags.length < maxTags) {
     const res = await fetch(url, {
