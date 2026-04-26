@@ -3,6 +3,7 @@ import { parseArgs } from "node:util";
 import { runDoctor } from "./commands/doctor.js";
 import { runScan } from "./commands/scan.js";
 import { runAdvise } from "./commands/advise.js";
+import { runDaemon } from "./commands/daemon.js";
 
 const HELP = `bumpsight — Docker image update advisor for self-hosters
 
@@ -14,6 +15,13 @@ Usage:
   bumpsight advise  <image> --to <tag> [--from <tag>]
                                      Summarize breaking changes between two
                                      image tags using a local LLM (Ollama).
+  bumpsight daemon  [<compose-file>...] [--once]
+                                     Run as a long-lived service: periodically
+                                     scan, classify bumps as patch/minor/major,
+                                     auto-apply or hold for approval per
+                                     policy, and notify via email / Apprise.
+                                     Configured via /config/bumpsight.yaml or
+                                     BUMPSIGHT_* env vars.
 
 Shared options:
   --json                   Output as JSON instead of text.
@@ -34,14 +42,31 @@ advise-specific options:
                            $BUMPSIGHT_MODEL).
   --github-token <token>   GitHub API token (or $GITHUB_TOKEN).
 
+daemon-specific options:
+  --config <file>          Config file path (default /config/bumpsight.yaml,
+                           or $BUMPSIGHT_CONFIG).
+  --db <file>              SQLite state file (default /var/lib/bumpsight/
+                           state.db, or $BUMPSIGHT_DB).
+  --interval <duration>    Scan interval, e.g. 30m, 6h, 1d (default 6h, or
+                           $BUMPSIGHT_INTERVAL).
+  --notify <uri,uri,…>     Notifier URIs (smtp://…, smtps://…, apprise://…).
+                           Default reads $BUMPSIGHT_NOTIFY.
+  --auto-apply <action>    Default bump policy: patch | minor | major |
+                           notify | none (default notify, or
+                           $BUMPSIGHT_AUTO_APPLY).
+  --once                   Run a single scan pass and exit.
+
 Examples:
   bumpsight doctor compose.yaml
   bumpsight scan compose.yaml
   bumpsight advise linuxserver/sonarr:4.0.14 --to 4.1.0 \\
     --compose compose.yaml --service sonarr
+  bumpsight daemon /stacks/jellyfin/compose.yaml --interval 6h \\
+    --notify smtp://user:pass@mail.example.com:587/?to=admin@x.com&from=b@x.com \\
+    --auto-apply patch
 `;
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0-dev";
 
 async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
@@ -61,15 +86,21 @@ async function main(argv: string[]): Promise<number> {
       "ollama-host": { type: "string" },
       model: { type: "string" },
       "github-token": { type: "string" },
+      config: { type: "string" },
+      db: { type: "string" },
+      interval: { type: "string" },
+      notify: { type: "string" },
+      "auto-apply": { type: "string" },
+      once: { type: "boolean" },
     },
   });
 
-  if (values.help || positionals.length === 0) {
-    process.stdout.write(HELP);
-    return 0;
-  }
   if (values.version) {
     process.stdout.write(VERSION + "\n");
+    return 0;
+  }
+  if (values.help || positionals.length === 0) {
+    process.stdout.write(HELP);
     return 0;
   }
 
@@ -102,6 +133,17 @@ async function main(argv: string[]): Promise<number> {
       });
       process.stdout.write(output);
       return exitCode;
+    }
+    case "daemon": {
+      return await runDaemon({
+        configFile: values.config,
+        dbPath: values.db,
+        composeFiles: rest.length > 0 ? rest : undefined,
+        interval: values.interval,
+        notify: values.notify,
+        autoApply: values["auto-apply"],
+        once: values.once,
+      });
     }
     case "advise": {
       const image = rest[0];
