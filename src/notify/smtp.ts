@@ -64,6 +64,7 @@ export class SmtpNotifier implements Notifier {
       to: this.opts.to.join(", "),
       subject: msg.subject,
       text,
+      ...(msg.htmlBody ? { html: msg.htmlBody } : {}),
     });
   }
 }

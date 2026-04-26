@@ -60,10 +60,15 @@ describe("runScanOnce", () => {
     expect(subject).toContain("10.11.0");
     expect(sent[0]!.body).toContain("Click Approve to pull");
     expect(sent[0]!.body).toContain("Kind:    minor bump");
-    const links = sent[0]!.links!;
-    expect(links).toHaveLength(2);
-    expect(links[0]!.url).toMatch(/^https:\/\/bump.example.com\/approve\/[A-Za-z0-9_-]+$/);
-    expect(links[1]!.url).toMatch(/^https:\/\/bump.example.com\/deny\/[A-Za-z0-9_-]+$/);
+    // URLs are now baked into the body text (action card at top), not the links
+    // list — that's intentional so we don't double-render in HTML+text emails.
+    expect(sent[0]!.body).toMatch(/Approve: https:\/\/bump\.example\.com\/approve\/[A-Za-z0-9_-]+/);
+    expect(sent[0]!.body).toMatch(/Deny:\s+https:\/\/bump\.example\.com\/deny\/[A-Za-z0-9_-]+/);
+    // HTML body should have the styled buttons at the top.
+    expect(sent[0]!.htmlBody).toBeDefined();
+    expect(sent[0]!.htmlBody!).toContain("background:#16a34a");
+    expect(sent[0]!.htmlBody!).toContain(">Approve<");
+    expect(sent[0]!.htmlBody!).toContain(">Deny<");
 
     rmSync(file, { force: true });
   });

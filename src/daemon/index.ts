@@ -186,41 +186,153 @@ async function dispatchHoldNotification(
 ): Promise<void> {
   if (notifiers.length === 0) return;
   const subject = `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`;
-  const lines: string[] = [
-    `Stack:   ${row.stack}`,
-    `Service: ${row.service}`,
-    `Image:   ${row.image}`,
-    `From:    ${row.current_tag}`,
-    `To:      ${row.target_tag}`,
-    `Kind:    ${row.bump} bump`,
-  ];
+  const links = buildLinks(row, publicUrl);
+  const approveUrl = links.find((l) => l.label === "Approve")?.url;
+  const denyUrl = links.find((l) => l.label === "Deny")?.url;
+
+  // Plain-text body: action card at top (instruction + URLs), then metadata,
+  // then LLM summary. Both Apprise and email-clients-without-HTML see this.
+  const text: string[] = [];
+  if (publicUrl && approveUrl && denyUrl) {
+    text.push(
+      "Click Approve to pull + restart, or Deny to leave the stack on its current tag.",
+    );
+    text.push("");
+    text.push(`Approve: ${approveUrl}`);
+    text.push(`Deny:    ${denyUrl}`);
+  } else {
+    text.push("Approval URLs are not configured (set BUMPSIGHT_PUBLIC_URL).");
+  }
+  text.push("");
+  text.push(`Stack:   ${row.stack}`);
+  text.push(`Service: ${row.service}`);
+  text.push(`Image:   ${row.image}`);
+  text.push(`From:    ${row.current_tag}`);
+  text.push(`To:      ${row.target_tag}`);
+  text.push(`Kind:    ${row.bump} bump`);
   if (advise) {
-    lines.push("");
-    lines.push("───── Upstream release-note summary ─────");
+    text.push("");
+    text.push("───── Upstream release-note summary ─────");
     if (advise.ok && advise.summary) {
-      lines.push(
+      text.push(
         `Source: github.com/${advise.repo} · ${advise.releaseCount} release(s) in range`,
       );
-      lines.push("");
-      lines.push(advise.summary);
+      text.push("");
+      text.push(advise.summary);
     } else {
-      lines.push(
+      text.push(
         `(advise skipped: ${advise.error ?? "unknown reason"}` +
           (advise.repo ? ` · upstream: ${advise.repo}` : "") +
           `)`,
       );
     }
   }
-  lines.push("");
-  lines.push(
-    publicUrl
-      ? `Click Approve to pull + restart, or Deny to leave the stack on its current tag.`
-      : `Approval URLs are not configured (set BUMPSIGHT_PUBLIC_URL).`,
-  );
+
+  const htmlBody = buildHoldHtml({
+    row,
+    approveUrl,
+    denyUrl,
+    advise: advise ?? undefined,
+  });
+
   await notifyAll(notifiers, {
     subject,
-    body: lines.join("\n"),
-    links: buildLinks(row, publicUrl),
+    body: text.join("\n"),
+    htmlBody,
+    // Links already rendered inline at the top of the body and as buttons in
+    // the HTML — no need for the formatter to append a duplicate list.
+    links: undefined,
+  });
+}
+
+interface HoldHtmlOpts {
+  row: UpdateRow;
+  approveUrl?: string;
+  denyUrl?: string;
+  advise?: AdviseSummary;
+}
+
+function buildHoldHtml(opts: HoldHtmlOpts): string {
+  const { row, approveUrl, denyUrl, advise } = opts;
+  const e = escapeHtml;
+
+  const buttons =
+    approveUrl && denyUrl
+      ? `
+      <table role="presentation" cellspacing="0" cellpadding="0" border="0">
+        <tr>
+          <td style="padding-right:8px;">
+            <a href="${e(approveUrl)}" style="display:inline-block;background:#16a34a;color:#ffffff;padding:10px 22px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;">Approve</a>
+          </td>
+          <td>
+            <a href="${e(denyUrl)}" style="display:inline-block;background:#475569;color:#ffffff;padding:10px 22px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;">Deny</a>
+          </td>
+        </tr>
+      </table>`
+      : `<p style="margin:0;color:#7f1d1d;font-size:13px;">Approval URLs are not configured (set <code>BUMPSIGHT_PUBLIC_URL</code>).</p>`;
+
+  const adviseSection = advise
+    ? advise.ok && advise.summary
+      ? `
+      <div style="margin-top:24px;">
+        <h3 style="margin:0 0 4px 0;font-size:14px;color:#1e293b;">Upstream release-note summary</h3>
+        <div style="font-size:12px;color:#64748b;margin-bottom:12px;">Source: github.com/${e(advise.repo ?? "")} · ${advise.releaseCount ?? 0} release(s) in range</div>
+        <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:13px;line-height:1.5;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;white-space:pre-wrap;">${e(advise.summary)}</div>
+      </div>`
+      : `
+      <div style="margin-top:24px;font-size:13px;color:#94a3b8;font-style:italic;">
+        Release-note summary skipped: ${e(advise.error ?? "unknown reason")}${advise.repo ? ` · upstream: github.com/${e(advise.repo)}` : ""}
+      </div>`
+    : "";
+
+  return `<!doctype html>
+<html><body style="margin:0;padding:0;background:#f1f5f9;">
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f1f5f9;padding:24px 12px;">
+<tr><td align="center">
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="600" style="max-width:600px;background:#ffffff;border-radius:8px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0f172a;">
+<tr><td style="padding:24px;">
+
+  <!-- Action card -->
+  <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:18px 20px;margin-bottom:24px;">
+    <p style="margin:0 0 14px 0;font-size:14px;line-height:1.5;color:#1e3a8a;">
+      Click <strong>Approve</strong> to pull + restart, or <strong>Deny</strong> to leave the stack on its current tag.
+    </p>
+    ${buttons}
+  </div>
+
+  <!-- Metadata -->
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="font-size:14px;line-height:1.6;">
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Stack</td>   <td><strong>${e(row.stack)}</strong></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Service</td> <td>${e(row.service)}</td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Image</td>   <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.image)}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Bump</td>    <td>${e(row.bump)}</td></tr>
+  </table>
+
+  ${adviseSection}
+
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>`;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      default:
+        return "&#39;";
+    }
   });
 }
 
