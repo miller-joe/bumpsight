@@ -54,11 +54,15 @@ CREATE INDEX IF NOT EXISTS idx_updates_token ON updates(approval_token);
 
 -- Last-seen digest per (image, tag). Used to detect digest changes on moving
 -- tags like :latest where the version isn't encoded in the tag itself.
+-- resolved_tag records the most-precise semver tag we found sharing this
+-- digest at observation time (Phase 2 — used to classify digest changes
+-- as patch/minor/major instead of always "digest").
 CREATE TABLE IF NOT EXISTS tag_digests (
-  image     TEXT NOT NULL,
-  tag       TEXT NOT NULL,
-  digest    TEXT NOT NULL,
-  seen_at   INTEGER NOT NULL,
+  image         TEXT NOT NULL,
+  tag           TEXT NOT NULL,
+  digest        TEXT NOT NULL,
+  resolved_tag  TEXT,
+  seen_at       INTEGER NOT NULL,
   PRIMARY KEY (image, tag)
 );
 `;
@@ -75,12 +79,23 @@ function migrate(db: DB): void {
       "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
     )
     .get() as { sql: string } | undefined;
-  if (!row) return; // fresh DB — SCHEMA's CREATE TABLE IF NOT EXISTS handles it
-  if (row.sql.includes("'patch','minor','major','unknown'")) {
+  if (row && row.sql.includes("'patch','minor','major','unknown'")) {
+    // pre-v0.3.1 had a CHECK on `bump` that doesn't include 'digest'.
+    // SQLite can't ALTER a CHECK in place, so rename + recreate.
     db.exec("ALTER TABLE updates RENAME TO _updates_v1");
-    db.exec(SCHEMA); // creates the new table
+    db.exec(SCHEMA);
     db.exec("INSERT INTO updates SELECT * FROM _updates_v1");
     db.exec("DROP TABLE _updates_v1");
+  }
+
+  // Add tag_digests.resolved_tag if upgrading from v0.3.1 (Phase 1).
+  const td = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='tag_digests'",
+    )
+    .get() as { sql: string } | undefined;
+  if (td && !/\bresolved_tag\b/.test(td.sql)) {
+    db.exec("ALTER TABLE tag_digests ADD COLUMN resolved_tag TEXT");
   }
 }
 
@@ -99,36 +114,54 @@ export function openDb(opts: OpenOptions): DB {
   return db;
 }
 
+export interface StoredDigest {
+  digest: string;
+  resolvedTag: string | null;
+}
+
 /**
  * Look up the last-seen digest for (image, tag). Returns undefined if we've
  * never recorded one — caller's first observation should always be stored
- * silently (no bump generated for the initial observation).
+ * silently (no bump generated for the initial observation). The resolved_tag
+ * field carries the most-precise semver tag that shared this digest at the
+ * time of observation (Phase 2). Rows recorded under v0.3.1 have it null.
  */
 export function getStoredDigest(
   db: DB,
   image: string,
   tag: string,
-): string | undefined {
+): StoredDigest | undefined {
   const row = db
-    .prepare(`SELECT digest FROM tag_digests WHERE image = ? AND tag = ?`)
-    .get(image, tag) as { digest: string } | undefined;
-  return row?.digest;
+    .prepare(
+      `SELECT digest, resolved_tag FROM tag_digests WHERE image = ? AND tag = ?`,
+    )
+    .get(image, tag) as
+    | { digest: string; resolved_tag: string | null }
+    | undefined;
+  if (!row) return undefined;
+  return { digest: row.digest, resolvedTag: row.resolved_tag };
 }
 
 /**
- * Record (or replace) the last-seen digest for (image, tag).
+ * Record (or replace) the last-seen digest for (image, tag). The optional
+ * resolvedTag is the most-precise semver tag known to share this digest at
+ * the time of observation (used by Phase 2 digest → semver resolution).
  */
 export function saveDigest(
   db: DB,
   image: string,
   tag: string,
   digest: string,
+  resolvedTag?: string | null,
 ): void {
   db.prepare(
-    `INSERT INTO tag_digests (image, tag, digest, seen_at)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(image, tag) DO UPDATE SET digest = excluded.digest, seen_at = excluded.seen_at`,
-  ).run(image, tag, digest, Date.now());
+    `INSERT INTO tag_digests (image, tag, digest, resolved_tag, seen_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(image, tag) DO UPDATE SET
+       digest = excluded.digest,
+       resolved_tag = excluded.resolved_tag,
+       seen_at = excluded.seen_at`,
+  ).run(image, tag, digest, resolvedTag ?? null, Date.now());
 }
 
 export interface NewUpdate {

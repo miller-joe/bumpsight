@@ -1,9 +1,14 @@
 import { dirname, basename, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { Database as DB } from "better-sqlite3";
-import { loadComposeFile, parseImageRef } from "../compose/parse.js";
-import { isSupportedRegistry, listTags } from "../registry/index.js";
-import { findLatestInFamily } from "../util/semver.js";
+import { loadComposeFile, parseImageRef, type ImageRef } from "../compose/parse.js";
+import {
+  isSupportedRegistry,
+  listTags,
+  fetchManifestDigest,
+  type RemoteTag,
+} from "../registry/index.js";
+import { findLatestInFamily, parseTag } from "../util/semver.js";
 import { classifyBump, decideAction, isMovingTag } from "./rules.js";
 import type { BumpKind, RulesConfig } from "./rules.js";
 import type { DaemonConfig } from "./config.js";
@@ -56,6 +61,8 @@ export interface ScanRunDeps {
   notifyIntervalMs?: number;
   /** Test seam — defaults to the real registry client. */
   listTagsFn?: typeof listTags;
+  /** Test seam — defaults to the real per-tag manifest digest fetcher. */
+  fetchManifestDigestFn?: typeof fetchManifestDigest;
   /** Test seam — defaults to the real spawn-based docker runner. */
   runner?: CommandRunner;
   /** Test seam — override advise. Returns null to skip the LLM section. */
@@ -82,6 +89,7 @@ export async function runScanOnce(
     errors: {},
   };
   const lister = deps.listTagsFn ?? listTags;
+  const manifestFetcher = deps.fetchManifestDigestFn ?? fetchManifestDigest;
   const sleep =
     deps.sleepFn ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const notifyIntervalMs = deps.notifyIntervalMs ?? 0;
@@ -117,34 +125,95 @@ export async function runScanOnce(
       }
 
       // Path A: moving tag (latest / stable / edge / etc.) — track digest
-      // changes instead of tag-name changes. Phase 1 always holds these for
-      // approval; Phase 2 will resolve digest → semver tag and apply policy.
+      // changes. Phase 2: try to resolve the digest to the most-precise
+      // semver tag sharing it. When both prior and new digests resolve, we
+      // classify the change as a normal patch / minor / major and let the
+      // stack's policy decide auto-apply vs hold. When resolution fails on
+      // either side, we fall back to Phase 1 behavior (always hold, with
+      // digest prefixes shown in the email).
       if (isMovingTag(ref.tag)) {
+        // Get the current digest of the moving tag. Docker Hub returns it
+        // inline in the tag list; GHCR doesn't, so fall back to a manifest
+        // probe.
         const matching = tags.find((t) => t.name === ref.tag);
-        const newDigest = matching?.digest;
-        if (!newDigest) continue; // registry doesn't expose digests in tag list (GHCR)
-        const prevDigest = getStoredDigest(deps.db, ref.raw, ref.tag);
-        if (!prevDigest) {
-          // First observation — record silently, no bump.
-          saveDigest(deps.db, ref.raw, ref.tag, newDigest);
+        let newDigest = matching?.digest;
+        if (!newDigest) {
+          try {
+            newDigest = await manifestFetcher(ref, ref.tag);
+          } catch {
+            newDigest = undefined;
+          }
+        }
+        if (!newDigest) continue;
+
+        const prev = getStoredDigest(deps.db, ref.raw, ref.tag);
+
+        if (!prev) {
+          // First observation — resolve and record silently for the next scan.
+          const resolved = await resolveDigestToTag(
+            ref,
+            tags,
+            newDigest,
+            ref.tag,
+            manifestFetcher,
+          );
+          saveDigest(deps.db, ref.raw, ref.tag, newDigest, resolved ?? null);
           continue;
         }
-        if (prevDigest === newDigest) continue;
+        if (prev.digest === newDigest) continue;
 
-        const fromShort = prevDigest.replace(/^sha256:/, "").slice(0, 12);
-        const toShort = newDigest.replace(/^sha256:/, "").slice(0, 12);
-        const bump: BumpKind = "digest";
+        // Digest changed. Try to resolve it to a semver tag.
+        const newResolved = await resolveDigestToTag(
+          ref,
+          tags,
+          newDigest,
+          ref.tag,
+          manifestFetcher,
+        );
+
+        let bump: BumpKind = "digest";
+        let currentTagForRow = prev.digest.replace(/^sha256:/, "").slice(0, 12);
+        let targetTagForRow = newDigest.replace(/^sha256:/, "").slice(0, 12);
+        let familyForRow: string | undefined;
+
+        // Phase 2 happy path: both sides resolve to a semver tag we can
+        // classify. Use the resolved pair as the row's current/target so the
+        // email shows "1.27.4 → 1.27.5" instead of digest prefixes, and so
+        // policy can auto-apply.
+        if (prev.resolvedTag && newResolved) {
+          const semverBump = classifyBump(prev.resolvedTag, newResolved);
+          if (semverBump !== "unknown") {
+            bump = semverBump;
+            currentTagForRow = prev.resolvedTag;
+            targetTagForRow = newResolved;
+            familyForRow = `moving:${ref.tag}`;
+          }
+        }
+
         const decision = decideAction(deps.rules, stack, bump);
-        if (decision === "skip") continue;
+        if (decision === "skip") {
+          // Still advance stored digest so we don't refire on every scan.
+          saveDigest(
+            deps.db,
+            ref.raw,
+            ref.tag,
+            newDigest,
+            newResolved ?? null,
+          );
+          continue;
+        }
 
         const token =
-          decision === "hold" ? randomBytes(18).toString("base64url") : undefined;
+          decision === "hold"
+            ? randomBytes(18).toString("base64url")
+            : undefined;
         const id = recordUpdate(deps.db, {
           stack,
           service: serviceName,
           image: ref.raw,
-          currentTag: fromShort,
-          targetTag: toShort,
+          currentTag: currentTagForRow,
+          targetTag: targetTagForRow,
+          family: familyForRow,
           bump,
           approvalToken: token,
         });
@@ -154,9 +223,43 @@ export async function runScanOnce(
 
         // Advance the stored digest now so a re-scan before the user acts
         // doesn't keep refiring the same bump.
-        saveDigest(deps.db, ref.raw, ref.tag, newDigest);
+        saveDigest(deps.db, ref.raw, ref.tag, newDigest, newResolved ?? null);
 
-        if (decision === "report") {
+        if (decision === "auto-apply") {
+          // applyOne sees row.family === `moving:${tag}` and skips the
+          // compose-file rewrite (the file still says `:latest`); it just
+          // pulls + restarts so the new digest gets picked up.
+          result.autoApplied += 1;
+          const after = await applyOne(
+            {
+              db: deps.db,
+              composeFiles: deps.composeFiles,
+              runner: deps.runner,
+            },
+            row.id,
+          );
+          if (after.status === "applied") result.autoAppliedOk += 1;
+          await dispatchAppliedNotification(
+            deps.notifiers,
+            after,
+            deps.llmUrl
+              ? await safeAdvise(
+                  {
+                    image: ref.raw,
+                    from: currentTagForRow,
+                    to: targetTagForRow,
+                    composeFile: composePath,
+                    serviceName,
+                    llmUrl: deps.llmUrl,
+                    llmKey: deps.llmKey,
+                    model: deps.llmModel,
+                    githubToken: deps.githubToken,
+                  },
+                  deps.adviseFn,
+                )
+              : null,
+          );
+        } else if (decision === "report") {
           reportRows.push({ row, composePath, serviceName });
         } else {
           result.held += 1;
@@ -375,11 +478,15 @@ async function dispatchBumpNotification(
   text.push(`Image:   ${row.image}`);
   if (isDigest) {
     text.push(`Digest:  sha256:${row.current_tag}… → sha256:${row.target_tag}…`);
-    text.push(`Kind:    digest change (no semver classification — Phase 1)`);
+    text.push(`Kind:    digest change (no semver classification — fallback)`);
   } else {
     text.push(`From:    ${row.current_tag}`);
     text.push(`To:      ${row.target_tag}`);
     text.push(`Kind:    ${row.bump} bump`);
+  }
+  if (row.bump !== "digest" && row.family?.startsWith("moving:")) {
+    const movingTag = row.family.slice("moving:".length);
+    text.push(`Origin:  digest change on :${movingTag}`);
   }
   if (others.length > 0) {
     text.push("");
@@ -530,6 +637,11 @@ function buildHoldHtml(opts: HoldHtmlOpts): string {
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Bump</td>    <td>${e(row.bump)}</td></tr>
+    ${
+      row.bump !== "digest" && row.family?.startsWith("moving:")
+        ? `<tr><td style="padding:2px 14px 2px 0;color:#64748b;">Origin</td>  <td>digest change on <code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">:${e(row.family.slice("moving:".length))}</code></td></tr>`
+        : ""
+    }
   </table>
 
   ${adviseSection}
@@ -569,6 +681,74 @@ async function safeAdvise(
   }
 }
 
+/**
+ * Given a digest from a moving tag (e.g. `:latest`), return the most-precise
+ * semver-shaped tag in the registry that shares it. Used to classify
+ * digest changes as a normal patch / minor / major bump.
+ *
+ * Strategy:
+ *   - Take all semver-shaped candidate tags (skip the moving tag itself and
+ *     any other moving channels — those have no `numeric` part).
+ *   - Sort by descending precision (most-specific first), then alphabetically
+ *     so within the same precision the higher-version name wins.
+ *   - Fast path: if the registry returned digests inline (Docker Hub), match
+ *     directly.
+ *   - Slow path: probe candidate manifests one by one, capped at MAX_PROBES
+ *     to avoid runaway requests on a registry without inline digests (GHCR).
+ *
+ * Returns undefined when nothing matches — callers fall back to the
+ * Phase 1 digest-only behavior (always hold).
+ */
+async function resolveDigestToTag(
+  ref: ImageRef,
+  tags: RemoteTag[],
+  digest: string,
+  movingTag: string,
+  fetchFn: typeof fetchManifestDigest,
+): Promise<string | undefined> {
+  interface Candidate {
+    name: string;
+    precision: number;
+    digest?: string;
+  }
+  const candidates: Candidate[] = [];
+  for (const t of tags) {
+    if (t.name.toLowerCase() === movingTag.toLowerCase()) continue;
+    const parsed = parseTag(t.name);
+    if (!parsed.numeric) continue; // skip other moving / opaque tags
+    candidates.push({
+      name: t.name,
+      precision: parsed.numeric.length,
+      digest: t.digest,
+    });
+  }
+  candidates.sort((a, b) => {
+    if (a.precision !== b.precision) return b.precision - a.precision;
+    return b.name.localeCompare(a.name);
+  });
+
+  // Fast path: inline digests (Docker Hub).
+  for (const c of candidates) {
+    if (c.digest && c.digest === digest) return c.name;
+  }
+
+  // Slow path: probe manifests for tags without inline digests (GHCR).
+  const MAX_PROBES = 30;
+  let probed = 0;
+  for (const c of candidates) {
+    if (c.digest !== undefined) continue;
+    if (probed >= MAX_PROBES) break;
+    probed += 1;
+    try {
+      const probed_digest = await fetchFn(ref, c.name);
+      if (probed_digest === digest) return c.name;
+    } catch {
+      // ignore probe failure, keep trying others
+    }
+  }
+  return undefined;
+}
+
 async function dispatchAppliedNotification(
   notifiers: Notifier[],
   row: UpdateRow,
@@ -591,6 +771,9 @@ async function dispatchAppliedNotification(
   text.push(`From:    ${row.current_tag}`);
   text.push(`To:      ${row.target_tag}`);
   text.push(`Kind:    ${row.bump} bump`);
+  if (row.bump !== "digest" && row.family?.startsWith("moving:")) {
+    text.push(`Origin:  digest change on :${row.family.slice("moving:".length)}`);
+  }
   text.push(`Status:  ${row.status}`);
   if (row.apply_log) {
     text.push("");
@@ -684,6 +867,11 @@ function buildAppliedHtml(opts: AppliedHtmlOpts): string {
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Bump</td>    <td>${e(row.bump)}</td></tr>
+    ${
+      row.bump !== "digest" && row.family?.startsWith("moving:")
+        ? `<tr><td style="padding:2px 14px 2px 0;color:#64748b;">Origin</td>  <td>digest change on <code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">:${e(row.family.slice("moving:".length))}</code></td></tr>`
+        : ""
+    }
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Status</td>  <td>${e(row.status)}</td></tr>
   </table>
 
@@ -714,6 +902,7 @@ export interface StartDaemonDeps {
   log: (msg: string) => void;
   /** Test seams. */
   listTagsFn?: typeof listTags;
+  fetchManifestDigestFn?: typeof fetchManifestDigest;
   runner?: CommandRunner;
   adviseFn?: typeof getAdviseSummary;
 }
@@ -747,6 +936,7 @@ export function startDaemon(
           githubToken: deps.githubToken,
           notifyIntervalMs: cfg.notifyIntervalMs,
           listTagsFn: deps.listTagsFn,
+          fetchManifestDigestFn: deps.fetchManifestDigestFn,
           runner: deps.runner,
           adviseFn: deps.adviseFn,
         });

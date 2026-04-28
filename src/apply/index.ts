@@ -36,19 +36,26 @@ export async function applyOne(
     return findUpdate(deps.db, updateId)!;
   }
 
-  try {
-    rewriteImageTag({
-      composePath,
-      serviceName: row.service,
-      expectedCurrentTag: row.current_tag,
-      newTag: row.target_tag,
-    });
-  } catch (err) {
-    setApplied(deps.db, row.id, {
-      ok: false,
-      log: `apply: rewrite failed: ${(err as Error).message}`,
-    });
-    return findUpdate(deps.db, updateId)!;
+  // Moving-tag bumps (e.g. :latest digest changes that resolved to a semver
+  // pair) keep the original `:latest` in the compose file — the upgrade is
+  // achieved by `pull` picking up the new digest. Don't try to rewrite.
+  const isMovingApply = row.family?.startsWith("moving:") ?? false;
+
+  if (!isMovingApply) {
+    try {
+      rewriteImageTag({
+        composePath,
+        serviceName: row.service,
+        expectedCurrentTag: row.current_tag,
+        newTag: row.target_tag,
+      });
+    } catch (err) {
+      setApplied(deps.db, row.id, {
+        ok: false,
+        log: `apply: rewrite failed: ${(err as Error).message}`,
+      });
+      return findUpdate(deps.db, updateId)!;
+    }
   }
 
   const result = await pullAndUp({

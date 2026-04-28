@@ -348,7 +348,9 @@ describe("runScanOnce", () => {
     expect(sent).toHaveLength(0);
     // Digest got recorded for next scan
     const { getStoredDigest } = await import("../src/state/db.js");
-    expect(getStoredDigest(db, "nginx:latest", "latest")).toBe("sha256:aaaaaaaaaaaa1111");
+    expect(getStoredDigest(db, "nginx:latest", "latest")?.digest).toBe(
+      "sha256:aaaaaaaaaaaa1111",
+    );
     rmSync(file, { force: true });
   });
 
@@ -388,7 +390,9 @@ describe("runScanOnce", () => {
 
     // Stored digest advanced to the new value
     const { getStoredDigest } = await import("../src/state/db.js");
-    expect(getStoredDigest(db, "nginx:latest", "latest")).toBe("sha256:bbbbbbbbbbbb2222");
+    expect(getStoredDigest(db, "nginx:latest", "latest")?.digest).toBe(
+      "sha256:bbbbbbbbbbbb2222",
+    );
 
     // Third scan with no further change: no new bump
     sent.length = 0;
@@ -396,6 +400,165 @@ describe("runScanOnce", () => {
     expect(third.discovered).toBe(0);
     expect(sent).toHaveLength(0);
 
+    rmSync(file, { force: true });
+  });
+
+  it("digest tracking Phase 2: resolves :latest digest to semver pair and auto-applies under matching policy", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-phase2-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
+
+    // First scan: :latest digest matches 1.27.4
+    let latestDigest = "sha256:aaaa";
+    const fakeListTags = async () => [
+      { name: "latest", digest: latestDigest },
+      { name: "1", digest: latestDigest },
+      { name: "1.27", digest: latestDigest },
+      { name: "1.27.4", digest: "sha256:aaaa" },
+      { name: "1.27.5", digest: "sha256:bbbb" },
+    ];
+    const calls: { args: string[] }[] = [];
+    const runner: CommandRunner = async (_, args) => {
+      calls.push({ args });
+      return { exitCode: 0, combinedOutput: "ok" };
+    };
+
+    const deps = {
+      db,
+      notifiers: [notifier],
+      rules: { default: "patch" as const, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+      runner,
+    };
+    // First scan resolves :latest → 1.27.4 silently.
+    await runScanOnce(deps);
+    expect(sent).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+
+    // Second scan: :latest now points at 1.27.5's digest (a patch bump).
+    latestDigest = "sha256:bbbb";
+    const result = await runScanOnce(deps);
+    expect(result.autoApplied).toBe(1);
+    expect(result.autoAppliedOk).toBe(1);
+    // pull + up ran against the moving-tag stack
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.args).toContain("pull");
+    expect(calls[1]!.args).toContain("up");
+    // Compose file is NOT rewritten — still says :latest
+    expect(readFileSync(file, "utf-8")).toContain("nginx:latest");
+    // Notification reports the resolved semver pair, not digest prefixes
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.body).toContain("From:    1.27.4");
+    expect(sent[0]!.body).toContain("To:      1.27.5");
+    expect(sent[0]!.body).toContain("Origin:  digest change on :latest");
+    rmSync(file, { force: true });
+  });
+
+  it("digest tracking Phase 2: falls back to digest hold when prior side has no resolved tag", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-phase2-fallback-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
+
+    // Pre-seed a v0.3.1-style row: digest known, resolved_tag null.
+    const { saveDigest } = await import("../src/state/db.js");
+    saveDigest(db, "nginx:latest", "latest", "sha256:aaaa", null);
+
+    const fakeListTags = async () => [
+      { name: "latest", digest: "sha256:bbbb" },
+      { name: "1.27.5", digest: "sha256:bbbb" },
+    ];
+    const calls: { args: string[] }[] = [];
+    const runner: CommandRunner = async (_, args) => {
+      calls.push({ args });
+      return { exitCode: 0, combinedOutput: "ok" };
+    };
+
+    // Even under `major` policy, fallback should hold.
+    const result = await runScanOnce({
+      db,
+      notifiers: [notifier],
+      rules: { default: "major", stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+      runner,
+    });
+    expect(result.autoApplied).toBe(0);
+    expect(result.held).toBe(1);
+    expect(calls).toHaveLength(0);
+    expect(sent[0]!.subject).toContain("digest changed");
+    rmSync(file, { force: true });
+  });
+
+  it("digest tracking Phase 2: probes GHCR manifests when tag list lacks inline digests", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-phase2-ghcr-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(
+      file,
+      `services:\n  app:\n    image: ghcr.io/example/app:latest\n`,
+      "utf-8",
+    );
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
+
+    // GHCR-style tag list: no inline digests
+    const fakeListTags = async () => [
+      { name: "latest" },
+      { name: "1.27.4" },
+      { name: "1.27.5" },
+    ];
+
+    let movingDigest = "sha256:aaaa";
+    const probes: string[] = [];
+    const fetchManifestDigestFn = async (
+      _ref: unknown,
+      tag: string,
+    ): Promise<string | undefined> => {
+      probes.push(tag);
+      if (tag === "latest") return movingDigest;
+      if (tag === "1.27.4") return "sha256:aaaa";
+      if (tag === "1.27.5") return "sha256:bbbb";
+      return undefined;
+    };
+
+    const deps = {
+      db,
+      notifiers: [notifier],
+      rules: { default: "notify" as const, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+      fetchManifestDigestFn: fetchManifestDigestFn as never,
+    };
+    // First scan: silent record after probing.
+    await runScanOnce(deps);
+    expect(sent).toHaveLength(0);
+
+    movingDigest = "sha256:bbbb";
+    const result = await runScanOnce(deps);
+    expect(result.held).toBe(1);
+    expect(sent).toHaveLength(1);
+    // Resolved pair shown in body
+    expect(sent[0]!.body).toContain("From:    1.27.4");
+    expect(sent[0]!.body).toContain("To:      1.27.5");
     rmSync(file, { force: true });
   });
 

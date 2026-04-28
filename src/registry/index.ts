@@ -3,6 +3,7 @@ import { listDockerHubTags, type RemoteTag, type FetchTagsOptions } from "./dock
 import { listGhcrTags } from "./ghcr.js";
 
 export type { RemoteTag, FetchTagsOptions } from "./dockerhub.js";
+export { fetchManifestDigest } from "./manifest.js";
 
 /**
  * Dispatch to the correct registry client for an image. Unsupported

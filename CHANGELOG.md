@@ -2,6 +2,27 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.3.2 — 2026-04-28
+
+`:latest` digest tracking — Phase 2: digest → semver resolution + GHCR support.
+
+### Added
+
+- **Digest → semver tag resolution.** When a moving tag (`:latest`, `:stable`, …) gets a new digest, bumpsight now looks for a semver-shaped tag in the registry that shares the digest (e.g. `nginx:latest` → digest also tagged `1.27.5`). When both the prior and new digests resolve to semver tags, the change is classified as a normal `patch` / `minor` / `major` bump and the stack's policy decides auto-apply vs hold — fulfilling the "12.1→12.2 auto, 12→13 ask" workflow.
+- **GHCR digest tracking.** Now works on GHCR images. The Docker Registry v2 `/tags/list` endpoint that GHCR uses doesn't return digests inline, so bumpsight falls back to per-tag manifest probes (`HEAD /v2/<repo>/manifests/<tag>`) — capped at 30 probes per resolution to keep scans fast.
+- **`Origin: digest change on :<tag>` line** in held + auto-applied notifications when the underlying source was a moving-tag bump. Makes it obvious that the resolved semver pair came from `:latest`'s pointer moving, not from rewriting `:latest` to a pinned tag in the compose file.
+- **`tag_digests.resolved_tag` column.** Stores the semver tag we matched a digest to at observation time, so the next scan can compare resolved-pair against resolved-pair without re-probing the prior side.
+
+### Changed
+
+- **Auto-applied moving-tag bumps no longer rewrite the compose file.** When a `:latest` digest change resolves and falls under auto-apply policy, the daemon runs `docker compose pull && up -d` against the existing `:latest` reference instead of pinning the file to the resolved tag. The user's choice to track a moving tag is preserved.
+- **Schema migration.** `tag_digests` gains a nullable `resolved_tag` column. Pre-v0.3.2 rows simply have NULL there — those bumps fall back to Phase 1 behavior (always hold) on the next observed digest change, since we don't know what tag the prior digest resolved to. Idempotent — safe to upgrade from v0.3.1.
+
+### Notes
+
+- When digest resolution fails on either the prior or new side (e.g. registry pruned the matching tag, or it's pinned outside the 200-tag horizon), the daemon falls back to Phase 1 — emit a `digest`-kind bump with hex prefixes and always hold.
+- LLM advise now runs on resolved moving-tag bumps too, since the resolved semver pair is a real upstream tag range.
+
 ## 0.3.1 — 2026-04-27
 
 `:latest` digest tracking — Phase 1.

@@ -205,9 +205,59 @@ describe("digest tracking helpers", () => {
     const db = openDb({ path: ":memory:" });
     const { saveDigest, getStoredDigest } = await import("../src/state/db.js");
     saveDigest(db, "nginx:latest", "latest", "sha256:aaa");
-    expect(getStoredDigest(db, "nginx:latest", "latest")).toBe("sha256:aaa");
+    expect(getStoredDigest(db, "nginx:latest", "latest")).toEqual({
+      digest: "sha256:aaa",
+      resolvedTag: null,
+    });
     saveDigest(db, "nginx:latest", "latest", "sha256:bbb");
-    expect(getStoredDigest(db, "nginx:latest", "latest")).toBe("sha256:bbb");
+    expect(getStoredDigest(db, "nginx:latest", "latest")).toEqual({
+      digest: "sha256:bbb",
+      resolvedTag: null,
+    });
+  });
+
+  it("saveDigest preserves resolved_tag round-trip", async () => {
+    const db = openDb({ path: ":memory:" });
+    const { saveDigest, getStoredDigest } = await import("../src/state/db.js");
+    saveDigest(db, "nginx:latest", "latest", "sha256:aaa", "1.27.4");
+    expect(getStoredDigest(db, "nginx:latest", "latest")).toEqual({
+      digest: "sha256:aaa",
+      resolvedTag: "1.27.4",
+    });
+    // Re-observation with a new digest replaces the resolution too.
+    saveDigest(db, "nginx:latest", "latest", "sha256:bbb", "1.27.5");
+    expect(getStoredDigest(db, "nginx:latest", "latest")).toEqual({
+      digest: "sha256:bbb",
+      resolvedTag: "1.27.5",
+    });
+  });
+
+  it("openDb adds resolved_tag column to a v0.3.1-shaped tag_digests table", async () => {
+    const Database = (await import("better-sqlite3")).default;
+    const tmp = `/tmp/bumpsight-mig-${Date.now()}-${Math.random()}.sqlite`;
+    const raw = new Database(tmp);
+    raw.exec(`
+      CREATE TABLE tag_digests (
+        image     TEXT NOT NULL,
+        tag       TEXT NOT NULL,
+        digest    TEXT NOT NULL,
+        seen_at   INTEGER NOT NULL,
+        PRIMARY KEY (image, tag)
+      );
+      INSERT INTO tag_digests (image, tag, digest, seen_at)
+      VALUES ('nginx:latest', 'latest', 'sha256:old', 1);
+    `);
+    raw.close();
+
+    const db = openDb({ path: tmp });
+    const { getStoredDigest } = await import("../src/state/db.js");
+    expect(getStoredDigest(db, "nginx:latest", "latest")).toEqual({
+      digest: "sha256:old",
+      resolvedTag: null,
+    });
+    db.close();
+    const fs = await import("node:fs");
+    fs.unlinkSync(tmp);
   });
 
   it("openDb migrates an old-schema DB by rebuilding the updates table", async () => {
