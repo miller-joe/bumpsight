@@ -58,5 +58,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # GHCR-backed registry cache (replaces the GHA cache backend, which
+          # consistently hung on multi-arch cache export during v0.2.1 builds).
+          cache-from: type=registry,ref=ghcr.io/miller-joe/bumpsight:buildcache
+          cache-to: type=registry,ref=ghcr.io/miller-joe/bumpsight:buildcache,mode=max

@@ -2,6 +2,14 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.2.2 — 2026-04-27
+
+Release pipeline fix only. Same code as v0.2.1.
+
+### Fixed
+
+- Multi-arch GHCR image build was hanging on the buildx cache export step. Switched the buildx cache backend from `type=gha` to GHCR-backed registry cache (`type=registry,ref=…:buildcache`) — fixes the hang and keeps `linux/amd64`+`linux/arm64` both publishing. Workflow also gained a `timeout-minutes: 30` guard and a `workflow_dispatch:` trigger so future stalls die cleanly and can be re-run from the Actions UI.
+
 ## 0.2.1 — 2026-04-27
 
 Reliability fixes shaken out by the v0.2.0 dogfood deploy.
