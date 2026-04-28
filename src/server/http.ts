@@ -2,7 +2,12 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse, Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Database as DB } from "better-sqlite3";
-import { findByToken, setDecision, type UpdateRow } from "../state/db.js";
+import {
+  findByToken,
+  findSiblings,
+  setDecision,
+  type UpdateRow,
+} from "../state/db.js";
 import { applyOne } from "../apply/index.js";
 import type { CommandRunner } from "../apply/docker.js";
 
@@ -122,19 +127,28 @@ async function handleApprove(
     return;
   }
 
-  setDecision(deps.db, row.id, { status: "approved", decidedBy: "http-link" });
+  // Find sibling rows (same image bump on other stacks) so this single
+  // click approves the whole group that the notification covered.
+  const siblings = findSiblings(deps.db, row);
+  const all = [row, ...siblings];
+
+  for (const r of all) {
+    setDecision(deps.db, r.id, { status: "approved", decidedBy: "http-link" });
+  }
   // Reply immediately, run apply in background so the click feels snappy.
-  writeHtml(res, 200, approvedPendingPage(row));
+  writeHtml(res, 200, approvedPendingPage(row, siblings));
 
   void (async () => {
-    try {
-      const after = await applyOne(
-        { db: deps.db, composeFiles: deps.composeFiles, runner: deps.runner },
-        row.id,
-      );
-      log(`apply ${row.id} (${row.stack}/${row.service}): ${after.status}`);
-    } catch (err) {
-      log(`apply ${row.id} crashed: ${(err as Error).message}`);
+    for (const r of all) {
+      try {
+        const after = await applyOne(
+          { db: deps.db, composeFiles: deps.composeFiles, runner: deps.runner },
+          r.id,
+        );
+        log(`apply ${r.id} (${r.stack}/${r.service}): ${after.status}`);
+      } catch (err) {
+        log(`apply ${r.id} crashed: ${(err as Error).message}`);
+      }
     }
   })();
 }
@@ -165,9 +179,13 @@ function handleDeny(
     );
     return;
   }
-  setDecision(deps.db, row.id, { status: "denied", decidedBy: "http-link" });
-  log(`denied ${row.id} (${row.stack}/${row.service})`);
-  writeHtml(res, 200, deniedPage({ ...row, status: "denied" }));
+  const siblings = findSiblings(deps.db, row);
+  const all = [row, ...siblings];
+  for (const r of all) {
+    setDecision(deps.db, r.id, { status: "denied", decidedBy: "http-link" });
+    log(`denied ${r.id} (${r.stack}/${r.service})`);
+  }
+  writeHtml(res, 200, deniedPage({ ...row, status: "denied" }, siblings));
 }
 
 function writeHtml(res: ServerResponse, status: number, html: string): void {
@@ -195,10 +213,16 @@ function summaryRows(row: UpdateRow): string {
   <p><span class=k>Bump:</span>    ${row.bump}</p>`;
 }
 
-function approvedPendingPage(row: UpdateRow): string {
+function approvedPendingPage(row: UpdateRow, siblings: UpdateRow[] = []): string {
+  const extra =
+    siblings.length > 0
+      ? `<p>Approval also applied to ${siblings.length} other stack(s) running the same image: <code>${siblings
+          .map((s) => escapeHtml(`${s.stack}/${s.service}`))
+          .join(", ")}</code>.</p>`
+      : "";
   return page(
     "Approved — applying",
-    `Pulling and recreating <code>${escapeHtml(row.service)}</code> on <code>${escapeHtml(row.stack)}</code>. Watch the daemon log for the result.${summaryRows(row)}`,
+    `Pulling and recreating <code>${escapeHtml(row.service)}</code> on <code>${escapeHtml(row.stack)}</code>. Watch the daemon log for the result.${extra}${summaryRows(row)}`,
   );
 }
 
@@ -209,10 +233,16 @@ function alreadyAppliedPage(row: UpdateRow): string {
   );
 }
 
-function deniedPage(row: UpdateRow): string {
+function deniedPage(row: UpdateRow, siblings: UpdateRow[] = []): string {
+  const extra =
+    siblings.length > 0
+      ? `<p>Denial also applied to ${siblings.length} other stack(s) running the same image: <code>${siblings
+          .map((s) => escapeHtml(`${s.stack}/${s.service}`))
+          .join(", ")}</code>.</p>`
+      : "";
   return page(
     "Denied",
-    `The bump was rejected and won't be applied.${summaryRows(row)}`,
+    `The bump was rejected and won't be applied.${extra}${summaryRows(row)}`,
   );
 }
 

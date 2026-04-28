@@ -62,6 +62,10 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     opts.interval ?? process.env.BUMPSIGHT_INTERVAL ?? fileShape.interval ?? "6h";
   const intervalMs = parseDuration(intervalRaw);
 
+  const notifyIntervalRaw =
+    process.env.BUMPSIGHT_NOTIFY_INTERVAL ?? fileShape.notify_interval ?? "10s";
+  const notifyIntervalMs = parseDuration(notifyIntervalRaw);
+
   const dbPath =
     opts.dbPath ??
     process.env.BUMPSIGHT_DB ??
@@ -99,6 +103,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
     intervalMs,
+    notifyIntervalMs,
     notifyUris,
     rules,
     httpPort,
@@ -124,7 +129,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
         : `(auto-discovered under ${stacksDir})`;
   log(
     `daemon starting: ${cfg.composeFiles.length} compose file(s) ${discoveryHint}, ` +
-      `interval=${intervalRaw}, notifiers=${notifiers.length}, ` +
+      `interval=${intervalRaw}, notify_interval=${notifyIntervalRaw}, ` +
+      `notifiers=${notifiers.length}, ` +
       `default=${cfg.rules.default}, db=${cfg.dbPath}, ` +
       `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}, ` +
       `advise=${cfg.llmUrl ? `on @ ${cfg.llmUrl} (${cfg.llmModel ?? "default-model"})` : "off"}`,
@@ -141,6 +147,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       llmKey: cfg.llmKey,
       llmModel: cfg.llmModel,
       githubToken: cfg.githubToken,
+      notifyIntervalMs: cfg.notifyIntervalMs,
     });
     log(
       `scan: ${result.scanned} services, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held)`,

@@ -2,6 +2,19 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.2.1 — 2026-04-27
+
+Reliability fixes shaken out by the v0.2.0 dogfood deploy.
+
+### Fixed
+
+- **Held bumps no longer get marked `notified` when delivery fails.** A row is only advanced to `notified` after at least one notifier reports success. Previously, an SMTP rejection (e.g. an MXroute throttle) would silently bury the row — it would never re-fire on later scans. Now failed deliveries leave rows in `pending` and the next scan retries.
+
+### Added
+
+- **Per-message dispatch rate limit.** New `BUMPSIGHT_NOTIFY_INTERVAL` env (also `notify_interval:` in `bumpsight.yaml`), default `10s`. Enforces a minimum gap between dispatched notifications so a 13-bump first scan doesn't trip the SMTP relay's rate limit.
+- **Image-level dedup.** Multiple stacks running the same image bump now collapse into a single notification — e.g. 17 vault-agent sidecars on `1.21 → 1.22` produce one email listing all stacks, not 17. Approving (or denying) the canonical link applies the decision to every sibling stack in the group.
+
 ## 0.2.0 — 2026-04-26
 
 Daemon-mode release. Watchtower-replacement scope.

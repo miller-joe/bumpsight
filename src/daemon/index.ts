@@ -50,12 +50,16 @@ export interface ScanRunDeps {
   llmModel?: string;
   /** GitHub token for advise's release-notes fetch. */
   githubToken?: string;
+  /** Minimum gap in ms between dispatched notifications. Default 0 (no rate limit). */
+  notifyIntervalMs?: number;
   /** Test seam — defaults to the real registry client. */
   listTagsFn?: typeof listTags;
   /** Test seam — defaults to the real spawn-based docker runner. */
   runner?: CommandRunner;
   /** Test seam — override advise. Returns null to skip the LLM section. */
   adviseFn?: typeof getAdviseSummary;
+  /** Test seam — sleep helper for the rate limiter. */
+  sleepFn?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -76,6 +80,12 @@ export async function runScanOnce(
     errors: {},
   };
   const lister = deps.listTagsFn ?? listTags;
+  const sleep =
+    deps.sleepFn ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const notifyIntervalMs = deps.notifyIntervalMs ?? 0;
+  let lastDispatchAt = 0;
+  const heldRows: { row: UpdateRow; composePath: string; serviceName: string }[] =
+    [];
 
   for (const [stack, composePath] of Object.entries(deps.composeFiles)) {
     let compose: ReturnType<typeof loadComposeFile>;
@@ -140,29 +150,63 @@ export async function runScanOnce(
         await dispatchAppliedNotification(deps.notifiers, after);
       } else {
         result.held += 1;
-        const advise = deps.llmUrl
-          ? await safeAdvise(
-              {
-                image: ref.raw,
-                from: ref.tag,
-                to: latest,
-                composeFile: composePath,
-                serviceName,
-                llmUrl: deps.llmUrl,
-                llmKey: deps.llmKey,
-                model: deps.llmModel,
-                githubToken: deps.githubToken,
-              },
-              deps.adviseFn,
-            )
-          : null;
-        await dispatchHoldNotification(
-          deps.notifiers,
-          row,
-          deps.publicUrl,
-          advise,
-        );
-        setNotified(deps.db, row.id);
+        heldRows.push({ row, composePath, serviceName });
+      }
+    }
+  }
+
+  // Group held rows by (image, current_tag, target_tag) so multiple stacks
+  // running the same image get one notification, not N. Approval applies
+  // to all rows in the group (see handleApprove → findSiblings).
+  const groups = new Map<
+    string,
+    { row: UpdateRow; composePath: string; serviceName: string }[]
+  >();
+  for (const entry of heldRows) {
+    const key = `${entry.row.image}|${entry.row.current_tag}|${entry.row.target_tag}`;
+    const existing = groups.get(key);
+    if (existing) existing.push(entry);
+    else groups.set(key, [entry]);
+  }
+
+  for (const group of groups.values()) {
+    const canonical = group[0]!;
+    const advise = deps.llmUrl
+      ? await safeAdvise(
+          {
+            image: canonical.row.image,
+            from: canonical.row.current_tag,
+            to: canonical.row.target_tag,
+            composeFile: canonical.composePath,
+            serviceName: canonical.serviceName,
+            llmUrl: deps.llmUrl,
+            llmKey: deps.llmKey,
+            model: deps.llmModel,
+            githubToken: deps.githubToken,
+          },
+          deps.adviseFn,
+        )
+      : null;
+
+    if (notifyIntervalMs > 0 && lastDispatchAt > 0) {
+      const wait = notifyIntervalMs - (Date.now() - lastDispatchAt);
+      if (wait > 0) await sleep(wait);
+    }
+
+    const delivered = await dispatchHoldNotification(
+      deps.notifiers,
+      group.map((g) => g.row),
+      deps.publicUrl,
+      advise,
+    );
+    lastDispatchAt = Date.now();
+
+    // Only mark notified when the message actually went out. Otherwise
+    // a transient SMTP rejection (e.g. MXroute throttle) would leave the
+    // bump silently buried — the row would never re-fire on later scans.
+    if (delivered) {
+      for (const entry of group) {
+        setNotified(deps.db, entry.row.id);
       }
     }
   }
@@ -180,13 +224,26 @@ function buildLinks(row: UpdateRow, publicUrl?: string): NotifyLink[] {
 
 async function dispatchHoldNotification(
   notifiers: Notifier[],
-  row: UpdateRow,
+  rows: UpdateRow[],
   publicUrl?: string,
   advise?: AdviseSummary | null,
-): Promise<void> {
-  if (notifiers.length === 0) return;
-  const subject = `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`;
-  const links = buildLinks(row, publicUrl);
+): Promise<boolean> {
+  if (rows.length === 0) return false;
+  // No notifiers configured → treat as a successful no-op so the row's
+  // state machine still advances (otherwise we'd retry every scan forever).
+  if (notifiers.length === 0) return true;
+  const canonical = rows[0]!;
+  const others = rows.slice(1);
+  const row = canonical;
+  const stacksLabel =
+    rows.length === 1
+      ? row.stack
+      : `${rows.length} stacks (${rows.map((r) => r.stack).join(", ")})`;
+  const subject =
+    rows.length === 1
+      ? `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`
+      : `${rows.length} stacks: ${row.image} → ${row.target_tag}`;
+  const links = buildLinks(canonical, publicUrl);
   const approveUrl = links.find((l) => l.label === "Approve")?.url;
   const denyUrl = links.find((l) => l.label === "Deny")?.url;
 
@@ -204,12 +261,25 @@ async function dispatchHoldNotification(
     text.push("Approval URLs are not configured (set BUMPSIGHT_PUBLIC_URL).");
   }
   text.push("");
-  text.push(`Stack:   ${row.stack}`);
-  text.push(`Service: ${row.service}`);
+  if (rows.length === 1) {
+    text.push(`Stack:   ${row.stack}`);
+    text.push(`Service: ${row.service}`);
+  } else {
+    text.push(`Stacks:  ${stacksLabel}`);
+    text.push(
+      `Services: ${rows.map((r) => `${r.stack}/${r.service}`).join(", ")}`,
+    );
+  }
   text.push(`Image:   ${row.image}`);
   text.push(`From:    ${row.current_tag}`);
   text.push(`To:      ${row.target_tag}`);
   text.push(`Kind:    ${row.bump} bump`);
+  if (others.length > 0) {
+    text.push("");
+    text.push(
+      `Approval applies to all ${rows.length} stacks listed above.`,
+    );
+  }
   if (advise) {
     text.push("");
     if (advise.ok && advise.summary) {
@@ -236,13 +306,13 @@ async function dispatchHoldNotification(
   }
 
   const htmlBody = buildHoldHtml({
-    row,
+    rows,
     approveUrl,
     denyUrl,
     advise: advise ?? undefined,
   });
 
-  await notifyAll(notifiers, {
+  const result = await notifyAll(notifiers, {
     subject,
     body: text.join("\n"),
     htmlBody,
@@ -250,17 +320,19 @@ async function dispatchHoldNotification(
     // the HTML — no need for the formatter to append a duplicate list.
     links: undefined,
   });
+  return result.delivered > 0;
 }
 
 interface HoldHtmlOpts {
-  row: UpdateRow;
+  rows: UpdateRow[];
   approveUrl?: string;
   denyUrl?: string;
   advise?: AdviseSummary;
 }
 
 function buildHoldHtml(opts: HoldHtmlOpts): string {
-  const { row, approveUrl, denyUrl, advise } = opts;
+  const { rows, approveUrl, denyUrl, advise } = opts;
+  const row = rows[0]!;
   const e = escapeHtml;
 
   const buttons =
@@ -275,7 +347,11 @@ function buildHoldHtml(opts: HoldHtmlOpts): string {
             <a href="${e(denyUrl)}" style="display:inline-block;background:#475569;color:#ffffff;padding:10px 22px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;">Deny</a>
           </td>
         </tr>
-      </table>`
+      </table>${
+        rows.length > 1
+          ? `<p style="margin:10px 0 0;font-size:12px;color:#1e3a8a;">Approval applies to all ${rows.length} stacks listed below.</p>`
+          : ""
+      }`
       : `<p style="margin:0;color:#7f1d1d;font-size:13px;">Approval URLs are not configured (set <code>BUMPSIGHT_PUBLIC_URL</code>).</p>`;
 
   const adviseSection = advise
@@ -318,8 +394,17 @@ function buildHoldHtml(opts: HoldHtmlOpts): string {
 
   <!-- Metadata -->
   <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="font-size:14px;line-height:1.6;">
-    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Stack</td>   <td><strong>${e(row.stack)}</strong></td></tr>
-    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Service</td> <td>${e(row.service)}</td></tr>
+    ${
+      rows.length === 1
+        ? `<tr><td style="padding:2px 14px 2px 0;color:#64748b;">Stack</td>   <td><strong>${e(row.stack)}</strong></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Service</td> <td>${e(row.service)}</td></tr>`
+        : `<tr><td style="padding:2px 14px 2px 0;color:#64748b;vertical-align:top;">Stacks</td><td>${rows
+            .map(
+              (r) =>
+                `<strong>${e(r.stack)}</strong> <span style="color:#94a3b8;">/ ${e(r.service)}</span>`,
+            )
+            .join("<br>")}</td></tr>`
+    }
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Image</td>   <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.image)}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code></td></tr>
@@ -432,6 +517,7 @@ export function startDaemon(
           llmKey: deps.llmKey,
           llmModel: deps.llmModel,
           githubToken: deps.githubToken,
+          notifyIntervalMs: cfg.notifyIntervalMs,
           listTagsFn: deps.listTagsFn,
           runner: deps.runner,
           adviseFn: deps.adviseFn,

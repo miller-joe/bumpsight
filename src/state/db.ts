@@ -134,6 +134,29 @@ export function listByStatus(db: DB, status: UpdateStatus): UpdateRow[] {
     .all(status) as UpdateRow[];
 }
 
+/**
+ * Find sibling rows that share the same image bump (same image, current_tag,
+ * target_tag) and are still awaiting a decision. Used by the approve/deny
+ * handler to apply one click to every stack running the same image.
+ *
+ * Excludes the canonical row's own id so callers can iterate without
+ * special-casing it. Includes only rows in actionable states ('pending',
+ * 'notified') — already-decided siblings are left alone.
+ */
+export function findSiblings(db: DB, row: UpdateRow): UpdateRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM updates
+       WHERE id != ?
+         AND image = ?
+         AND current_tag = ?
+         AND target_tag = ?
+         AND status IN ('pending','notified')
+       ORDER BY id ASC`,
+    )
+    .all(row.id, row.image, row.current_tag, row.target_tag) as UpdateRow[];
+}
+
 export function setNotified(db: DB, id: number): void {
   db.prepare(
     `UPDATE updates SET status = 'notified', notified_at = ? WHERE id = ?`,

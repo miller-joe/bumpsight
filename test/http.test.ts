@@ -151,6 +151,69 @@ describe("HTTP server", () => {
     );
   });
 
+  it("approving one row also approves+applies sibling rows for the same image bump", async () => {
+    const dirA = mkdtempSync(join(tmpdir(), "bumpsight-http-"));
+    const dirB = mkdtempSync(join(tmpdir(), "bumpsight-http-"));
+    const fileA = join(dirA, "compose.yaml");
+    const fileB = join(dirB, "compose.yaml");
+    writeFileSync(fileA, `services:\n  vault-agent:\n    image: hashicorp/vault:1.21\n`, "utf-8");
+    writeFileSync(fileB, `services:\n  vault-agent:\n    image: hashicorp/vault:1.21\n`, "utf-8");
+    const stackA = dirA.split("/").pop()!;
+    const stackB = dirB.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    const idA = recordUpdate(db, {
+      stack: stackA,
+      service: "vault-agent",
+      image: "hashicorp/vault:1.21",
+      currentTag: "1.21",
+      targetTag: "1.22",
+      bump: "minor",
+      approvalToken: "tok-canonical",
+    });
+    const idB = recordUpdate(db, {
+      stack: stackB,
+      service: "vault-agent",
+      image: "hashicorp/vault:1.21",
+      currentTag: "1.21",
+      targetTag: "1.22",
+      bump: "minor",
+      // Sibling has no token — only canonical row's token is on the email.
+      approvalToken: undefined,
+    });
+
+    let runnerCalls = 0;
+    const runner: CommandRunner = async () => {
+      runnerCalls += 1;
+      return { exitCode: 0, combinedOutput: "ok" };
+    };
+
+    await withServer(
+      () =>
+        startHttpServer({
+          db,
+          composeFiles: { [stackA]: fileA, [stackB]: fileB },
+          port: 0,
+          runner,
+        }),
+      async (port) => {
+        const res = await fetch(`http://127.0.0.1:${port}/approve/tok-canonical`);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toContain("1 other stack");
+      },
+    );
+
+    // Wait for both background applies to finish.
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(findUpdate(db, idA)!.status).toBe("applied");
+    expect(findUpdate(db, idB)!.status).toBe("applied");
+    // Two rows × (pull + up) = 4 runner calls.
+    expect(runnerCalls).toBe(4);
+
+    rmSync(fileA, { force: true });
+    rmSync(fileB, { force: true });
+  });
+
   it("idempotency: re-clicking approve on an already-applied row does not re-run apply", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bumpsight-http-"));
     const file = join(dir, "compose.yaml");

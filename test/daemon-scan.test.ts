@@ -142,6 +142,109 @@ describe("runScanOnce", () => {
     rmSync(file, { force: true });
   });
 
+  it("dedups: one notification covers multiple stacks running the same image", async () => {
+    const a = makeStack("vault-a", "hashicorp/vault:1.21.0");
+    const b = makeStack("vault-b", "hashicorp/vault:1.21.0");
+    const c = makeStack("vault-c", "hashicorp/vault:1.21.0");
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
+    const fakeListTags = async () => [
+      { name: "1.21.0" },
+      { name: "1.21.1" },
+    ];
+
+    const result = await runScanOnce({
+      db,
+      notifiers: [notifier],
+      rules: { default: "notify", stacks: {} },
+      composeFiles: { [a.stack]: a.file, [b.stack]: b.file, [c.stack]: c.file },
+      publicUrl: "https://bump.example.com",
+      listTagsFn: fakeListTags as never,
+    });
+
+    expect(result.held).toBe(3);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.subject).toContain("3 stacks");
+    expect(sent[0]!.body).toContain("Approval applies to all 3 stacks");
+
+    rmSync(a.file, { force: true });
+    rmSync(b.file, { force: true });
+    rmSync(c.file, { force: true });
+  });
+
+  it("leaves rows pending when notifier delivery fails", async () => {
+    const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
+    const db = openDb({ path: ":memory:" });
+    const fakeListTags = async () => [
+      { name: "10.10.7" },
+      { name: "10.11.0" },
+    ];
+    const failingNotifier: Notifier = {
+      name: "broken",
+      send: async () => {
+        throw new Error("smtp 450 throttled");
+      },
+    };
+
+    await runScanOnce({
+      db,
+      notifiers: [failingNotifier],
+      rules: { default: "notify", stacks: {} },
+      composeFiles: { [stack]: file },
+      publicUrl: "https://bump.example.com",
+      listTagsFn: fakeListTags as never,
+    });
+
+    const { listByStatus } = await import("../src/state/db.js");
+    expect(listByStatus(db, "pending")).toHaveLength(1);
+    expect(listByStatus(db, "notified")).toHaveLength(0);
+
+    rmSync(file, { force: true });
+  });
+
+  it("rate-limits dispatches when notifyIntervalMs is set", async () => {
+    const a = makeStack("svc-a", "linuxserver/jellyfin:10.10.7");
+    const b = makeStack("svc-b", "linuxserver/sonarr:4.0.0");
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
+    const fakeListTags = async (ref: { name: string; tag: string }) => {
+      if (ref.name.includes("jellyfin"))
+        return [{ name: "10.10.7" }, { name: "10.11.0" }];
+      return [{ name: "4.0.0" }, { name: "4.1.0" }];
+    };
+    const sleeps: number[] = [];
+    const sleepFn = async (ms: number) => {
+      sleeps.push(ms);
+    };
+
+    await runScanOnce({
+      db,
+      notifiers: [notifier],
+      rules: { default: "notify", stacks: {} },
+      composeFiles: { [a.stack]: a.file, [b.stack]: b.file },
+      publicUrl: "https://bump.example.com",
+      listTagsFn: fakeListTags as never,
+      notifyIntervalMs: 10_000,
+      sleepFn,
+    });
+
+    expect(sent).toHaveLength(2);
+    // Two distinct image bumps → no dedup → second dispatch should sleep.
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(sleeps[0]).toBeLessThanOrEqual(10_000);
+
+    rmSync(a.file, { force: true });
+    rmSync(b.file, { force: true });
+  });
+
   it("does not duplicate work on repeat scans", async () => {
     const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
     const db = openDb({ path: ":memory:" });

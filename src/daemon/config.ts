@@ -9,6 +9,9 @@ export interface DaemonConfig {
   composeFiles: string[];
   /** How often the scan loop runs. Milliseconds. */
   intervalMs: number;
+  /** Minimum gap between dispatched notifications, in ms. 0 disables rate limiting.
+   *  Defaults to 10s — enough to keep MXroute and similar relays from throttling. */
+  notifyIntervalMs: number;
   /** Notifier URIs (smtp://…, apprise://…). Empty array disables notifications. */
   notifyUris: string[];
   /** Bump policy. */
@@ -40,6 +43,7 @@ export interface FileConfigShape {
   /** Root directory scanned by auto-discovery. Defaults to /stacks. */
   stacks_dir?: string;
   interval?: string;
+  notify_interval?: string;
   db_path?: string;
   notify?: string[];
   http_port?: number;
