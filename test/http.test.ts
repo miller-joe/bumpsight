@@ -138,6 +138,38 @@ describe("HTTP server", () => {
     rmSync(file, { force: true });
   });
 
+  it("/queue lists pending and notified rows with approve/deny links", async () => {
+    const db = openDb({ path: ":memory:" });
+    recordUpdate(db, {
+      stack: "stalwart", service: "stalwart", image: "stalwart:0.15", currentTag: "0.15", targetTag: "0.16",
+      bump: "minor", approvalToken: "tok-pending",
+    });
+    recordUpdate(db, {
+      stack: "vault-a", service: "vault-agent", image: "hashicorp/vault:1.21",
+      currentTag: "1.21", targetTag: "1.22", bump: "minor", approvalToken: "tok-notif",
+    });
+    // notified one
+    db.prepare("UPDATE updates SET status='notified', notified_at=? WHERE approval_token=?")
+      .run(Date.now(), "tok-notif");
+
+    await withServer(
+      () => startHttpServer({ db, composeFiles: {}, port: 0 }),
+      async (port) => {
+        const res = await fetch(`http://127.0.0.1:${port}/queue`);
+        expect(res.status).toBe(200);
+        const body = await res.text();
+        expect(body).toContain("bumpsight queue");
+        expect(body).toContain("Pending");
+        expect(body).toContain("Notified — awaiting approval");
+        expect(body).toContain("stalwart");
+        expect(body).toContain("hashicorp/vault");
+        // approve/deny links rendered for actionable rows
+        expect(body).toContain('href="/approve/tok-pending"');
+        expect(body).toContain('href="/deny/tok-notif"');
+      },
+    );
+  });
+
   it("returns 404 for an unknown approval token", async () => {
     const db = openDb({ path: ":memory:" });
     await withServer(

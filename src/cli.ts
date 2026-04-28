@@ -52,8 +52,9 @@ daemon-specific options:
   --notify <uri,uri,…>     Notifier URIs (smtp://…, smtps://…, apprise://…).
                            Default reads $BUMPSIGHT_NOTIFY.
   --auto-apply <action>    Default bump policy: patch | minor | major |
-                           notify | none (default notify, or
+                           notify | report | none (default notify, or
                            $BUMPSIGHT_AUTO_APPLY).
+                           report = FYI-only notification, no approve/deny.
   --once                   Run a single scan pass and exit.
 
 Examples:

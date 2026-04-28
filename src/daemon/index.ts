@@ -86,6 +86,8 @@ export async function runScanOnce(
   let lastDispatchAt = 0;
   const heldRows: { row: UpdateRow; composePath: string; serviceName: string }[] =
     [];
+  const reportRows: { row: UpdateRow; composePath: string; serviceName: string }[] =
+    [];
 
   for (const [stack, composePath] of Object.entries(deps.composeFiles)) {
     let compose: ReturnType<typeof loadComposeFile>;
@@ -121,7 +123,10 @@ export async function runScanOnce(
       const decision = decideAction(deps.rules, stack, bump);
       if (decision === "skip") continue;
 
-      const token = randomBytes(18).toString("base64url");
+      // Only generate an approval token for `hold` decisions — `report`
+      // notifications never carry an approve/deny flow.
+      const token =
+        decision === "hold" ? randomBytes(18).toString("base64url") : undefined;
       const id = recordUpdate(deps.db, {
         stack,
         service: serviceName,
@@ -147,7 +152,28 @@ export async function runScanOnce(
           row.id,
         );
         if (after.status === "applied") result.autoAppliedOk += 1;
-        await dispatchAppliedNotification(deps.notifiers, after);
+        await dispatchAppliedNotification(
+          deps.notifiers,
+          after,
+          deps.llmUrl
+            ? await safeAdvise(
+                {
+                  image: ref.raw,
+                  from: ref.tag,
+                  to: latest,
+                  composeFile: composePath,
+                  serviceName,
+                  llmUrl: deps.llmUrl,
+                  llmKey: deps.llmKey,
+                  model: deps.llmModel,
+                  githubToken: deps.githubToken,
+                },
+                deps.adviseFn,
+              )
+            : null,
+        );
+      } else if (decision === "report") {
+        reportRows.push({ row, composePath, serviceName });
       } else {
         result.held += 1;
         heldRows.push({ row, composePath, serviceName });
@@ -155,21 +181,30 @@ export async function runScanOnce(
     }
   }
 
-  // Group held rows by (image, current_tag, target_tag) so multiple stacks
-  // running the same image get one notification, not N. Approval applies
-  // to all rows in the group (see handleApprove → findSiblings).
-  const groups = new Map<
-    string,
-    { row: UpdateRow; composePath: string; serviceName: string }[]
-  >();
-  for (const entry of heldRows) {
-    const key = `${entry.row.image}|${entry.row.current_tag}|${entry.row.target_tag}`;
-    const existing = groups.get(key);
-    if (existing) existing.push(entry);
-    else groups.set(key, [entry]);
-  }
+  // Group rows by (image, current_tag, target_tag) so multiple stacks running
+  // the same image get one notification, not N. Approval applies to all rows
+  // in a hold group (see handleApprove → findSiblings); report groups are
+  // FYI-only and never carry an approval token.
+  const groupBy = (
+    rows: { row: UpdateRow; composePath: string; serviceName: string }[],
+  ) => {
+    const groups = new Map<
+      string,
+      { row: UpdateRow; composePath: string; serviceName: string }[]
+    >();
+    for (const entry of rows) {
+      const key = `${entry.row.image}|${entry.row.current_tag}|${entry.row.target_tag}`;
+      const existing = groups.get(key);
+      if (existing) existing.push(entry);
+      else groups.set(key, [entry]);
+    }
+    return groups;
+  };
 
-  for (const group of groups.values()) {
+  const dispatchGroup = async (
+    group: { row: UpdateRow; composePath: string; serviceName: string }[],
+    mode: "hold" | "report",
+  ) => {
     const canonical = group[0]!;
     const advise = deps.llmUrl
       ? await safeAdvise(
@@ -193,9 +228,10 @@ export async function runScanOnce(
       if (wait > 0) await sleep(wait);
     }
 
-    const delivered = await dispatchHoldNotification(
+    const delivered = await dispatchBumpNotification(
       deps.notifiers,
       group.map((g) => g.row),
+      mode,
       deps.publicUrl,
       advise,
     );
@@ -209,7 +245,10 @@ export async function runScanOnce(
         setNotified(deps.db, entry.row.id);
       }
     }
-  }
+  };
+
+  for (const group of groupBy(heldRows).values()) await dispatchGroup(group, "hold");
+  for (const group of groupBy(reportRows).values()) await dispatchGroup(group, "report");
   return result;
 }
 
@@ -222,9 +261,10 @@ function buildLinks(row: UpdateRow, publicUrl?: string): NotifyLink[] {
   ];
 }
 
-async function dispatchHoldNotification(
+async function dispatchBumpNotification(
   notifiers: Notifier[],
   rows: UpdateRow[],
+  mode: "hold" | "report",
   publicUrl?: string,
   advise?: AdviseSummary | null,
 ): Promise<boolean> {
@@ -243,14 +283,19 @@ async function dispatchHoldNotification(
     rows.length === 1
       ? `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`
       : `${rows.length} stacks: ${row.image} → ${row.target_tag}`;
-  const links = buildLinks(canonical, publicUrl);
+  // `report` mode never renders Approve/Deny — the row has no approval token.
+  const links = mode === "hold" ? buildLinks(canonical, publicUrl) : [];
   const approveUrl = links.find((l) => l.label === "Approve")?.url;
   const denyUrl = links.find((l) => l.label === "Deny")?.url;
 
   // Plain-text body: action card at top (instruction + URLs), then metadata,
   // then LLM summary. Both Apprise and email-clients-without-HTML see this.
   const text: string[] = [];
-  if (publicUrl && approveUrl && denyUrl) {
+  if (mode === "report") {
+    text.push(
+      `FYI — this stack is on policy "report"; no action will be taken.`,
+    );
+  } else if (publicUrl && approveUrl && denyUrl) {
     text.push(
       "Click Approve to pull + restart, or Deny to leave the stack on its current tag.",
     );
@@ -277,7 +322,9 @@ async function dispatchHoldNotification(
   if (others.length > 0) {
     text.push("");
     text.push(
-      `Approval applies to all ${rows.length} stacks listed above.`,
+      mode === "report"
+        ? `FYI applies to all ${rows.length} stacks listed above.`
+        : `Approval applies to all ${rows.length} stacks listed above.`,
     );
   }
   if (advise) {
@@ -307,6 +354,7 @@ async function dispatchHoldNotification(
 
   const htmlBody = buildHoldHtml({
     rows,
+    mode,
     approveUrl,
     denyUrl,
     advise: advise ?? undefined,
@@ -325,18 +373,26 @@ async function dispatchHoldNotification(
 
 interface HoldHtmlOpts {
   rows: UpdateRow[];
+  mode: "hold" | "report";
   approveUrl?: string;
   denyUrl?: string;
   advise?: AdviseSummary;
 }
 
 function buildHoldHtml(opts: HoldHtmlOpts): string {
-  const { rows, approveUrl, denyUrl, advise } = opts;
+  const { rows, mode, approveUrl, denyUrl, advise } = opts;
   const row = rows[0]!;
   const e = escapeHtml;
 
+  const reportNote =
+    mode === "report"
+      ? `<p style="margin:0;font-size:14px;line-height:1.5;color:#1e3a8a;">FYI — this stack is on policy <code>report</code>. No action will be taken; the bump is here for awareness.</p>`
+      : "";
+
   const buttons =
-    approveUrl && denyUrl
+    mode === "report"
+      ? reportNote
+      : approveUrl && denyUrl
       ? `
       <table role="presentation" cellspacing="0" cellpadding="0" border="0">
         <tr>
@@ -386,10 +442,13 @@ function buildHoldHtml(opts: HoldHtmlOpts): string {
 
   <!-- Action card -->
   <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:18px 20px;margin-bottom:24px;">
-    <p style="margin:0 0 14px 0;font-size:14px;line-height:1.5;color:#1e3a8a;">
+    ${
+      mode === "hold"
+        ? `<p style="margin:0 0 14px 0;font-size:14px;line-height:1.5;color:#1e3a8a;">
       Click <strong>Approve</strong> to pull + restart, or <strong>Deny</strong> to leave the stack on its current tag.
-    </p>
-    ${buttons}
+    </p>`
+        : ""
+    }${buttons}
   </div>
 
   <!-- Metadata -->
@@ -451,22 +510,129 @@ async function safeAdvise(
 async function dispatchAppliedNotification(
   notifiers: Notifier[],
   row: UpdateRow,
+  advise?: AdviseSummary | null,
 ): Promise<void> {
   if (notifiers.length === 0) return;
   const subject = `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`;
-  const body = [
-    `Stack:   ${row.stack}`,
-    `Service: ${row.service}`,
-    `From:    ${row.current_tag}`,
-    `To:      ${row.target_tag}`,
-    `Kind:    ${row.bump} bump`,
-    `Status:  ${row.status}`,
-    ``,
-    row.apply_log ? `Last log:\n${row.apply_log}` : ``,
-  ]
-    .filter(Boolean)
-    .join("\n");
-  await notifyAll(notifiers, { subject, body });
+  const ok = row.status === "applied";
+
+  const text: string[] = [];
+  text.push(
+    ok
+      ? `Auto-applied per policy. The stack is now on ${row.target_tag}.`
+      : `Auto-apply failed. The stack is still on ${row.current_tag}; check the daemon log + apply_log below.`,
+  );
+  text.push("");
+  text.push(`Stack:   ${row.stack}`);
+  text.push(`Service: ${row.service}`);
+  text.push(`Image:   ${row.image}`);
+  text.push(`From:    ${row.current_tag}`);
+  text.push(`To:      ${row.target_tag}`);
+  text.push(`Kind:    ${row.bump} bump`);
+  text.push(`Status:  ${row.status}`);
+  if (row.apply_log) {
+    text.push("");
+    text.push("───── apply log ─────");
+    text.push(row.apply_log);
+  }
+  if (advise) {
+    text.push("");
+    if (advise.ok && advise.summary) {
+      const heading =
+        advise.source === "general-knowledge"
+          ? "───── LLM opinion (no upstream release notes) ─────"
+          : "───── Upstream release-note summary ─────";
+      text.push(heading);
+      text.push(advise.summary);
+    }
+  }
+
+  const htmlBody = buildAppliedHtml({ row, advise: advise ?? undefined });
+
+  await notifyAll(notifiers, {
+    subject,
+    body: text.join("\n"),
+    htmlBody,
+    links: undefined,
+  });
+}
+
+interface AppliedHtmlOpts {
+  row: UpdateRow;
+  advise?: AdviseSummary;
+}
+
+function buildAppliedHtml(opts: AppliedHtmlOpts): string {
+  const { row, advise } = opts;
+  const e = escapeHtml;
+  const ok = row.status === "applied";
+
+  const banner = ok
+    ? `<div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:18px 20px;margin-bottom:24px;">
+        <p style="margin:0;font-size:14px;line-height:1.5;color:#14532d;">
+          <strong>Auto-applied.</strong> The stack is now on <code style="background:#bbf7d0;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code>. No action needed from you.
+        </p>
+      </div>`
+    : `<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;padding:18px 20px;margin-bottom:24px;">
+        <p style="margin:0;font-size:14px;line-height:1.5;color:#7f1d1d;">
+          <strong>Auto-apply failed.</strong> The stack is still on <code style="background:#fecaca;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code>. See apply log below.
+        </p>
+      </div>`;
+
+  const adviseSection =
+    advise && advise.ok && advise.summary
+      ? (() => {
+          const isOpinion = advise.source === "general-knowledge";
+          const heading = isOpinion
+            ? "LLM opinion (no upstream release notes)"
+            : "Upstream release-note summary";
+          const sourceLine = isOpinion
+            ? `Source: model general knowledge${advise.repo ? ` · upstream checked: github.com/${e(advise.repo)}` : ""}`
+            : `Source: github.com/${e(advise.repo ?? "")} · ${advise.releaseCount ?? 0} release(s) in range`;
+          return `
+      <div style="margin-top:24px;">
+        <h3 style="margin:0 0 4px 0;font-size:14px;color:#1e293b;">${heading}</h3>
+        <div style="font-size:12px;color:#64748b;margin-bottom:12px;">${sourceLine}</div>
+        <div style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:13px;line-height:1.5;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;white-space:pre-wrap;">${e(advise.summary)}</div>
+      </div>`;
+        })()
+      : "";
+
+  const applyLogSection = row.apply_log
+    ? `
+      <div style="margin-top:24px;">
+        <h3 style="margin:0 0 8px 0;font-size:14px;color:#1e293b;">Apply log</h3>
+        <pre style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:12px;line-height:1.4;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;white-space:pre-wrap;margin:0;">${e(row.apply_log)}</pre>
+      </div>`
+    : "";
+
+  return `<!doctype html>
+<html><body style="margin:0;padding:0;background:#f1f5f9;">
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background:#f1f5f9;padding:24px 12px;">
+<tr><td align="center">
+<table role="presentation" cellspacing="0" cellpadding="0" border="0" width="600" style="max-width:600px;background:#ffffff;border-radius:8px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0f172a;">
+<tr><td style="padding:24px;">
+
+  ${banner}
+
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="font-size:14px;line-height:1.6;">
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Stack</td>   <td><strong>${e(row.stack)}</strong></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Service</td> <td>${e(row.service)}</td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Image</td>   <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.image)}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Bump</td>    <td>${e(row.bump)}</td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Status</td>  <td>${e(row.status)}</td></tr>
+  </table>
+
+  ${adviseSection}
+  ${applyLogSection}
+
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>`;
 }
 
 export interface DaemonRuntime {

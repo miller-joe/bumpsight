@@ -2,6 +2,20 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.3.0 — 2026-04-27
+
+Visibility + parity batch.
+
+### Added
+
+- **`/queue` HTTP route.** Visit `BUMPSIGHT_PUBLIC_URL/queue` to see a styled HTML table of every tracked bump grouped by status (pending / notified / failed / denied / applied), with inline approve/deny links on actionable rows. Removes the need to `sqlite3` the state DB to see what's happening.
+- **`report` policy level.** New per-stack action that sits between `notify` and `none`: bump is recorded, an HTML notification is dispatched, but no approve/deny flow is generated and no token is created. Useful for stacks where you only want awareness ("noisy upstream, I'll handle it manually when it matters"). Configure as `default: report` or per-stack in `bumpsight.yaml`, or `BUMPSIGHT_AUTO_APPLY=report`.
+- **HTML + LLM summary on auto-applied notifications.** Auto-apply emails now ship as HTML with a green success banner (or red failure banner) at the top, full metadata table, the apply log, and the LLM upstream-release-note summary or general-knowledge opinion when `BUMPSIGHT_LLM_URL` is configured. Brings auto-applied notifications to parity with held-bump notifications.
+
+### Changed
+
+- Internal: `dispatchHoldNotification` was renamed to `dispatchBumpNotification` and now takes a `mode: "hold" | "report"` discriminator. Buttons, action-card text, and the HTML body branch on mode.
+
 ## 0.2.2 — 2026-04-27
 
 Release pipeline fix only. Same code as v0.2.1.

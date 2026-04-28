@@ -57,6 +57,7 @@ const VALID_ACTIONS: BumpAction[] = [
   "minor",
   "major",
   "notify",
+  "report",
   "none",
 ];
 

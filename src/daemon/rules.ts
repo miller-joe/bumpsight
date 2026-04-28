@@ -19,8 +19,20 @@ export function classifyBump(currentTag: string, newTag: string): BumpKind {
   return "patch";
 }
 
-/** Per-stack policy. `notify` always holds for human approval. `none` skips. */
-export type BumpAction = "patch" | "minor" | "major" | "notify" | "none";
+/**
+ * Per-stack policy.
+ *   patch / minor / major  → auto-apply at or below the named bump kind.
+ *   notify                 → hold for human approval (Approve/Deny buttons).
+ *   report                 → FYI-only notification; no approve/deny flow.
+ *   none                   → ignore.
+ */
+export type BumpAction =
+  | "patch"
+  | "minor"
+  | "major"
+  | "notify"
+  | "report"
+  | "none";
 
 export interface RulesConfig {
   /** Default policy applied when a stack has no explicit override. */
@@ -29,7 +41,7 @@ export interface RulesConfig {
   stacks: Record<string, BumpAction>;
 }
 
-export type Decision = "auto-apply" | "hold" | "skip";
+export type Decision = "auto-apply" | "hold" | "report" | "skip";
 
 /**
  * Decide what to do with a discovered bump.
@@ -38,9 +50,11 @@ export type Decision = "auto-apply" | "hold" | "skip";
  *   minor  → auto-apply patches and minors.
  *   major  → auto-apply everything classified.
  *   notify → never auto-apply; hold for human approval.
+ *   report → FYI-only notification, no approve/deny flow.
  *   none   → ignore.
  *
- * `unknown` bumps are always held — we can't reason about them safely.
+ * `unknown` bumps are always held under `notify`-style policies — we can't
+ * reason about them safely. Under `report`, unknowns still report-only.
  */
 export function decideAction(
   config: RulesConfig,
@@ -49,9 +63,10 @@ export function decideAction(
 ): Decision {
   const action = config.stacks[stack] ?? config.default;
   if (action === "none") return "skip";
+  if (action === "report") return "report";
   if (action === "notify") return "hold";
   if (bump === "unknown") return "hold";
-  const allowed: Record<Exclude<BumpAction, "notify" | "none">, BumpKind[]> = {
+  const allowed: Record<Exclude<BumpAction, "notify" | "report" | "none">, BumpKind[]> = {
     patch: ["patch"],
     minor: ["patch", "minor"],
     major: ["patch", "minor", "major"],

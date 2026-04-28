@@ -73,6 +73,14 @@ describe("decideAction", () => {
     }
   });
 
+  it("returns 'report' for stacks on the report policy regardless of bump kind", () => {
+    const cfg = { default: "report" as const, stacks: {} };
+    expect(decideAction(cfg, "any", "patch")).toBe("report");
+    expect(decideAction(cfg, "any", "minor")).toBe("report");
+    expect(decideAction(cfg, "any", "major")).toBe("report");
+    expect(decideAction(cfg, "any", "unknown")).toBe("report");
+  });
+
   it("respects per-stack overrides over the default", () => {
     const cfg = {
       default: "patch" as const,

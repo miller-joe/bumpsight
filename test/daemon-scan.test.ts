@@ -245,6 +245,84 @@ describe("runScanOnce", () => {
     rmSync(b.file, { force: true });
   });
 
+  it("under 'report' policy: dispatches FYI notification and never generates approval token", async () => {
+    const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
+    const fakeListTags = async () => [
+      { name: "10.10.7" },
+      { name: "10.11.0" },
+    ];
+
+    await runScanOnce({
+      db,
+      notifiers: [notifier],
+      rules: { default: "report", stacks: {} },
+      composeFiles: { [stack]: file },
+      publicUrl: "https://bump.example.com",
+      listTagsFn: fakeListTags as never,
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.body).toContain('FYI');
+    expect(sent[0]!.body).not.toContain("Click Approve");
+    // No buttons in HTML either
+    expect(sent[0]!.htmlBody).not.toContain(">Approve<");
+    expect(sent[0]!.htmlBody).toContain("policy <code>report</code>");
+    // Row should have no approval token (so no approve link is even possible)
+    const { listByStatus } = await import("../src/state/db.js");
+    const rows = listByStatus(db, "notified");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.approval_token).toBeNull();
+
+    rmSync(file, { force: true });
+  });
+
+  it("auto-applied notifications include LLM advise summary when llmUrl is set", async () => {
+    const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
+    const fakeListTags = async () => [
+      { name: "10.10.7" },
+      { name: "10.10.8" },
+    ];
+    const adviseFn = async () => ({
+      ok: true,
+      summary: "No breaking changes. Bug fixes only.",
+      repo: "linuxserver/docker-jellyfin",
+      releaseCount: 1,
+      source: "release-notes" as const,
+    });
+
+    await runScanOnce({
+      db,
+      notifiers: [notifier],
+      rules: { default: "patch", stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+      runner: okRunner,
+      llmUrl: "http://stub/v1",
+      adviseFn,
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.body).toContain("Auto-applied per policy");
+    expect(sent[0]!.body).toContain("No breaking changes");
+    expect(sent[0]!.htmlBody).toBeDefined();
+    expect(sent[0]!.htmlBody!).toContain("background:#dcfce7"); // green success banner
+    expect(sent[0]!.htmlBody!).toContain("No breaking changes");
+
+    rmSync(file, { force: true });
+  });
+
   it("does not duplicate work on repeat scans", async () => {
     const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
     const db = openDb({ path: ":memory:" });

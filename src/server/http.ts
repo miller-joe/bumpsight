@@ -5,6 +5,7 @@ import type { Database as DB } from "better-sqlite3";
 import {
   findByToken,
   findSiblings,
+  listByStatus,
   setDecision,
   type UpdateRow,
 } from "../state/db.js";
@@ -87,6 +88,11 @@ async function handle(
     return;
   }
 
+  if (path === "/queue") {
+    handleQueue(res, deps);
+    return;
+  }
+
   const approveMatch = path.match(/^\/approve\/([A-Za-z0-9_-]{8,})$/);
   const denyMatch = path.match(/^\/deny\/([A-Za-z0-9_-]{8,})$/);
 
@@ -100,6 +106,89 @@ async function handle(
   }
 
   writeHtml(res, 404, page("Not found", "No such route."));
+}
+
+function handleQueue(res: ServerResponse, deps: HttpServerDeps): void {
+  const pending = listByStatus(deps.db, "pending");
+  const notified = listByStatus(deps.db, "notified");
+  const failed = listByStatus(deps.db, "failed");
+  const denied = listByStatus(deps.db, "denied");
+  const applied = listByStatus(deps.db, "applied");
+  writeHtml(res, 200, queuePage({ pending, notified, failed, denied, applied }));
+}
+
+interface QueueData {
+  pending: UpdateRow[];
+  notified: UpdateRow[];
+  failed: UpdateRow[];
+  denied: UpdateRow[];
+  applied: UpdateRow[];
+}
+
+function queuePage(d: QueueData): string {
+  const fmtTime = (ms: number | null) =>
+    ms ? new Date(ms).toISOString().replace("T", " ").slice(0, 19) : "—";
+
+  const renderRows = (rows: UpdateRow[], showAction: boolean): string => {
+    if (rows.length === 0) {
+      return `<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:12px;">none</td></tr>`;
+    }
+    return rows
+      .map((r) => {
+        const action =
+          showAction && r.approval_token
+            ? `<a href="/approve/${escapeHtml(r.approval_token)}" style="color:#16a34a;text-decoration:none;">approve</a> · <a href="/deny/${escapeHtml(r.approval_token)}" style="color:#475569;text-decoration:none;">deny</a>`
+            : showAction
+              ? "—"
+              : fmtTime(r.applied_at ?? r.decided_at ?? r.notified_at);
+        return `<tr>
+          <td style="padding:4px 10px;"><code>${escapeHtml(r.stack)}</code></td>
+          <td style="padding:4px 10px;"><code>${escapeHtml(r.service)}</code></td>
+          <td style="padding:4px 10px;"><code>${escapeHtml(r.image)}</code></td>
+          <td style="padding:4px 10px;"><code>${escapeHtml(r.current_tag)}</code> → <code>${escapeHtml(r.target_tag)}</code></td>
+          <td style="padding:4px 10px;color:#64748b;">${escapeHtml(r.bump)}</td>
+          <td style="padding:4px 10px;font-size:12px;">${action}</td>
+        </tr>`;
+      })
+      .join("");
+  };
+
+  const section = (
+    title: string,
+    color: string,
+    rows: UpdateRow[],
+    showAction: boolean,
+  ): string => `
+    <h2 style="margin:24px 0 8px 0;font-size:16px;color:${color};">${escapeHtml(title)} <span style="color:#94a3b8;font-weight:normal;">(${rows.length})</span></h2>
+    <table style="border-collapse:collapse;width:100%;font-size:13px;border:1px solid #e2e8f0;border-radius:6px;overflow:hidden;">
+      <thead style="background:#f8fafc;color:#475569;">
+        <tr>
+          <th style="text-align:left;padding:6px 10px;">stack</th>
+          <th style="text-align:left;padding:6px 10px;">service</th>
+          <th style="text-align:left;padding:6px 10px;">image</th>
+          <th style="text-align:left;padding:6px 10px;">bump</th>
+          <th style="text-align:left;padding:6px 10px;">kind</th>
+          <th style="text-align:left;padding:6px 10px;">${showAction ? "action" : "when"}</th>
+        </tr>
+      </thead>
+      <tbody>${renderRows(rows, showAction)}</tbody>
+    </table>`;
+
+  const total =
+    d.pending.length + d.notified.length + d.failed.length + d.denied.length + d.applied.length;
+
+  return `<!doctype html>
+<html><head><meta charset=utf-8><title>bumpsight queue</title>
+<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:60rem;margin:2rem auto;padding:0 1rem;color:#0f172a;background:#f1f5f9}h1{margin:0 0 0.5rem;font-size:1.5rem}p.lede{color:#64748b;margin:0 0 1rem;}code{background:#fff;padding:1px 4px;border-radius:3px;font-size:12px;}table{background:#fff;}</style>
+</head><body>
+  <h1>bumpsight queue</h1>
+  <p class="lede">${total} bump record(s) tracked. Refresh after clicking approve/deny.</p>
+  ${section("Pending", "#1e3a8a", d.pending, true)}
+  ${section("Notified — awaiting approval", "#1e3a8a", d.notified, true)}
+  ${section("Failed", "#7f1d1d", d.failed, false)}
+  ${section("Denied", "#475569", d.denied, false)}
+  ${section("Applied", "#14532d", d.applied, false)}
+</body></html>`;
 }
 
 async function handleApprove(
