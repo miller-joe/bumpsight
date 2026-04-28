@@ -4,13 +4,15 @@ import type { Database as DB } from "better-sqlite3";
 import { loadComposeFile, parseImageRef } from "../compose/parse.js";
 import { isSupportedRegistry, listTags } from "../registry/index.js";
 import { findLatestInFamily } from "../util/semver.js";
-import { classifyBump, decideAction } from "./rules.js";
+import { classifyBump, decideAction, isMovingTag } from "./rules.js";
 import type { BumpKind, RulesConfig } from "./rules.js";
 import type { DaemonConfig } from "./config.js";
 import {
   recordUpdate,
   setNotified,
   findUpdate,
+  getStoredDigest,
+  saveDigest,
   type UpdateRow,
 } from "../state/db.js";
 import { notifyAll } from "../notify/index.js";
@@ -106,17 +108,68 @@ export async function runScanOnce(
       const ref = parseImageRef(svc.image!);
       if (!isSupportedRegistry(ref)) continue;
 
-      let latest: string | null;
+      let tags: Awaited<ReturnType<typeof lister>>;
       try {
-        const tags = await lister(ref, {});
-        latest = findLatestInFamily(
-          ref.tag,
-          tags.map((t) => t.name),
-        );
+        tags = await lister(ref, {});
       } catch (err) {
         result.errors[ref.raw] = (err as Error).message;
         continue;
       }
+
+      // Path A: moving tag (latest / stable / edge / etc.) — track digest
+      // changes instead of tag-name changes. Phase 1 always holds these for
+      // approval; Phase 2 will resolve digest → semver tag and apply policy.
+      if (isMovingTag(ref.tag)) {
+        const matching = tags.find((t) => t.name === ref.tag);
+        const newDigest = matching?.digest;
+        if (!newDigest) continue; // registry doesn't expose digests in tag list (GHCR)
+        const prevDigest = getStoredDigest(deps.db, ref.raw, ref.tag);
+        if (!prevDigest) {
+          // First observation — record silently, no bump.
+          saveDigest(deps.db, ref.raw, ref.tag, newDigest);
+          continue;
+        }
+        if (prevDigest === newDigest) continue;
+
+        const fromShort = prevDigest.replace(/^sha256:/, "").slice(0, 12);
+        const toShort = newDigest.replace(/^sha256:/, "").slice(0, 12);
+        const bump: BumpKind = "digest";
+        const decision = decideAction(deps.rules, stack, bump);
+        if (decision === "skip") continue;
+
+        const token =
+          decision === "hold" ? randomBytes(18).toString("base64url") : undefined;
+        const id = recordUpdate(deps.db, {
+          stack,
+          service: serviceName,
+          image: ref.raw,
+          currentTag: fromShort,
+          targetTag: toShort,
+          bump,
+          approvalToken: token,
+        });
+        const row = findUpdate(deps.db, id);
+        if (!row || row.status !== "pending") continue;
+        result.discovered += 1;
+
+        // Advance the stored digest now so a re-scan before the user acts
+        // doesn't keep refiring the same bump.
+        saveDigest(deps.db, ref.raw, ref.tag, newDigest);
+
+        if (decision === "report") {
+          reportRows.push({ row, composePath, serviceName });
+        } else {
+          result.held += 1;
+          heldRows.push({ row, composePath, serviceName });
+        }
+        continue;
+      }
+
+      // Path B: semver tag — existing behavior
+      const latest = findLatestInFamily(
+        ref.tag,
+        tags.map((t) => t.name),
+      );
       if (!latest || latest === ref.tag) continue;
 
       const bump: BumpKind = classifyBump(ref.tag, latest);
@@ -279,8 +332,12 @@ async function dispatchBumpNotification(
     rows.length === 1
       ? row.stack
       : `${rows.length} stacks (${rows.map((r) => r.stack).join(", ")})`;
-  const subject =
-    rows.length === 1
+  const isDigest = row.bump === "digest";
+  const subject = isDigest
+    ? rows.length === 1
+      ? `${row.stack}/${row.service}: ${row.image} digest changed`
+      : `${rows.length} stacks: ${row.image} digest changed`
+    : rows.length === 1
       ? `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`
       : `${rows.length} stacks: ${row.image} → ${row.target_tag}`;
   // `report` mode never renders Approve/Deny — the row has no approval token.
@@ -316,9 +373,14 @@ async function dispatchBumpNotification(
     );
   }
   text.push(`Image:   ${row.image}`);
-  text.push(`From:    ${row.current_tag}`);
-  text.push(`To:      ${row.target_tag}`);
-  text.push(`Kind:    ${row.bump} bump`);
+  if (isDigest) {
+    text.push(`Digest:  sha256:${row.current_tag}… → sha256:${row.target_tag}…`);
+    text.push(`Kind:    digest change (no semver classification — Phase 1)`);
+  } else {
+    text.push(`From:    ${row.current_tag}`);
+    text.push(`To:      ${row.target_tag}`);
+    text.push(`Kind:    ${row.bump} bump`);
+  }
   if (others.length > 0) {
     text.push("");
     text.push(

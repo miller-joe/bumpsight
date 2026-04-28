@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS updates (
   current_tag     TEXT NOT NULL,
   target_tag      TEXT NOT NULL,
   family          TEXT,
-  bump            TEXT NOT NULL CHECK (bump IN ('patch','minor','major','unknown')),
+  bump            TEXT NOT NULL,
   status          TEXT NOT NULL CHECK (status IN ('pending','notified','approved','denied','applied','failed')),
   approval_token  TEXT,
   discovered_at   INTEGER NOT NULL,
@@ -51,7 +51,38 @@ CREATE TABLE IF NOT EXISTS updates (
 );
 CREATE INDEX IF NOT EXISTS idx_updates_status ON updates(status);
 CREATE INDEX IF NOT EXISTS idx_updates_token ON updates(approval_token);
+
+-- Last-seen digest per (image, tag). Used to detect digest changes on moving
+-- tags like :latest where the version isn't encoded in the tag itself.
+CREATE TABLE IF NOT EXISTS tag_digests (
+  image     TEXT NOT NULL,
+  tag       TEXT NOT NULL,
+  digest    TEXT NOT NULL,
+  seen_at   INTEGER NOT NULL,
+  PRIMARY KEY (image, tag)
+);
 `;
+
+/**
+ * Idempotent migration. The pre-v0.3.1 schema had a CHECK constraint on the
+ * `bump` column restricting it to patch/minor/major/unknown — the digest-
+ * tracking feature adds a new `digest` value. SQLite can't ALTER a CHECK
+ * constraint, so we rename + recreate when we detect the old form.
+ */
+function migrate(db: DB): void {
+  const row = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (!row) return; // fresh DB — SCHEMA's CREATE TABLE IF NOT EXISTS handles it
+  if (row.sql.includes("'patch','minor','major','unknown'")) {
+    db.exec("ALTER TABLE updates RENAME TO _updates_v1");
+    db.exec(SCHEMA); // creates the new table
+    db.exec("INSERT INTO updates SELECT * FROM _updates_v1");
+    db.exec("DROP TABLE _updates_v1");
+  }
+}
 
 export interface OpenOptions {
   /** Path to the SQLite file, or ":memory:" for an ephemeral DB (used by tests). */
@@ -63,8 +94,41 @@ export function openDb(opts: OpenOptions): DB {
   db.pragma("journal_mode = WAL");
   db.pragma("synchronous = NORMAL");
   db.pragma("foreign_keys = ON");
+  migrate(db);
   db.exec(SCHEMA);
   return db;
+}
+
+/**
+ * Look up the last-seen digest for (image, tag). Returns undefined if we've
+ * never recorded one — caller's first observation should always be stored
+ * silently (no bump generated for the initial observation).
+ */
+export function getStoredDigest(
+  db: DB,
+  image: string,
+  tag: string,
+): string | undefined {
+  const row = db
+    .prepare(`SELECT digest FROM tag_digests WHERE image = ? AND tag = ?`)
+    .get(image, tag) as { digest: string } | undefined;
+  return row?.digest;
+}
+
+/**
+ * Record (or replace) the last-seen digest for (image, tag).
+ */
+export function saveDigest(
+  db: DB,
+  image: string,
+  tag: string,
+  digest: string,
+): void {
+  db.prepare(
+    `INSERT INTO tag_digests (image, tag, digest, seen_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(image, tag) DO UPDATE SET digest = excluded.digest, seen_at = excluded.seen_at`,
+  ).run(image, tag, digest, Date.now());
 }
 
 export interface NewUpdate {

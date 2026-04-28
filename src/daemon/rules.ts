@@ -1,6 +1,28 @@
 import { parseTag } from "../util/semver.js";
 
-export type BumpKind = "patch" | "minor" | "major" | "unknown";
+export type BumpKind = "patch" | "minor" | "major" | "digest" | "unknown";
+
+/**
+ * Tags that don't carry a version in their name and instead "move" — i.e.
+ * the digest under the tag changes over time without the tag string changing.
+ * These get tracked by digest comparison instead of tag-name comparison.
+ */
+const MOVING_TAGS = new Set([
+  "latest",
+  "stable",
+  "edge",
+  "main",
+  "master",
+  "rolling",
+  "current",
+  "nightly",
+  "dev",
+  "develop",
+]);
+
+export function isMovingTag(tag: string): boolean {
+  return MOVING_TAGS.has(tag.toLowerCase());
+}
 
 /**
  * Classify a tag bump into patch / minor / major using the same family
@@ -65,7 +87,10 @@ export function decideAction(
   if (action === "none") return "skip";
   if (action === "report") return "report";
   if (action === "notify") return "hold";
-  if (bump === "unknown") return "hold";
+  // `digest` bumps don't carry a semver classification, so we can't reason
+  // about "is this safe to auto-apply." Always hold them under any policy
+  // until Phase 2 resolves digest → highest-precision tag → semver kind.
+  if (bump === "unknown" || bump === "digest") return "hold";
   const allowed: Record<Exclude<BumpAction, "notify" | "report" | "none">, BumpKind[]> = {
     patch: ["patch"],
     minor: ["patch", "minor"],

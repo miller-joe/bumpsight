@@ -323,6 +323,113 @@ describe("runScanOnce", () => {
     rmSync(file, { force: true });
   });
 
+  it("digest tracking: first scan of :latest records digest silently, no bump", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-latest-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = { name: "stub", send: async (m) => void sent.push(m) };
+    const fakeListTags = async () => [
+      { name: "latest", digest: "sha256:aaaaaaaaaaaa1111" },
+      { name: "1.27.0", digest: "sha256:cccccccccccc2222" },
+    ];
+
+    const result = await runScanOnce({
+      db,
+      notifiers: [notifier],
+      rules: { default: "notify", stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+    });
+
+    expect(result.discovered).toBe(0);
+    expect(sent).toHaveLength(0);
+    // Digest got recorded for next scan
+    const { getStoredDigest } = await import("../src/state/db.js");
+    expect(getStoredDigest(db, "nginx:latest", "latest")).toBe("sha256:aaaaaaaaaaaa1111");
+    rmSync(file, { force: true });
+  });
+
+  it("digest tracking: second scan with changed digest records a digest bump", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-latest-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = { name: "stub", send: async (m) => void sent.push(m) };
+    let digest = "sha256:aaaaaaaaaaaa1111";
+    const fakeListTags = async () => [{ name: "latest", digest }];
+
+    const deps = {
+      db,
+      notifiers: [notifier],
+      rules: { default: "notify" as const, stacks: {} },
+      composeFiles: { [stack]: file },
+      publicUrl: "https://bump.example.com",
+      listTagsFn: fakeListTags as never,
+    };
+    // First scan: silent record
+    await runScanOnce(deps);
+    expect(sent).toHaveLength(0);
+
+    // Second scan: digest changed
+    digest = "sha256:bbbbbbbbbbbb2222";
+    const result = await runScanOnce(deps);
+    expect(result.discovered).toBe(1);
+    expect(result.held).toBe(1);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.subject).toContain("digest changed");
+    expect(sent[0]!.body).toContain("sha256:aaaaaaaaaaaa…");
+    expect(sent[0]!.body).toContain("sha256:bbbbbbbbbbbb…");
+    expect(sent[0]!.body).toContain("digest change");
+
+    // Stored digest advanced to the new value
+    const { getStoredDigest } = await import("../src/state/db.js");
+    expect(getStoredDigest(db, "nginx:latest", "latest")).toBe("sha256:bbbbbbbbbbbb2222");
+
+    // Third scan with no further change: no new bump
+    sent.length = 0;
+    const third = await runScanOnce(deps);
+    expect(third.discovered).toBe(0);
+    expect(sent).toHaveLength(0);
+
+    rmSync(file, { force: true });
+  });
+
+  it("digest tracking: never auto-applies a digest bump even under 'major' policy", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-latest-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    let digest = "sha256:aaaaaaaaaaaa1111";
+    const fakeListTags = async () => [{ name: "latest", digest }];
+    const calls: string[] = [];
+    const runner = async (..._args: unknown[]) => {
+      calls.push("ran");
+      return { exitCode: 0, combinedOutput: "" };
+    };
+
+    const deps = {
+      db,
+      notifiers: [] as Notifier[],
+      rules: { default: "major" as const, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+      runner: runner as never,
+    };
+    await runScanOnce(deps);
+    digest = "sha256:bbbbbbbbbbbb2222";
+    const result = await runScanOnce(deps);
+    expect(result.autoApplied).toBe(0);
+    expect(result.held).toBe(1);
+    expect(calls).toHaveLength(0); // docker compose was never invoked
+    rmSync(file, { force: true });
+  });
+
   it("does not duplicate work on repeat scans", async () => {
     const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
     const db = openDb({ path: ":memory:" });

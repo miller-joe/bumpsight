@@ -2,6 +2,26 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.3.1 — 2026-04-27
+
+`:latest` digest tracking — Phase 1.
+
+### Added
+
+- **Digest tracking for moving tags.** Bumpsight now detects when a non-semver tag (e.g. `:latest`, `:stable`, `:edge`, `:main`, `:master`, `:rolling`, `:current`, `:nightly`, `:dev`, `:develop`) gets a new digest under the same name — the case watchtower used to handle. First scan records the digest silently; later scans compare and emit a bump when the digest changes.
+- **New `digest` bump kind.** Records show as `bump=digest` with the prior+new digest prefixes in the `current_tag`/`target_tag` columns. Subject line is `<image> digest changed` instead of the `→ <tag>` form. Always held for approval — Phase 2 will resolve digest → highest-precision tag and apply semver policy ("12.1→12.2 auto, 12→13 ask").
+- **`tag_digests` table** stores last-seen `(image, tag) → digest, seen_at`. Lookup helpers exported from `src/state/db.ts`.
+- **`isMovingTag` helper** in `src/daemon/rules.ts` — single source of truth for what counts as a moving tag.
+
+### Changed
+
+- **Schema migration.** The `bump` column previously had a CHECK constraint allowing only `patch | minor | major | unknown`. SQLite can't ALTER a CHECK in place, so `openDb` now detects the old form and rebuilds the table on first open. Idempotent — safe to upgrade from any prior v0.x DB.
+
+### Notes
+
+- **GHCR digest tracking is not yet supported** in this phase. The Docker Registry v2 `/tags/list` endpoint that GHCR uses doesn't return digests inline; getting them requires a per-tag manifest fetch. Phase 2 will add that.
+- Digest bumps **always hold for approval** under any policy. Auto-apply for digest changes lands when Phase 2 ships the digest → semver-tag resolution.
+
 ## 0.3.0 — 2026-04-27
 
 Visibility + parity batch.
