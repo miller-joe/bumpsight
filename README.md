@@ -1,4 +1,4 @@
-<img src="assets/logo.svg" align="left" width="80" height="80" alt="bumpsight" hspace="16">
+<img src="assets/logo.svg" width="80" height="80" alt="bumpsight">
 
 # bumpsight
 
