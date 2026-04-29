@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/logo.svg" width="96" height="96" alt="bumpsight">
-</p>
+<img src="assets/logo.svg" align="left" width="80" height="80" alt="bumpsight" hspace="16">
 
 # bumpsight
 
