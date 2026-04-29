@@ -9,7 +9,7 @@ import {
   type RemoteTag,
 } from "../registry/index.js";
 import { findLatestInFamily, parseTag } from "../util/semver.js";
-import { classifyBump, decideAction, isMovingTag } from "./rules.js";
+import { classifyBump, decideAction, isDependencyImage, isMovingTag } from "./rules.js";
 import type { BumpKind, RulesConfig } from "./rules.js";
 import type { DaemonConfig } from "./config.js";
 import {
@@ -95,8 +95,6 @@ export async function runScanOnce(
   const notifyIntervalMs = deps.notifyIntervalMs ?? 0;
   let lastDispatchAt = 0;
   const heldRows: { row: UpdateRow; composePath: string; serviceName: string }[] =
-    [];
-  const reportRows: { row: UpdateRow; composePath: string; serviceName: string }[] =
     [];
 
   for (const [stack, composePath] of Object.entries(deps.composeFiles)) {
@@ -190,7 +188,10 @@ export async function runScanOnce(
           }
         }
 
-        const decision = decideAction(deps.rules, stack, bump);
+        const isDep = isDependencyImage(
+          ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+        );
+        const decision = decideAction(deps.rules, stack, bump, isDep);
         if (decision === "skip") {
           // Still advance stored digest so we don't refire on every scan.
           saveDigest(
@@ -259,8 +260,6 @@ export async function runScanOnce(
                 )
               : null,
           );
-        } else if (decision === "report") {
-          reportRows.push({ row, composePath, serviceName });
         } else {
           result.held += 1;
           heldRows.push({ row, composePath, serviceName });
@@ -276,11 +275,13 @@ export async function runScanOnce(
       if (!latest || latest === ref.tag) continue;
 
       const bump: BumpKind = classifyBump(ref.tag, latest);
-      const decision = decideAction(deps.rules, stack, bump);
+      const isDep = isDependencyImage(
+        ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+      );
+      const decision = decideAction(deps.rules, stack, bump, isDep);
       if (decision === "skip") continue;
 
-      // Only generate an approval token for `hold` decisions — `report`
-      // notifications never carry an approve/deny flow.
+      // Only generate an approval token for `hold` decisions.
       const token =
         decision === "hold" ? randomBytes(18).toString("base64url") : undefined;
       const id = recordUpdate(deps.db, {
@@ -328,8 +329,6 @@ export async function runScanOnce(
               )
             : null,
         );
-      } else if (decision === "report") {
-        reportRows.push({ row, composePath, serviceName });
       } else {
         result.held += 1;
         heldRows.push({ row, composePath, serviceName });
@@ -339,8 +338,7 @@ export async function runScanOnce(
 
   // Group rows by (image, current_tag, target_tag) so multiple stacks running
   // the same image get one notification, not N. Approval applies to all rows
-  // in a hold group (see handleApprove → findSiblings); report groups are
-  // FYI-only and never carry an approval token.
+  // in a hold group (see handleApprove → findSiblings).
   const groupBy = (
     rows: { row: UpdateRow; composePath: string; serviceName: string }[],
   ) => {
@@ -359,7 +357,6 @@ export async function runScanOnce(
 
   const dispatchGroup = async (
     group: { row: UpdateRow; composePath: string; serviceName: string }[],
-    mode: "hold" | "report",
   ) => {
     const canonical = group[0]!;
     const advise = deps.llmUrl
@@ -387,7 +384,6 @@ export async function runScanOnce(
     const delivered = await dispatchBumpNotification(
       deps.notifiers,
       group.map((g) => g.row),
-      mode,
       deps.publicUrl,
       advise,
     );
@@ -403,8 +399,7 @@ export async function runScanOnce(
     }
   };
 
-  for (const group of groupBy(heldRows).values()) await dispatchGroup(group, "hold");
-  for (const group of groupBy(reportRows).values()) await dispatchGroup(group, "report");
+  for (const group of groupBy(heldRows).values()) await dispatchGroup(group);
   return result;
 }
 
@@ -420,7 +415,6 @@ function buildLinks(row: UpdateRow, publicUrl?: string): NotifyLink[] {
 async function dispatchBumpNotification(
   notifiers: Notifier[],
   rows: UpdateRow[],
-  mode: "hold" | "report",
   publicUrl?: string,
   advise?: AdviseSummary | null,
 ): Promise<boolean> {
@@ -443,19 +437,14 @@ async function dispatchBumpNotification(
     : rows.length === 1
       ? `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`
       : `${rows.length} stacks: ${row.image} → ${row.target_tag}`;
-  // `report` mode never renders Approve/Deny — the row has no approval token.
-  const links = mode === "hold" ? buildLinks(canonical, publicUrl) : [];
+  const links = buildLinks(canonical, publicUrl);
   const approveUrl = links.find((l) => l.label === "Approve")?.url;
   const denyUrl = links.find((l) => l.label === "Deny")?.url;
 
   // Plain-text body: action card at top (instruction + URLs), then metadata,
   // then LLM summary. Both Apprise and email-clients-without-HTML see this.
   const text: string[] = [];
-  if (mode === "report") {
-    text.push(
-      `FYI — this stack is on policy "report"; no action will be taken.`,
-    );
-  } else if (publicUrl && approveUrl && denyUrl) {
+  if (publicUrl && approveUrl && denyUrl) {
     text.push(
       "Click Approve to pull + restart, or Deny to leave the stack on its current tag.",
     );
@@ -490,11 +479,7 @@ async function dispatchBumpNotification(
   }
   if (others.length > 0) {
     text.push("");
-    text.push(
-      mode === "report"
-        ? `FYI applies to all ${rows.length} stacks listed above.`
-        : `Approval applies to all ${rows.length} stacks listed above.`,
-    );
+    text.push(`Approval applies to all ${rows.length} stacks listed above.`);
   }
   if (advise) {
     text.push("");
@@ -523,7 +508,6 @@ async function dispatchBumpNotification(
 
   const htmlBody = buildHoldHtml({
     rows,
-    mode,
     approveUrl,
     denyUrl,
     advise: advise ?? undefined,
@@ -542,26 +526,18 @@ async function dispatchBumpNotification(
 
 interface HoldHtmlOpts {
   rows: UpdateRow[];
-  mode: "hold" | "report";
   approveUrl?: string;
   denyUrl?: string;
   advise?: AdviseSummary;
 }
 
 function buildHoldHtml(opts: HoldHtmlOpts): string {
-  const { rows, mode, approveUrl, denyUrl, advise } = opts;
+  const { rows, approveUrl, denyUrl, advise } = opts;
   const row = rows[0]!;
   const e = escapeHtml;
 
-  const reportNote =
-    mode === "report"
-      ? `<p style="margin:0;font-size:14px;line-height:1.5;color:#1e3a8a;">FYI — this stack is on policy <code>report</code>. No action will be taken; the bump is here for awareness.</p>`
-      : "";
-
   const buttons =
-    mode === "report"
-      ? reportNote
-      : approveUrl && denyUrl
+    approveUrl && denyUrl
       ? `
       <table role="presentation" cellspacing="0" cellpadding="0" border="0">
         <tr>
@@ -611,13 +587,9 @@ function buildHoldHtml(opts: HoldHtmlOpts): string {
 
   <!-- Action card -->
   <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:18px 20px;margin-bottom:24px;">
-    ${
-      mode === "hold"
-        ? `<p style="margin:0 0 14px 0;font-size:14px;line-height:1.5;color:#1e3a8a;">
+    <p style="margin:0 0 14px 0;font-size:14px;line-height:1.5;color:#1e3a8a;">
       Click <strong>Approve</strong> to pull + restart, or <strong>Deny</strong> to leave the stack on its current tag.
-    </p>`
-        : ""
-    }${buttons}
+    </p>${buttons}
   </div>
 
   <!-- Metadata -->

@@ -47,7 +47,7 @@ describe("runScanOnce", () => {
     const result = await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "patch", stacks: {} },
+      rules: { default: { app: "patch", dependencies: "patch" }, stacks: {} },
       composeFiles: { [stack]: file },
       publicUrl: "https://bump.example.com",
       listTagsFn: fakeListTags as never,
@@ -94,7 +94,7 @@ describe("runScanOnce", () => {
     const result = await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "patch", stacks: {} },
+      rules: { default: { app: "patch", dependencies: "patch" }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner,
@@ -129,7 +129,7 @@ describe("runScanOnce", () => {
     const result = await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "patch", stacks: {} },
+      rules: { default: { app: "patch", dependencies: "patch" }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner: failRunner,
@@ -160,7 +160,7 @@ describe("runScanOnce", () => {
     const result = await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "notify", stacks: {} },
+      rules: { default: { app: "notify", dependencies: "notify" }, stacks: {} },
       composeFiles: { [a.stack]: a.file, [b.stack]: b.file, [c.stack]: c.file },
       publicUrl: "https://bump.example.com",
       listTagsFn: fakeListTags as never,
@@ -193,7 +193,7 @@ describe("runScanOnce", () => {
     await runScanOnce({
       db,
       notifiers: [failingNotifier],
-      rules: { default: "notify", stacks: {} },
+      rules: { default: { app: "notify", dependencies: "notify" }, stacks: {} },
       composeFiles: { [stack]: file },
       publicUrl: "https://bump.example.com",
       listTagsFn: fakeListTags as never,
@@ -228,7 +228,7 @@ describe("runScanOnce", () => {
     await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "notify", stacks: {} },
+      rules: { default: { app: "notify", dependencies: "notify" }, stacks: {} },
       composeFiles: { [a.stack]: a.file, [b.stack]: b.file },
       publicUrl: "https://bump.example.com",
       listTagsFn: fakeListTags as never,
@@ -245,39 +245,44 @@ describe("runScanOnce", () => {
     rmSync(b.file, { force: true });
   });
 
-  it("under 'report' policy: dispatches FYI notification and never generates approval token", async () => {
-    const { stack, file } = makeStack("jellyfin", "linuxserver/jellyfin:10.10.7");
+  it("under split policy with deps='none': dep image is silently skipped while app proceeds", async () => {
+    // app=notify still asks; deps=none silently skips. Build a multi-service
+    // stack where one is the app and one is a known dep image.
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-split-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(
+      file,
+      `services:\n  app:\n    image: outline:1.0.0\n  db:\n    image: postgres:15.5\n`,
+      "utf-8",
+    );
+    const stack = dir.split("/").pop()!;
     const db = openDb({ path: ":memory:" });
     const sent: NotifyMessage[] = [];
     const notifier: Notifier = {
       name: "stub",
       send: async (m) => void sent.push(m),
     };
-    const fakeListTags = async () => [
-      { name: "10.10.7" },
-      { name: "10.11.0" },
-    ];
+    const fakeListTags = async (ref: { name: string; tag: string }) => {
+      if (ref.name.includes("postgres"))
+        return [{ name: "15.5" }, { name: "15.6" }, { name: "16.0" }];
+      return [{ name: "1.0.0" }, { name: "1.1.0" }];
+    };
 
-    await runScanOnce({
+    const result = await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "report", stacks: {} },
+      // app=notify (always ask), dependencies=none (silently skip postgres)
+      rules: { default: { app: "notify", dependencies: "none" }, stacks: {} },
       composeFiles: { [stack]: file },
       publicUrl: "https://bump.example.com",
       listTagsFn: fakeListTags as never,
     });
 
+    // Only the app got an ask email; postgres was skipped silently.
+    expect(result.held).toBe(1);
     expect(sent).toHaveLength(1);
-    expect(sent[0]!.body).toContain('FYI');
-    expect(sent[0]!.body).not.toContain("Click Approve");
-    // No buttons in HTML either
-    expect(sent[0]!.htmlBody).not.toContain(">Approve<");
-    expect(sent[0]!.htmlBody).toContain("policy <code>report</code>");
-    // Row should have no approval token (so no approve link is even possible)
-    const { listByStatus } = await import("../src/state/db.js");
-    const rows = listByStatus(db, "notified");
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.approval_token).toBeNull();
+    expect(sent[0]!.body).toContain("outline");
+    expect(sent[0]!.body).not.toContain("postgres");
 
     rmSync(file, { force: true });
   });
@@ -305,7 +310,7 @@ describe("runScanOnce", () => {
     await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "patch", stacks: {} },
+      rules: { default: { app: "patch", dependencies: "patch" }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner: okRunner,
@@ -339,7 +344,7 @@ describe("runScanOnce", () => {
     const result = await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "notify", stacks: {} },
+      rules: { default: { app: "notify", dependencies: "notify" }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
     });
@@ -368,7 +373,7 @@ describe("runScanOnce", () => {
     const deps = {
       db,
       notifiers: [notifier],
-      rules: { default: "notify" as const, stacks: {} },
+      rules: { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} },
       composeFiles: { [stack]: file },
       publicUrl: "https://bump.example.com",
       listTagsFn: fakeListTags as never,
@@ -433,7 +438,7 @@ describe("runScanOnce", () => {
     const deps = {
       db,
       notifiers: [notifier],
-      rules: { default: "patch" as const, stacks: {} },
+      rules: { default: { app: "patch" as const, dependencies: "patch" as const }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner,
@@ -492,7 +497,7 @@ describe("runScanOnce", () => {
     const result = await runScanOnce({
       db,
       notifiers: [notifier],
-      rules: { default: "major", stacks: {} },
+      rules: { default: { app: "major", dependencies: "major" }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner,
@@ -543,7 +548,7 @@ describe("runScanOnce", () => {
     const deps = {
       db,
       notifiers: [notifier],
-      rules: { default: "notify" as const, stacks: {} },
+      rules: { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       fetchManifestDigestFn: fetchManifestDigestFn as never,
@@ -579,7 +584,7 @@ describe("runScanOnce", () => {
     const deps = {
       db,
       notifiers: [] as Notifier[],
-      rules: { default: "major" as const, stacks: {} },
+      rules: { default: { app: "major" as const, dependencies: "major" as const }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner: runner as never,
@@ -603,7 +608,7 @@ describe("runScanOnce", () => {
     const deps = {
       db,
       notifiers: [] as Notifier[],
-      rules: { default: "patch" as const, stacks: {} },
+      rules: { default: { app: "patch" as const, dependencies: "patch" as const }, stacks: {} },
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner: okRunner,

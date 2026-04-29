@@ -27,6 +27,7 @@ export interface UpdateRow {
   decided_by: string | null;
   applied_at: number | null;
   apply_log: string | null;
+  digested_at: number | null;
 }
 
 const SCHEMA = `
@@ -47,10 +48,13 @@ CREATE TABLE IF NOT EXISTS updates (
   decided_by      TEXT,
   applied_at      INTEGER,
   apply_log       TEXT,
+  digested_at     INTEGER,
   UNIQUE (stack, service, current_tag, target_tag)
 );
 CREATE INDEX IF NOT EXISTS idx_updates_status ON updates(status);
 CREATE INDEX IF NOT EXISTS idx_updates_token ON updates(approval_token);
+CREATE INDEX IF NOT EXISTS idx_updates_applied_digest ON updates(applied_at, digested_at)
+  WHERE applied_at IS NOT NULL AND digested_at IS NULL;
 
 -- Last-seen digest per (image, tag). Used to detect digest changes on moving
 -- tags like :latest where the version isn't encoded in the tag itself.
@@ -96,6 +100,16 @@ function migrate(db: DB): void {
     .get() as { sql: string } | undefined;
   if (td && !/\bresolved_tag\b/.test(td.sql)) {
     db.exec("ALTER TABLE tag_digests ADD COLUMN resolved_tag TEXT");
+  }
+
+  // v0.4.0: add digested_at column for daily-digest dedup.
+  const u = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u && !/\bdigested_at\b/.test(u.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN digested_at INTEGER");
   }
 }
 
@@ -280,6 +294,39 @@ export function setApplied(db: DB, id: number, r: ApplyResult): void {
   db.prepare(
     `UPDATE updates SET status = ?, applied_at = ?, apply_log = ? WHERE id = ?`,
   ).run(r.ok ? "applied" : "failed", Date.now(), r.log ?? null, id);
+}
+
+/**
+ * Daily-digest support (v0.4.0). Returns rows that were applied (or failed
+ * apply) in the given window AND haven't been included in a digest yet.
+ * Caller marks them digested via `markDigested` once the daily report email
+ * actually went out.
+ */
+export function findUndigestedApplied(
+  db: DB,
+  sinceMs: number,
+): UpdateRow[] {
+  const cutoff = Date.now() - sinceMs;
+  return db
+    .prepare(
+      `SELECT * FROM updates
+       WHERE applied_at IS NOT NULL
+         AND applied_at >= ?
+         AND digested_at IS NULL
+         AND status IN ('applied', 'failed')
+       ORDER BY applied_at ASC`,
+    )
+    .all(cutoff) as UpdateRow[];
+}
+
+export function markDigested(db: DB, ids: number[]): void {
+  if (ids.length === 0) return;
+  const stmt = db.prepare(`UPDATE updates SET digested_at = ? WHERE id = ?`);
+  const now = Date.now();
+  const tx = db.transaction((rows: number[]) => {
+    for (const id of rows) stmt.run(now, id);
+  });
+  tx(ids);
 }
 
 export interface DigestStats {

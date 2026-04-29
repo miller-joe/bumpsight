@@ -119,56 +119,73 @@ export function classifyBump(currentTag: string, newTag: string): BumpKind {
 }
 
 /**
- * Per-stack policy.
+ * Bump-action level. Controls how aggressively bumpsight auto-applies upgrades.
  *   patch / minor / major  → auto-apply at or below the named bump kind.
- *   notify                 → hold for human approval (Approve/Deny buttons).
- *   report                 → FYI-only notification; no approve/deny flow.
- *   none                   → ignore.
+ *   notify                 → never auto-apply; hold for human approval.
+ *   none                   → ignore (no email, no DB row).
+ *
+ * v0.4.0 dropped the legacy `report` action — `notify` covers the "tell me,
+ * I'll decide" need; the old `report` (FYI-only no approve/deny) was an
+ * underused middle ground. Loaders accept legacy `report` and silently map
+ * it to `notify` with a one-time warning at startup.
  */
-export type BumpAction =
-  | "patch"
-  | "minor"
-  | "major"
-  | "notify"
-  | "report"
-  | "none";
+export type BumpAction = "patch" | "minor" | "major" | "notify" | "none";
+
+/**
+ * Per-stack policy: two orthogonal axes. The `app` axis controls the primary
+ * service in the stack; the `dependencies` axis controls images recognized
+ * as dependency layers (Postgres, Redis, MariaDB, Vault, etc. — see
+ * `isDependencyImage`).
+ *
+ * Typical conservative homelab default: `{ app: "minor", dependencies: "none" }`
+ * — auto-apply patches + minors of the primary app, never touch deps without
+ * being asked. Dependency major-upgrades against a parent app's pin risk
+ * on-disk format breaks; bumpsight defers to the parent app's release cadence.
+ */
+export interface PolicyAxes {
+  app: BumpAction;
+  dependencies: BumpAction;
+}
 
 export interface RulesConfig {
   /** Default policy applied when a stack has no explicit override. */
-  default: BumpAction;
+  default: PolicyAxes;
   /** Per-stack overrides keyed by stack name (compose project / directory). */
-  stacks: Record<string, BumpAction>;
+  stacks: Record<string, PolicyAxes>;
 }
 
-export type Decision = "auto-apply" | "hold" | "report" | "skip";
+export type Decision = "auto-apply" | "hold" | "skip";
 
 /**
  * Decide what to do with a discovered bump.
+ *
+ * Reads from the right axis of the stack's policy based on whether the
+ * bumped image is a known dependency layer. A bump on `library/postgres`
+ * (a dep) reads from `policy.dependencies`; a bump on `outline` (the app)
+ * reads from `policy.app`.
  *
  *   patch  → auto-apply patches only.
  *   minor  → auto-apply patches and minors.
  *   major  → auto-apply everything classified.
  *   notify → never auto-apply; hold for human approval.
- *   report → FYI-only notification, no approve/deny flow.
- *   none   → ignore.
+ *   none   → silent skip.
  *
- * `unknown` bumps are always held under `notify`-style policies — we can't
- * reason about them safely. Under `report`, unknowns still report-only.
+ * `unknown` and `digest` bumps are always held — they don't carry a
+ * semver classification we can reason about safely. `none` still skips
+ * them silently, since the operator explicitly asked for silence.
  */
 export function decideAction(
   config: RulesConfig,
   stack: string,
   bump: BumpKind,
+  isDependency: boolean,
 ): Decision {
-  const action = config.stacks[stack] ?? config.default;
+  const axes = config.stacks[stack] ?? config.default;
+  const action = isDependency ? axes.dependencies : axes.app;
   if (action === "none") return "skip";
-  if (action === "report") return "report";
   if (action === "notify") return "hold";
-  // `digest` bumps don't carry a semver classification, so we can't reason
-  // about "is this safe to auto-apply." Always hold them under any policy
-  // until Phase 2 resolves digest → highest-precision tag → semver kind.
   if (bump === "unknown" || bump === "digest") return "hold";
-  const allowed: Record<Exclude<BumpAction, "notify" | "report" | "none">, BumpKind[]> = {
+  const allowed: Record<Exclude<BumpAction, "notify" | "none">, BumpKind[]> = {
     patch: ["patch"],
     minor: ["patch", "minor"],
     major: ["patch", "minor", "major"],

@@ -63,66 +63,89 @@ describe("isDependencyImage", () => {
   });
 });
 
-describe("decideAction", () => {
-  it("auto-applies patches under default 'patch' policy", () => {
-    const cfg = { default: "patch" as const, stacks: {} };
-    expect(decideAction(cfg, "any", "patch")).toBe("auto-apply");
-    expect(decideAction(cfg, "any", "minor")).toBe("hold");
-    expect(decideAction(cfg, "any", "major")).toBe("hold");
+describe("decideAction (v0.4.0 split-axis policy)", () => {
+  // Helpers for legibility in the new split-axis world.
+  const both = (action: "patch" | "minor" | "major" | "notify" | "none") =>
+    ({ default: { app: action, dependencies: action }, stacks: {} } as const);
+  const split = (
+    app: "patch" | "minor" | "major" | "notify" | "none",
+    dependencies: "patch" | "minor" | "major" | "notify" | "none",
+  ) => ({ default: { app, dependencies }, stacks: {} } as const);
+
+  it("auto-applies patches under app='patch' (non-dep image)", () => {
+    const cfg = both("patch");
+    expect(decideAction(cfg, "any", "patch", false)).toBe("auto-apply");
+    expect(decideAction(cfg, "any", "minor", false)).toBe("hold");
+    expect(decideAction(cfg, "any", "major", false)).toBe("hold");
   });
 
-  it("auto-applies patches and minors under 'minor' policy", () => {
-    const cfg = { default: "minor" as const, stacks: {} };
-    expect(decideAction(cfg, "any", "patch")).toBe("auto-apply");
-    expect(decideAction(cfg, "any", "minor")).toBe("auto-apply");
-    expect(decideAction(cfg, "any", "major")).toBe("hold");
+  it("auto-applies patches+minors under app='minor'", () => {
+    const cfg = both("minor");
+    expect(decideAction(cfg, "any", "patch", false)).toBe("auto-apply");
+    expect(decideAction(cfg, "any", "minor", false)).toBe("auto-apply");
+    expect(decideAction(cfg, "any", "major", false)).toBe("hold");
   });
 
-  it("auto-applies everything classified under 'major' policy", () => {
-    const cfg = { default: "major" as const, stacks: {} };
-    expect(decideAction(cfg, "any", "patch")).toBe("auto-apply");
-    expect(decideAction(cfg, "any", "minor")).toBe("auto-apply");
-    expect(decideAction(cfg, "any", "major")).toBe("auto-apply");
+  it("auto-applies everything classified under app='major'", () => {
+    const cfg = both("major");
+    expect(decideAction(cfg, "any", "patch", false)).toBe("auto-apply");
+    expect(decideAction(cfg, "any", "minor", false)).toBe("auto-apply");
+    expect(decideAction(cfg, "any", "major", false)).toBe("auto-apply");
   });
 
-  it("never auto-applies under 'notify' policy", () => {
-    const cfg = { default: "notify" as const, stacks: {} };
-    expect(decideAction(cfg, "any", "patch")).toBe("hold");
-    expect(decideAction(cfg, "any", "major")).toBe("hold");
+  it("never auto-applies under 'notify'", () => {
+    const cfg = both("notify");
+    expect(decideAction(cfg, "any", "patch", false)).toBe("hold");
+    expect(decideAction(cfg, "any", "major", false)).toBe("hold");
   });
 
-  it("skips entirely under 'none' policy", () => {
-    const cfg = { default: "none" as const, stacks: {} };
-    expect(decideAction(cfg, "any", "patch")).toBe("skip");
-    expect(decideAction(cfg, "any", "major")).toBe("skip");
+  it("skips entirely under 'none'", () => {
+    const cfg = both("none");
+    expect(decideAction(cfg, "any", "patch", false)).toBe("skip");
+    expect(decideAction(cfg, "any", "major", false)).toBe("skip");
   });
 
-  it("never auto-applies an unknown bump regardless of policy", () => {
+  it("never auto-applies an unknown or digest bump regardless of policy", () => {
     for (const action of ["patch", "minor", "major"] as const) {
-      const cfg = { default: action, stacks: {} };
-      expect(decideAction(cfg, "any", "unknown")).toBe("hold");
+      const cfg = both(action);
+      expect(decideAction(cfg, "any", "unknown", false)).toBe("hold");
+      expect(decideAction(cfg, "any", "digest", false)).toBe("hold");
     }
   });
 
-  it("returns 'report' for stacks on the report policy regardless of bump kind", () => {
-    const cfg = { default: "report" as const, stacks: {} };
-    expect(decideAction(cfg, "any", "patch")).toBe("report");
-    expect(decideAction(cfg, "any", "minor")).toBe("report");
-    expect(decideAction(cfg, "any", "major")).toBe("report");
-    expect(decideAction(cfg, "any", "unknown")).toBe("report");
+  it("uses the dependencies axis for dependency images", () => {
+    // Adventurous on app, conservative on deps — typical homelab default.
+    const cfg = split("major", "none");
+    // app axis applies for non-dep image
+    expect(decideAction(cfg, "any", "major", false)).toBe("auto-apply");
+    // deps axis applies for dep image: skip silently
+    expect(decideAction(cfg, "any", "patch", true)).toBe("skip");
+    expect(decideAction(cfg, "any", "major", true)).toBe("skip");
+  });
+
+  it("dep major doesn't auto-apply when deps='minor'", () => {
+    const cfg = split("major", "minor");
+    expect(decideAction(cfg, "any", "patch", true)).toBe("auto-apply");
+    expect(decideAction(cfg, "any", "minor", true)).toBe("auto-apply");
+    expect(decideAction(cfg, "any", "major", true)).toBe("hold");
   });
 
   it("respects per-stack overrides over the default", () => {
     const cfg = {
-      default: "patch" as const,
-      stacks: { stalwart: "notify" as const, glance: "minor" as const },
-    };
-    // stalwart: forced notify
-    expect(decideAction(cfg, "stalwart", "patch")).toBe("hold");
-    // glance: minors auto-apply, defaults wouldn't have allowed it
-    expect(decideAction(cfg, "glance", "minor")).toBe("auto-apply");
+      default: { app: "patch", dependencies: "notify" },
+      stacks: {
+        stalwart: { app: "notify", dependencies: "none" },
+        glance: { app: "minor", dependencies: "notify" },
+      },
+    } as const;
+    // stalwart app: forced notify (always hold)
+    expect(decideAction(cfg, "stalwart", "patch", false)).toBe("hold");
+    // stalwart dep: 'none' -> silent skip
+    expect(decideAction(cfg, "stalwart", "patch", true)).toBe("skip");
+    // glance app: minor auto-applies (default 'patch' wouldn't have)
+    expect(decideAction(cfg, "glance", "minor", false)).toBe("auto-apply");
     // unrelated stack: falls back to default
-    expect(decideAction(cfg, "anything-else", "patch")).toBe("auto-apply");
-    expect(decideAction(cfg, "anything-else", "minor")).toBe("hold");
+    expect(decideAction(cfg, "anything-else", "patch", false)).toBe("auto-apply");
+    expect(decideAction(cfg, "anything-else", "patch", true)).toBe("hold"); // default deps='notify'
   });
 });

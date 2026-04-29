@@ -2,6 +2,44 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.4.0 — 2026-04-28
+
+Policy split: app and dependencies are now independent axes. Backward-compatible loader.
+
+### Added
+
+- **Per-stack policy split.** Each stack now has two orthogonal axes: `app` (the primary service) and `dependencies` (sidecar images bumpsight recognizes as dep layers — Postgres, Redis, MariaDB, Vault, Valkey, RabbitMQ, etc.). Each axis takes one of `patch | minor | major | notify | none`.
+
+  ```yaml
+  default:
+    app: minor              # auto-apply patches + minors of the primary app
+    dependencies: none      # never touch Postgres / Redis / etc.
+
+  stacks:
+    vault:
+      app: patch
+      dependencies: none
+    outline:
+      app: minor
+      dependencies: notify  # tell me, I decide
+  ```
+
+  Or env vars: `BUMPSIGHT_AUTO_UPDATE_APP=minor` and `BUMPSIGHT_AUTO_UPDATE_DEPENDENCIES=none`.
+
+  At-or-below the level → auto-apply silently. Above → ask email with AI assessment. `none` → silent skip. `notify` → ask for any change.
+- **Backward-compat loader.** Legacy single-axis configs (`default: minor`, `stacks: { vault: patch }`) keep working. They auto-map at load time to `{ app: <value>, dependencies: notify }` — preserves the v0.3.x behavior of holding dep bumps for human approval. Deprecation warnings printed at startup. Migrate at your leisure.
+
+### Changed
+
+- **`decideAction(config, stack, bump, isDependency)`** — added the `isDependency` flag. The daemon scan path computes it once per bump via `isDependencyImage(image)` and routes to the correct axis.
+- **The `report` action is dropped.** Was an underused FYI middle ground (dispatched email but no approve/deny); `notify` covers the use case. Legacy `report` in config files auto-migrates to `notify` with a one-time startup warning.
+- **The hack from v0.3.3** that force-held dep-major regardless of policy is removed — the new dependencies axis makes it explicit and operator-controllable.
+
+### Notes
+
+- v0.4.1 will add the daily-digest email (auto-applied bumps aggregated into one daily report instead of per-apply). For v0.4.0, immediate per-apply emails still ship — the policy split is the primary v0.4.0 contract change.
+- No DB schema break beyond the additive `digested_at` column on `updates` (preparing for v0.4.1, harmless on v0.4.0).
+
 ## 0.3.3 — 2026-04-28
 
 LinuxServer.io tag support, dependency-image awareness, tighter advise prompts.
