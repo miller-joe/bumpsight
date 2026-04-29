@@ -25,6 +25,83 @@ export function isMovingTag(tag: string): boolean {
 }
 
 /**
+ * Image references that are typically a dependency layer of another app
+ * (databases, caches, brokers, secret stores). When a parent app's compose
+ * pins one of these to a specific version, that pin reflects what the
+ * parent app has tested against — independent major upgrades risk on-disk
+ * format breaks, schema mismatch, or silent corruption.
+ *
+ * Bumpsight uses this list to soften the advise output for major bumps:
+ * surface the bump for awareness, but recommend "wait for the parent app
+ * to bump it" instead of "here's what to check before upgrading."
+ *
+ * Match is on the canonical Docker Hub `namespace/name` form (or just
+ * `name` for `library/<name>` images). Forks and unofficial mirrors
+ * aren't covered — that's intentional, the canonical names cover ~95%
+ * of homelab-stack DB sidecars.
+ */
+const KNOWN_DEPENDENCY_IMAGES = new Set<string>([
+  // Postgres family
+  "postgres", "library/postgres",
+  "pgvector/pgvector",
+  "tensorchord/pgvecto-rs",
+  "ankane/pgvector",
+  "supabase/postgres",
+  // MariaDB / MySQL
+  "mariadb", "library/mariadb",
+  "mysql", "library/mysql",
+  "percona", "library/percona",
+  // Mongo
+  "mongo", "library/mongo",
+  "mongodb/mongodb-community-server",
+  // KV / cache
+  "redis", "library/redis",
+  "valkey/valkey",
+  "memcached", "library/memcached",
+  "eqalpha/keydb",
+  // Search
+  "elasticsearch", "library/elasticsearch",
+  "opensearchproject/opensearch",
+  // Brokers
+  "rabbitmq", "library/rabbitmq",
+  "apache/kafka",
+  "confluentinc/cp-kafka",
+  "nats", "library/nats",
+  // Vector DBs
+  "qdrant/qdrant",
+  "weaviate/weaviate",
+  "chromadb/chroma",
+  "milvusdb/milvus",
+  // Other infra
+  "clickhouse/clickhouse-server",
+  "couchdb", "library/couchdb",
+  "influxdb", "library/influxdb",
+  "getmeili/meilisearch",
+  // Secret stores
+  "hashicorp/vault",
+  "hashicorp/consul",
+  // Coordination
+  "zookeeper", "library/zookeeper",
+]);
+
+/**
+ * Return true if the image ref is a well-known dependency layer (DB, cache,
+ * broker, secret store, vector DB, etc.). Pass the full image ref like
+ * `library/postgres` or `valkey/valkey`. Implicit `library/` is stripped
+ * before lookup so callers can pass the bare repo name too (`postgres`).
+ */
+export function isDependencyImage(repoRef: string): boolean {
+  const normalized = repoRef.toLowerCase();
+  // Strip a registry host if present (`docker.io/library/postgres`,
+  // `ghcr.io/foo/bar` — we only check namespace/name).
+  const noRegistry = normalized.replace(/^[a-z0-9.-]+\.[a-z]+\//, "");
+  return (
+    KNOWN_DEPENDENCY_IMAGES.has(noRegistry) ||
+    KNOWN_DEPENDENCY_IMAGES.has(`library/${noRegistry}`)
+  );
+}
+
+/**
  * Classify a tag bump into patch / minor / major using the same family
  * detection as scan. Anything that isn't a clean numeric bump within the
  * same family is "unknown" — and "unknown" is never auto-applied.

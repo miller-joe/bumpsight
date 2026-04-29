@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyBump, decideAction } from "../src/daemon/rules.js";
+import { classifyBump, decideAction, isDependencyImage } from "../src/daemon/rules.js";
 
 describe("classifyBump", () => {
   it("classifies a major version change", () => {
@@ -29,6 +29,37 @@ describe("classifyBump", () => {
   it("returns unknown for non-numeric tags", () => {
     expect(classifyBump("latest", "stable")).toBe("unknown");
     expect(classifyBump("develop", "1.2.3")).toBe("unknown");
+  });
+});
+
+describe("isDependencyImage", () => {
+  it("matches official Postgres in any common form", () => {
+    expect(isDependencyImage("postgres")).toBe(true);
+    expect(isDependencyImage("library/postgres")).toBe(true);
+    expect(isDependencyImage("docker.io/library/postgres")).toBe(true);
+    expect(isDependencyImage("Postgres")).toBe(true); // case-insensitive
+  });
+
+  it("matches namespaced dependency images (vault, valkey, pgvector, redis)", () => {
+    expect(isDependencyImage("hashicorp/vault")).toBe(true);
+    expect(isDependencyImage("valkey/valkey")).toBe(true);
+    expect(isDependencyImage("pgvector/pgvector")).toBe(true);
+    expect(isDependencyImage("redis")).toBe(true);
+  });
+
+  it("matches GHCR-prefixed dependency images via registry strip", () => {
+    expect(isDependencyImage("ghcr.io/hashicorp/vault")).toBe(true);
+  });
+
+  it("does NOT match application-layer images", () => {
+    expect(isDependencyImage("nginx")).toBe(false); // nginx is webserver, not dep
+    expect(isDependencyImage("library/node")).toBe(false);
+    expect(isDependencyImage("n8nio/n8n")).toBe(false);
+    expect(isDependencyImage("vaultwarden/server")).toBe(false); // vaultwarden ≠ Vault
+  });
+
+  it("does NOT match unknown forks (intentional — only canonical names covered)", () => {
+    expect(isDependencyImage("randomfork/postgres-custom")).toBe(false);
   });
 });
 

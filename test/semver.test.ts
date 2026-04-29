@@ -41,6 +41,37 @@ describe("parseTag", () => {
     const t = parseTag("latest");
     expect(t.family).toBe("channel:latest");
   });
+
+  it("LinuxServer.io tag with -rN-lsNNN strips build numbers from family", () => {
+    const a = parseTag("4.0.17.2952-r0-ls309");
+    const b = parseTag("4.0.18.2960-r1-ls310");
+    expect(a.family).toBe(b.family);
+    expect(a.numeric).toEqual([4, 0, 17, 2952]);
+    expect(b.numeric).toEqual([4, 0, 18, 2960]);
+    // suffix is preserved on the parsed object so display can keep it
+    expect(a.suffix).toBe("-r0-ls309");
+  });
+
+  it("LinuxServer.io version- prefix gets stripped before semver parse", () => {
+    const t = parseTag("version-1.43.1.10611-1e34174b1-ls303");
+    expect(t.family).toMatch(/^semver/);
+    expect(t.numeric).toEqual([1, 43, 1, 10611]);
+  });
+
+  it("LinuxServer.io comparison: newer ls-suffixed tag wins in same family", () => {
+    expect(findLatestInFamily("4.0.17.2952-r0-ls309", [
+      "4.0.18.2960-r0-ls310",
+      "4.0.16.2900-r0-ls300",
+    ])).toBe("4.0.18.2960-r0-ls310");
+  });
+
+  it("LinuxServer.io: alpine variant + ls suffix kept distinct from bare", () => {
+    // Variants like -alpine should remain in their own family even when
+    // an ls build number is also present.
+    const a = parseTag("3.0-alpine-r0-ls123");
+    const b = parseTag("3.0-r0-ls123");
+    expect(a.family).not.toBe(b.family);
+  });
 });
 
 describe("compareTags / findLatestInFamily", () => {

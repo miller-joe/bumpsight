@@ -2,6 +2,25 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.3.3 — 2026-04-28
+
+LinuxServer.io tag support, dependency-image awareness, tighter advise prompts.
+
+### Added
+
+- **LinuxServer.io tag format support.** Tags like `4.0.17.2952-r0-ls309` now parse cleanly: build-number suffix patterns (`-r\d+`, `-ls\d+`, `-build\.\d+`) are stripped from the family discriminator so `4.0.17.2952-r0-ls309` and `4.0.18.2960-r0-ls310` end up in the same family and compare normally. The `version-` prefix common in LSIO tags is also stripped before parsing. Affects: sonarr, radarr, lidarr, prowlarr, qbittorrent, plex, and any other `linuxserver/*` image bumpsight scans.
+- **Dependency-image awareness in advise output.** New `isDependencyImage()` helper in `src/daemon/rules.ts` recognizes well-known dependency layers (Postgres, MariaDB, MySQL, Mongo, Redis, Valkey, RabbitMQ, Kafka, Elasticsearch, OpenSearch, Vault, Consul, ClickHouse, InfluxDB, Meilisearch, Qdrant, Weaviate, Chroma, etc.). When advise is asked about a *major* bump of one of these, the LLM prompt switches to a "wait for the parent app to bump it" framing instead of "here's what to check before upgrading." Independent dependency-major upgrades risk on-disk format breaks, schema mismatches, or silent data corruption — bumpsight now reflects that.
+
+### Changed
+
+- **Tightened advise system prompts.** Both the release-notes and general-knowledge prompts now explicitly forbid "check the changelog / verify with the team / consult the docs / look up X / review the upgrade guide" punts. The LLM is required to give concrete findings from the supplied notes (or say "None mentioned in the supplied notes." explicitly) instead of redirecting the user. Every section of the output is required even if the body is just "None." — no silent skips. The general-knowledge prompt now also requires every section.
+- **Recommended-action section** added to the release-notes prompt (was only in the opinion-only prompt). Both flavors now end with a short, opinionated approve / approve-after-quick-check / hold-for-review / hold-for-thorough-review verdict.
+
+### Notes
+
+- The dependency-image list covers canonical Docker Hub names (e.g. `postgres`, `library/postgres`, `hashicorp/vault`, `valkey/valkey`). Forks under custom namespaces (e.g. `randomfork/postgres-custom`) are intentionally **not** matched — the canonical names cover the ~95% case for typical homelab stacks. Add forks to the set if you maintain one.
+- LSIO tag-name parsing is purely a family-discriminator fix; no schema or behavior change for non-LSIO images.
+
 ## 0.3.2 — 2026-04-28
 
 `:latest` digest tracking — Phase 2: digest → semver resolution + GHCR support.

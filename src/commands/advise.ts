@@ -7,6 +7,7 @@ import {
   type GithubRelease,
 } from "../releases/github.js";
 import { chat, type ChatMessage } from "../llm/chat.js";
+import { classifyBump, isDependencyImage } from "../daemon/rules.js";
 
 export interface AdviseOptions {
   image: string;
@@ -56,6 +57,16 @@ export async function getAdviseSummary(
   const ref = parseImageRef(opts.image);
   const from = opts.from ?? ref.tag;
 
+  // Dependency-image awareness: when the image is a known dependency layer
+  // (postgres, redis, mariadb, vault, etc.) AND the bump is major, switch
+  // the prompt to the "wait for the parent app to bump it" framing.
+  const repoForDepCheck = ref.namespace
+    ? `${ref.namespace}/${ref.name}`
+    : ref.name;
+  const isDepImage = isDependencyImage(repoForDepCheck);
+  const bumpKind = classifyBump(from, opts.to);
+  const isDependencyMajor = isDepImage && bumpKind === "major";
+
   const serviceConfig =
     opts.composeFile && opts.serviceName
       ? extractServiceConfig(opts.composeFile, opts.serviceName)
@@ -92,7 +103,7 @@ export async function getAdviseSummary(
     // Opinion-only fallback. The LLM is good at general guidance for
     // well-known images even without per-release notes.
     try {
-      const prompt = buildOpinionPrompt(opts.image, from, opts.to, serviceConfig);
+      const prompt = buildOpinionPrompt(opts.image, from, opts.to, serviceConfig, { isDependencyMajor });
       const summary = await chat(prompt, {
         baseUrl,
         apiKey: opts.llmKey,
@@ -124,7 +135,7 @@ export async function getAdviseSummary(
     allBetween.length > MAX_RELEASES_IN_PROMPT
       ? allBetween.slice(0, MAX_RELEASES_IN_PROMPT)
       : allBetween;
-  const prompt = buildPrompt(opts.image, from, opts.to, between, serviceConfig);
+  const prompt = buildPrompt(opts.image, from, opts.to, between, serviceConfig, { isDependencyMajor });
 
   try {
     const summary = await chat(prompt, {
@@ -205,7 +216,22 @@ function buildPrompt(
   to: string,
   releases: GithubRelease[],
   serviceConfig: ServiceDef | null,
+  flags: { isDependencyMajor?: boolean } = {},
 ): ChatMessage[] {
+  const dependencyMajorClause = flags.isDependencyMajor
+    ? [
+        "",
+        "IMPORTANT — this is a MAJOR bump of a known dependency image",
+        "(database, cache, broker, secret store, etc.). For these, the",
+        "right call for self-hosted users is usually 'don't upgrade",
+        "independently — wait for the parent app to bump it.' Database",
+        "majors typically require migration steps the parent app's",
+        "release coordinates with. Reflect this in your Recommended",
+        "action: prefer 'hold' unless the release notes explicitly",
+        "describe a clean drop-in upgrade path for self-hosted users.",
+      ].join("\n")
+    : "";
+
   const systemMessage: ChatMessage = {
     role: "system",
     content: [
@@ -223,11 +249,18 @@ function buildPrompt(
       "Required actions:",
       "- concrete steps the user should take before pulling, if any. If none, say 'None.'",
       "",
+      "Recommended action:",
+      "- one short, opinionated recommendation: approve / approve-after-quick-check / hold-for-review / hold-for-thorough-review.",
+      "- one sentence justifying it.",
+      "",
       "Rules:",
       "- No fluff. No greetings. No sign-offs.",
       "- Only claim a breaking change if the release notes say so.",
-      "- If the release notes are thin, say 'Release notes are minimal.' and stop.",
-    ].join("\n"),
+      "- NEVER punt with 'check the changelog' / 'verify with the team' / 'consult the docs' / 'look up X' / 'review the upgrade guide'. Give concrete findings from the supplied notes, or say 'None mentioned in the supplied notes.' explicitly.",
+      "- Always emit every section. If a section has nothing, write 'None.' — never skip.",
+      "- If the release notes are sparse, summarize what IS there in one or two lines, then say 'Notes are sparse — base your decision on history of this image and the version delta.' Do NOT advise the user to look elsewhere; that's their job, not yours.",
+      dependencyMajorClause,
+    ].filter(Boolean).join("\n"),
   };
 
   const releasesBlock = releases
@@ -271,7 +304,21 @@ function buildOpinionPrompt(
   from: string,
   to: string,
   serviceConfig: ServiceDef | null,
+  flags: { isDependencyMajor?: boolean } = {},
 ): ChatMessage[] {
+  const dependencyMajorClause = flags.isDependencyMajor
+    ? [
+        "",
+        "IMPORTANT — this is a MAJOR bump of a known dependency image",
+        "(database, cache, broker, secret store, etc.). For self-hosted",
+        "stacks, the canonical answer is 'wait for the parent app to bump",
+        "it.' Independent dependency-major upgrades risk on-disk format",
+        "breaks, schema mismatch, or silent data corruption. Default to",
+        "'hold-for-thorough-review' unless you have specific knowledge",
+        "that this image upgrades cleanly in place.",
+      ].join("\n")
+    : "";
+
   const systemMessage: ChatMessage = {
     role: "system",
     content: [
@@ -298,9 +345,12 @@ function buildOpinionPrompt(
       "",
       "Rules:",
       "- No fluff. No greetings. No sign-offs.",
-      "- Be honest about uncertainty — if you don't know the image, say 'risk: unknown'.",
+      "- Be honest about uncertainty — if you don't know the image, say 'risk: unknown' and stop with that section only.",
       "- Do not invent breaking changes you can't substantiate.",
-    ].join("\n"),
+      "- NEVER punt with 'check the changelog' / 'verify with the team' / 'consult the docs' / 'look up X' / 'review the upgrade guide'. The user wants YOUR read; if you don't have one, say so directly.",
+      "- Always emit every section. If a section genuinely has nothing useful, write 'None.' — never skip.",
+      dependencyMajorClause,
+    ].filter(Boolean).join("\n"),
   };
 
   const configBlock = serviceConfig

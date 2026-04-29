@@ -21,7 +21,12 @@ export interface ParsedTag {
 }
 
 export function parseTag(raw: string): ParsedTag {
-  const trimmed = raw.replace(/^v/, "");
+  // Strip leading `version-` (LinuxServer.io convention) FIRST, then `v`
+  // (semver convention). Order matters: `^v` would otherwise eat the v of
+  // "version-" and leave "ersion-..." which doesn't match anything.
+  // Use a lookahead on `^v` to require a digit after — `v1.2.3` strips,
+  // `vault` (channel name) does not.
+  const trimmed = raw.replace(/^version-/, "").replace(/^v(?=\d)/, "");
 
   // YYYY-MM-DD or YYYYMMDD
   const dateDash = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})(.*)$/);
@@ -48,11 +53,22 @@ export function parseTag(raw: string): ParsedTag {
   if (semver) {
     const numeric = semver[1]!.split(".").map((n) => Number(n));
     const suffix = semver[2] ?? "";
+    // Build-number patterns ARE per-build, not per-variant — strip them
+    // from the family discriminator so `4.0.0.701-r0-ls123` and
+    // `4.0.0.702-r0-ls124` end up in the same family and compare cleanly.
+    // Keeps `-alpine`, `-slim`, `-debian` etc. as variant discriminators.
+    const familySuffix = suffix
+      .replace(/-r\d+/g, "")
+      .replace(/-ls\d+/g, "")
+      .replace(/-build\.\d+/g, "")
+      // Collapse `-` runs that may form after stripping (e.g. "-r0-ls5" -> "--").
+      .replace(/-+/g, "-")
+      .replace(/-$/, "");
     // Include the numeric part count in the family so a bare build number
     // like `176` isn't compared against 3-part semver like `4.0.14`.
     return {
       raw,
-      family: `semver${suffix.toLowerCase()}:${numeric.length}`,
+      family: `semver${familySuffix.toLowerCase()}:${numeric.length}`,
       numeric,
       suffix,
     };
