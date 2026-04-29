@@ -131,7 +131,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     `daemon starting: ${cfg.composeFiles.length} compose file(s) ${discoveryHint}, ` +
       `interval=${intervalRaw}, notify_interval=${notifyIntervalRaw}, ` +
       `notifiers=${notifiers.length}, ` +
-      `default=${cfg.rules.default}, db=${cfg.dbPath}, ` +
+      `policy=app:${cfg.rules.default.app}/deps:${cfg.rules.default.dependencies}, db=${cfg.dbPath}, ` +
       `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}, ` +
       `advise=${cfg.llmUrl ? `on @ ${cfg.llmUrl} (${cfg.llmModel ?? "default-model"})` : "off"}`,
   );
