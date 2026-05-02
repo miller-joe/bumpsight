@@ -387,11 +387,10 @@ describe("runScanOnce", () => {
     const result = await runScanOnce(deps);
     expect(result.discovered).toBe(1);
     expect(result.held).toBe(1);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.subject).toContain("digest changed");
-    expect(sent[0]!.body).toContain("sha256:aaaaaaaaaaaa…");
-    expect(sent[0]!.body).toContain("sha256:bbbbbbbbbbbb…");
-    expect(sent[0]!.body).toContain("digest change");
+    // v0.4.1: digest-class bumps no longer fire per-event emails. The row
+    // is still recorded + marked notified, but the daily-digest path is
+    // the channel that surfaces them. Per-event ASK email was noise.
+    expect(sent).toHaveLength(0);
 
     // Stored digest advanced to the new value
     const { getStoredDigest } = await import("../src/state/db.js");
@@ -505,7 +504,9 @@ describe("runScanOnce", () => {
     expect(result.autoApplied).toBe(0);
     expect(result.held).toBe(1);
     expect(calls).toHaveLength(0);
-    expect(sent[0]!.subject).toContain("digest changed");
+    // v0.4.1: digest-class bumps no longer fire per-event email; row is
+    // recorded + held for the daily digest.
+    expect(sent).toHaveLength(0);
     rmSync(file, { force: true });
   });
 

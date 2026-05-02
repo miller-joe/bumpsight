@@ -2,6 +2,26 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.4.1 — 2026-05-02
+
+Triggered by 7 days of operating-in-anger feedback. Closes the silent-failure loop, kills digest-bump email noise, captures what we send.
+
+### Added
+
+- **Apply-completion notifications.** When an operator clicks Approve in a held-bump email, the apply step runs in the background. Pre-v0.4.1 there was no follow-up email — a failed apply (e.g. tag-drift safety check) died silently and the operator was left assuming success from the browser confirmation page. v0.4.1 dispatches a per-event email after every approve+apply attempt, success or failure, with the apply log inline.
+- **Email outbox archive.** Every dispatched email is also written to `BUMPSIGHT_OUTBOX_DIR` (default `/var/lib/bumpsight/outbox`) as a JSON file (`<ISO-timestamp>-<kind>-<row-id>.json`) containing subject + body + html + advise summary + delivery result. Bounded retention via `BUMPSIGHT_OUTBOX_KEEP` (default 200 most recent). Lets operators (and Claude) audit what actually went out without re-rendering or re-calling the LLM.
+- **`advise_text` column on `updates`.** When a held-bump email dispatches with an LLM advise summary, the rendered text is now persisted to the row. Useful for debugging "why was the AI advice unhelpful in this email" — read straight off the row instead of hoping the LLM gives the same stochastic answer twice.
+
+### Changed
+
+- **Digest-class bumps no longer fire per-event emails.** Rolling-tag refs (`:latest`, `:nightly`, etc.) cycle constantly and have no semver delta to summarise — per-event ASK emails were noise. The bump is still recorded + marked notified so `/queue` shows it, but no email goes out for the individual event. Daily-digest aggregation (v0.4.2) will surface these as a roll-up.
+- **Apply-completion email wording adapts** to whether the bump was auto-applied or human-approved+applied. Subject line stays the same; body banner reads `Auto-applied` vs `Approved & applied` so the email is unambiguous in either flow.
+
+### Notes
+
+- DB schema migration is additive (`advise_text` column). Safe to roll back to v0.4.0 — the column just sits unused.
+- The cosmetic startup-log fix (`default=[object Object]` → readable `policy=app:.../deps:...`) was committed to main right after v0.4.0 shipped (`13bcc0b`); ships properly in v0.4.1.
+
 ## 0.4.0 — 2026-04-28
 
 Policy split: app and dependencies are now independent axes. Backward-compatible loader.

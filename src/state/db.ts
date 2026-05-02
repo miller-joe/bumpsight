@@ -28,6 +28,7 @@ export interface UpdateRow {
   applied_at: number | null;
   apply_log: string | null;
   digested_at: number | null;
+  advise_text: string | null;
 }
 
 const SCHEMA = `
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS updates (
   applied_at      INTEGER,
   apply_log       TEXT,
   digested_at     INTEGER,
+  advise_text     TEXT,
   UNIQUE (stack, service, current_tag, target_tag)
 );
 CREATE INDEX IF NOT EXISTS idx_updates_status ON updates(status);
@@ -110,6 +112,19 @@ function migrate(db: DB): void {
     .get() as { sql: string } | undefined;
   if (u && !/\bdigested_at\b/.test(u.sql)) {
     db.exec("ALTER TABLE updates ADD COLUMN digested_at INTEGER");
+  }
+
+  // v0.4.1: persist the LLM advise body so we can audit what was actually
+  // shown to the operator. Useful for debugging "why is the AI advice
+  // unhelpful in this email" — read straight off the row instead of
+  // re-rendering and hoping the model gives the same output twice.
+  const u2 = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u2 && !/\badvise_text\b/.test(u2.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN advise_text TEXT");
   }
 }
 
@@ -294,6 +309,16 @@ export function setApplied(db: DB, id: number, r: ApplyResult): void {
   db.prepare(
     `UPDATE updates SET status = ?, applied_at = ?, apply_log = ? WHERE id = ?`,
   ).run(r.ok ? "applied" : "failed", Date.now(), r.log ?? null, id);
+}
+
+/**
+ * Persist the LLM-rendered advise body for a row (v0.4.1). Captured at the
+ * time the bump notification is dispatched so a later debug session can
+ * read what the operator actually saw, without having to re-call the LLM
+ * (and risk a different stochastic answer).
+ */
+export function setAdviseText(db: DB, id: number, text: string): void {
+  db.prepare(`UPDATE updates SET advise_text = ? WHERE id = ?`).run(text, id);
 }
 
 /**

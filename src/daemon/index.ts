@@ -21,10 +21,12 @@ import {
   type UpdateRow,
 } from "../state/db.js";
 import { notifyAll } from "../notify/index.js";
+import { archiveMessage } from "../notify/outbox.js";
 import type { Notifier, NotifyMessage, NotifyLink } from "../notify/types.js";
 import { applyOne } from "../apply/index.js";
 import type { CommandRunner } from "../apply/docker.js";
 import { getAdviseSummary, type AdviseSummary } from "../commands/advise.js";
+import { setAdviseText } from "../state/db.js";
 
 export interface ScanRunResult {
   /** Number of services examined across all compose files. */
@@ -59,6 +61,13 @@ export interface ScanRunDeps {
   githubToken?: string;
   /** Minimum gap in ms between dispatched notifications. Default 0 (no rate limit). */
   notifyIntervalMs?: number;
+  /** Optional outbox directory for archiving every dispatched email.
+   *  When set, each notifyAll call also writes a JSON record under
+   *  this dir so a human / Claude can audit what was actually sent.
+   *  Best-effort — write failures never abort delivery. */
+  outboxDir?: string;
+  /** Most recent N outbox files to keep. Defaults to 200. */
+  outboxKeepCount?: number;
   /** Test seam — defaults to the real registry client. */
   listTagsFn?: typeof listTags;
   /** Test seam — defaults to the real per-tag manifest digest fetcher. */
@@ -259,6 +268,9 @@ export async function runScanOnce(
                   deps.adviseFn,
                 )
               : null,
+            deps.outboxDir
+              ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
+              : undefined,
           );
         } else {
           result.held += 1;
@@ -309,25 +321,29 @@ export async function runScanOnce(
           row.id,
         );
         if (after.status === "applied") result.autoAppliedOk += 1;
+        const adviseForApplied = deps.llmUrl
+          ? await safeAdvise(
+              {
+                image: ref.raw,
+                from: ref.tag,
+                to: latest,
+                composeFile: composePath,
+                serviceName,
+                llmUrl: deps.llmUrl,
+                llmKey: deps.llmKey,
+                model: deps.llmModel,
+                githubToken: deps.githubToken,
+              },
+              deps.adviseFn,
+            )
+          : null;
         await dispatchAppliedNotification(
           deps.notifiers,
           after,
-          deps.llmUrl
-            ? await safeAdvise(
-                {
-                  image: ref.raw,
-                  from: ref.tag,
-                  to: latest,
-                  composeFile: composePath,
-                  serviceName,
-                  llmUrl: deps.llmUrl,
-                  llmKey: deps.llmKey,
-                  model: deps.llmModel,
-                  githubToken: deps.githubToken,
-                },
-                deps.adviseFn,
-              )
-            : null,
+          adviseForApplied,
+          deps.outboxDir
+            ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
+            : undefined,
         );
       } else {
         result.held += 1;
@@ -359,6 +375,19 @@ export async function runScanOnce(
     group: { row: UpdateRow; composePath: string; serviceName: string }[],
   ) => {
     const canonical = group[0]!;
+
+    // v0.4.1: digest-class bumps are noise on a per-event email channel —
+    // rolling tags (`:latest`, `:nightly`) cycle constantly without any
+    // semver delta to summarise. We still record + mark notified so /queue
+    // shows them and the daily digest (v0.4.2+) can roll them up; we just
+    // don't dispatch an immediate email asking the operator to act.
+    if (canonical.row.bump === "digest") {
+      for (const entry of group) {
+        setNotified(deps.db, entry.row.id);
+      }
+      return;
+    }
+
     const advise = deps.llmUrl
       ? await safeAdvise(
           {
@@ -386,6 +415,9 @@ export async function runScanOnce(
       group.map((g) => g.row),
       deps.publicUrl,
       advise,
+      deps.outboxDir
+        ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
+        : undefined,
     );
     lastDispatchAt = Date.now();
 
@@ -395,6 +427,11 @@ export async function runScanOnce(
     if (delivered) {
       for (const entry of group) {
         setNotified(deps.db, entry.row.id);
+        // v0.4.1: persist the LLM advise body so we can audit later what
+        // the operator actually saw without re-rolling the dice on the LLM.
+        if (advise?.ok && advise.summary) {
+          setAdviseText(deps.db, entry.row.id, advise.summary);
+        }
       }
     }
   };
@@ -417,6 +454,7 @@ async function dispatchBumpNotification(
   rows: UpdateRow[],
   publicUrl?: string,
   advise?: AdviseSummary | null,
+  outbox?: { dir: string; keepCount?: number },
 ): Promise<boolean> {
   if (rows.length === 0) return false;
   // No notifiers configured → treat as a successful no-op so the row's
@@ -513,14 +551,28 @@ async function dispatchBumpNotification(
     advise: advise ?? undefined,
   });
 
-  const result = await notifyAll(notifiers, {
+  const msg = {
     subject,
     body: text.join("\n"),
     htmlBody,
     // Links already rendered inline at the top of the body and as buttons in
     // the HTML — no need for the formatter to append a duplicate list.
     links: undefined,
-  });
+  };
+  const result = await notifyAll(notifiers, msg);
+  if (outbox) {
+    archiveMessage(
+      outbox,
+      msg,
+      {
+        kind: "hold",
+        rowIds: rows.map((r) => r.id),
+        adviseText: advise?.ok ? advise.summary : undefined,
+        delivered: result.delivered,
+        deliveryErrors: result.failed.length > 0 ? result.failed : undefined,
+      },
+    );
+  }
   return result.delivered > 0;
 }
 
@@ -721,20 +773,30 @@ async function resolveDigestToTag(
   return undefined;
 }
 
-async function dispatchAppliedNotification(
+export async function dispatchAppliedNotification(
   notifiers: Notifier[],
   row: UpdateRow,
   advise?: AdviseSummary | null,
+  outbox?: { dir: string; keepCount?: number },
 ): Promise<void> {
   if (notifiers.length === 0) return;
   const subject = `${row.stack}/${row.service}: ${row.image} → ${row.target_tag}`;
   const ok = row.status === "applied";
+  // v0.4.1: this function now serves both auto-apply (decided_by='auto')
+  // and human-approve (decided_by='http-link'). Phrase the message based
+  // on which flow ran so the email reads correctly in both contexts.
+  const isHumanApproved =
+    row.decided_by === "http-link" || row.decided_by === "manual-audit";
+  const verbApplied = isHumanApproved ? "Approved & applied" : "Auto-applied";
+  const verbApplyFailed = isHumanApproved
+    ? "Approved but apply failed"
+    : "Auto-apply failed";
 
   const text: string[] = [];
   text.push(
     ok
-      ? `Auto-applied per policy. The stack is now on ${row.target_tag}.`
-      : `Auto-apply failed. The stack is still on ${row.current_tag}; check the daemon log + apply_log below.`,
+      ? `${verbApplied} per policy. The stack is now on ${row.target_tag}.`
+      : `${verbApplyFailed}. The stack is still on ${row.current_tag}; check the daemon log + apply_log below.`,
   );
   text.push("");
   text.push(`Stack:   ${row.stack}`);
@@ -766,12 +828,26 @@ async function dispatchAppliedNotification(
 
   const htmlBody = buildAppliedHtml({ row, advise: advise ?? undefined });
 
-  await notifyAll(notifiers, {
+  const msg = {
     subject,
     body: text.join("\n"),
     htmlBody,
     links: undefined,
-  });
+  };
+  const result = await notifyAll(notifiers, msg);
+  if (outbox) {
+    archiveMessage(
+      outbox,
+      msg,
+      {
+        kind: ok ? "applied" : "apply-failure",
+        rowIds: [row.id],
+        adviseText: advise?.ok ? advise.summary : undefined,
+        delivered: result.delivered,
+        deliveryErrors: result.failed.length > 0 ? result.failed : undefined,
+      },
+    );
+  }
 }
 
 interface AppliedHtmlOpts {
@@ -783,16 +859,22 @@ function buildAppliedHtml(opts: AppliedHtmlOpts): string {
   const { row, advise } = opts;
   const e = escapeHtml;
   const ok = row.status === "applied";
+  const isHumanApproved =
+    row.decided_by === "http-link" || row.decided_by === "manual-audit";
+  const verbOk = isHumanApproved ? "Approved & applied" : "Auto-applied";
+  const verbFail = isHumanApproved
+    ? "Approved but apply failed"
+    : "Auto-apply failed";
 
   const banner = ok
     ? `<div style="background:#dcfce7;border:1px solid #86efac;border-radius:8px;padding:18px 20px;margin-bottom:24px;">
         <p style="margin:0;font-size:14px;line-height:1.5;color:#14532d;">
-          <strong>Auto-applied.</strong> The stack is now on <code style="background:#bbf7d0;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code>. No action needed from you.
+          <strong>${verbOk}.</strong> The stack is now on <code style="background:#bbf7d0;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code>. No action needed from you.
         </p>
       </div>`
     : `<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;padding:18px 20px;margin-bottom:24px;">
         <p style="margin:0;font-size:14px;line-height:1.5;color:#7f1d1d;">
-          <strong>Auto-apply failed.</strong> The stack is still on <code style="background:#fecaca;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code>. See apply log below.
+          <strong>${verbFail}.</strong> The stack is still on <code style="background:#fecaca;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code>. See apply log below.
         </p>
       </div>`;
 
@@ -871,6 +953,8 @@ export interface StartDaemonDeps {
   llmKey?: string;
   llmModel?: string;
   githubToken?: string;
+  outboxDir?: string;
+  outboxKeepCount?: number;
   log: (msg: string) => void;
   /** Test seams. */
   listTagsFn?: typeof listTags;
@@ -906,6 +990,8 @@ export function startDaemon(
           llmKey: deps.llmKey,
           llmModel: deps.llmModel,
           githubToken: deps.githubToken,
+          outboxDir: deps.outboxDir,
+          outboxKeepCount: deps.outboxKeepCount,
           notifyIntervalMs: cfg.notifyIntervalMs,
           listTagsFn: deps.listTagsFn,
           fetchManifestDigestFn: deps.fetchManifestDigestFn,

@@ -5,12 +5,16 @@ import type { Database as DB } from "better-sqlite3";
 import {
   findByToken,
   findSiblings,
+  findUpdate,
   listByStatus,
   setDecision,
   type UpdateRow,
 } from "../state/db.js";
 import { applyOne } from "../apply/index.js";
 import type { CommandRunner } from "../apply/docker.js";
+import type { Notifier } from "../notify/types.js";
+import { dispatchAppliedNotification } from "../daemon/index.js";
+import { getAdviseSummary } from "../commands/advise.js";
 
 export interface HttpServerDeps {
   db: DB;
@@ -23,6 +27,22 @@ export interface HttpServerDeps {
   /** Test seam for the apply step. */
   runner?: CommandRunner;
   log?: (msg: string) => void;
+  /** v0.4.1: notifiers used to send the apply-completion email after a click-Approve runs. */
+  notifiers?: Notifier[];
+  /** OpenAI-compat LLM URL for the post-apply advise call. Optional. */
+  llmUrl?: string;
+  /** Optional bearer token for the LLM endpoint. */
+  llmKey?: string;
+  /** Model name for the LLM call. */
+  llmModel?: string;
+  /** GitHub token for advise's release-notes fetch. */
+  githubToken?: string;
+  /** Test seam — override advise. Returns null to skip the LLM section. */
+  adviseFn?: typeof getAdviseSummary;
+  /** Optional outbox archive directory. */
+  outboxDir?: string;
+  /** Most recent N outbox files to keep. Defaults to 200. */
+  outboxKeepCount?: number;
 }
 
 export interface HttpServerHandle {
@@ -235,6 +255,43 @@ async function handleApprove(
           r.id,
         );
         log(`apply ${r.id} (${r.stack}/${r.service}): ${after.status}`);
+
+        // v0.4.1: close the silent-failure loop. After every apply attempt,
+        // dispatch an email so the operator knows the outcome — success or
+        // failure. Pre-v0.4.1 the apply ran in the background with no
+        // notification, so a failed apply (e.g. tag-drift safety check)
+        // would die quietly and the operator would assume success from the
+        // browser confirmation page.
+        if (deps.notifiers && deps.notifiers.length > 0) {
+          const fresh = findUpdate(deps.db, r.id);
+          if (fresh) {
+            const adviseFn = deps.adviseFn ?? getAdviseSummary;
+            const advise =
+              deps.llmUrl && (after.status === "applied" || after.status === "failed")
+                ? await adviseFn({
+                    image: fresh.image,
+                    from: fresh.current_tag,
+                    to: fresh.target_tag,
+                    composeFile: deps.composeFiles[fresh.stack],
+                    serviceName: fresh.service,
+                    llmUrl: deps.llmUrl,
+                    llmKey: deps.llmKey,
+                    model: deps.llmModel,
+                    githubToken: deps.githubToken,
+                  }).catch(() => null)
+                : null;
+            await dispatchAppliedNotification(
+              deps.notifiers,
+              fresh,
+              advise,
+              deps.outboxDir
+                ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
+                : undefined,
+            ).catch((err: Error) =>
+              log(`apply-notify ${r.id} crashed: ${err.message}`),
+            );
+          }
+        }
       } catch (err) {
         log(`apply ${r.id} crashed: ${(err as Error).message}`);
       }

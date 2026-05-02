@@ -33,6 +33,12 @@ export interface DaemonConfig {
   /** Optional GitHub token used by advise to fetch upstream release notes
    *  without hitting the unauthenticated-rate-limit. */
   githubToken?: string;
+  /** v0.4.1: directory to archive every dispatched email to. When set,
+   *  each notifyAll call writes a JSON record under this dir so a human
+   *  / Claude can audit what was actually sent. Best-effort. */
+  outboxDir?: string;
+  /** Most recent N outbox files to keep. Default 200. */
+  outboxKeepCount?: number;
 }
 
 /**
@@ -68,6 +74,8 @@ export interface FileConfigShape {
   http_host?: string;
   public_url?: string;
   ollama?: { host?: string; model?: string };
+  outbox_dir?: string;
+  outbox_keep_count?: number;
 }
 
 const VALID_ACTIONS: BumpAction[] = ["patch", "minor", "major", "notify", "none"];

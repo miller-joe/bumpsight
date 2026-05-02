@@ -99,6 +99,14 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
   const llmKey = process.env.BUMPSIGHT_LLM_KEY;
   const llmModel = fileShape.ollama?.model ?? process.env.BUMPSIGHT_MODEL;
 
+  const outboxDir =
+    process.env.BUMPSIGHT_OUTBOX_DIR ??
+    fileShape.outbox_dir ??
+    "/var/lib/bumpsight/outbox";
+  const outboxKeepCount = Number(
+    process.env.BUMPSIGHT_OUTBOX_KEEP ?? fileShape.outbox_keep_count ?? 200,
+  );
+
   const cfg: DaemonConfig = {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
@@ -113,6 +121,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     llmKey,
     llmModel,
     githubToken: process.env.GITHUB_TOKEN,
+    outboxDir,
+    outboxKeepCount,
   };
 
   const db = openDb({ path: cfg.dbPath });
@@ -148,6 +158,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       llmModel: cfg.llmModel,
       githubToken: cfg.githubToken,
       notifyIntervalMs: cfg.notifyIntervalMs,
+      outboxDir: cfg.outboxDir,
+      outboxKeepCount: cfg.outboxKeepCount,
     });
     log(
       `scan: ${result.scanned} services, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held)`,
@@ -165,6 +177,13 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     port: cfg.httpPort,
     host: cfg.httpHost,
     log,
+    notifiers,
+    llmUrl: cfg.llmUrl,
+    llmKey: cfg.llmKey,
+    llmModel: cfg.llmModel,
+    githubToken: cfg.githubToken,
+    outboxDir: cfg.outboxDir,
+    outboxKeepCount: cfg.outboxKeepCount,
   });
 
   const runtime = startDaemon(cfg, {
@@ -176,6 +195,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     llmKey: cfg.llmKey,
     llmModel: cfg.llmModel,
     githubToken: cfg.githubToken,
+    outboxDir: cfg.outboxDir,
+    outboxKeepCount: cfg.outboxKeepCount,
     log,
   });
 
