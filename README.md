@@ -36,7 +36,10 @@ services:
       - "9100:9100"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /mnt/docker/stacks:/stacks                  # mount your compose tree
+      # Aligned mount: container path == host path. Required so target
+      # stacks with relative bind mounts (./config, ./data, …) resolve
+      # correctly when bumpsight invokes `docker compose` against them.
+      - /mnt/docker/stacks:/mnt/docker/stacks       # mount your compose tree
       - bumpsight-state:/var/lib/bumpsight          # SQLite state lives here
       - ./bumpsight.yaml:/config/bumpsight.yaml:ro  # optional, see below
     environment:
@@ -53,7 +56,7 @@ volumes:
   bumpsight-state:
 ```
 
-That's the whole product. Mount your compose tree at `/stacks` and bumpsight auto-discovers every `<stack>/compose.{yaml,yml}` underneath. Point `BUMPSIGHT_PUBLIC_URL` at however you expose port 9100 (reverse proxy, Tailscale, LAN-only) — that's the base URL bumpsight uses for the approve/deny links it embeds in your emails.
+That's the whole product. Mount your compose tree at the same path inside the container as on the host (the *aligned-mount* convention since v0.4.2 — keeps relative bind mounts in target stacks resolvable when bumpsight runs `docker compose` against them) and bumpsight auto-discovers every `<stack>/compose.{yaml,yml}` underneath. Set `stacks_dir:` in `bumpsight.yaml` to the same path you mounted, or override via `BUMPSIGHT_STACKS_DIR`. Point `BUMPSIGHT_PUBLIC_URL` at however you expose port 9100 (reverse proxy, Tailscale, LAN-only) — that's the base URL bumpsight uses for the approve/deny links it embeds in your emails.
 
 To opt a specific stack OUT of scanning, set its policy to `none` in `bumpsight.yaml` (see below). To restrict to a specific allowlist instead of auto-discovery, pass paths after `daemon` or set `compose_files:` in the config.
 
@@ -127,6 +130,7 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 | `BUMPSIGHT_LLM_URL` | (none) | OpenAI-compatible LLM base URL ending in `/v1`. When unset, advise is skipped. |
 | `BUMPSIGHT_LLM_KEY` | (none) | Bearer token for the LLM endpoint. Required for LiteLLM, OpenAI, etc.; ignored by Ollama. |
 | `BUMPSIGHT_MODEL` | `llama3.2` | Model name. For Ollama: e.g. `qwen2.5:14b-instruct`. For LiteLLM: an alias like `smart`. |
+| `BUMPSIGHT_LLM_TIMEOUT_MS` | `180000` | Per-call LLM request timeout (ms). Default 180s since v0.4.2. Routers like LiteLLM walk fallback chains server-side and can exceed shorter timeouts; bump higher for slow local Ollama on CPU, lower for stricter SLAs. |
 | `OLLAMA_HOST` | (none) | Legacy Ollama base URL. Used as `<host>/v1` when `BUMPSIGHT_LLM_URL` is unset. |
 | `GITHUB_TOKEN` | (none) | Optional. Lifts the GitHub-anonymous rate limit when fetching upstream release notes. |
 
@@ -197,6 +201,11 @@ When a scan finds a new tag in the same family, bumpsight:
 4. **Hold path:** sends an HTML email with the action card at top — instruction + styled Approve / Deny buttons — followed by metadata and the LLM release-note summary.
     - `https://your-bump-url/approve/<token>` — when clicked, marks the row approved and runs the same apply path as above.
     - `https://your-bump-url/deny/<token>` — marks the row denied. bumpsight will not re-prompt for this exact bump.
+5. **Post-apply prune (v0.4.2+):** after a successful, non-moving-tag apply, bumpsight removes the *just-replaced* image tag if no other container references it. Reports `freed N MB` in the apply log + completion email. Always best-effort; a prune failure never marks the apply itself failed. Skipped for moving-tag bumps (`:latest` digest changes etc. — the rolling tag still resolves the old digest implicitly). This keeps disk usage from creeping up over time as bumpsight applies multiple version bumps in succession.
+
+### Rolling-tag (`:latest`, `:nightly`, …) semantics
+
+When the source compose entry uses a moving tag (`:latest`, `:stable`, `:edge`, `:nightly`, `:rolling`, etc.), bumpsight tracks updates by **digest** rather than tag string. The compose file is left untouched on apply — `docker compose pull` picks up the new digest and `up -d` recreates the container. v0.4.2 fixed a class of apply failures where digest-only bumps on rolling tags were trying (and failing) to rewrite a 12-char digest prefix into a compose entry that read `latest`.
 
 `unknown` bumps (cross-family changes, channel rolls like `latest` → `stable`) are always held, regardless of policy. There's nothing meaningful to "auto-patch" there.
 
@@ -289,14 +298,16 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $PWD:/stacks bum
 Shipped:
 
 - v0.1: `doctor` (lint), `scan` (registry tag freshness), `advise` (LLM-summarised breaking changes)
-- v0.2: `daemon` mode — interval scheduler, semver-aware auto-apply policy, SQLite state, SMTP / Apprise notifiers, HTTP approve/deny server, automatic compose-file rewrite + `docker compose pull && up -d`, GHCR image (linux/amd64 + linux/arm64), HTML emails with action card at top, OpenAI-compatible LLM client (LiteLLM / Ollama / OpenAI / etc.), curated upstream-repo table for Docker Official images, auto-discovery of compose files under `/stacks`
+- v0.2: `daemon` mode — interval scheduler, semver-aware auto-apply policy, SQLite state, SMTP / Apprise notifiers, HTTP approve/deny server, automatic compose-file rewrite + `docker compose pull && up -d`, GHCR image (linux/amd64 + linux/arm64), HTML emails with action card at top, OpenAI-compatible LLM client (LiteLLM / Ollama / OpenAI / etc.), curated upstream-repo table for Docker Official images
+- v0.3: `:latest`-digest tracking with semver-pair resolution (Phase 1+2), `/queue` HTTP route, `report` policy, LSIO tag format support, dependency-image-aware advise prompts, GHCR per-tag manifest support, LLM opinion-fallback when no upstream notes, multi-arch buildx via GHCR cache
+- v0.4: split policy (`app` vs `dependencies` axes), apply-completion notifications + outbox archive + `advise_text` persistence (v0.4.1), advise reliability (180s default timeout, configurable `BUMPSIGHT_LLM_TIMEOUT_MS`, retry-on-AbortError), aligned-mount convention, rolling-tag apply path fix, post-apply targeted image prune (v0.4.2)
 
-Planned:
+Planned (v0.4.3+):
 
-- Track digest changes on `:latest`-pinned images and apply the same semver policy when the resolved version is detectable
-- "Report-only" policy level — scan + notify, never apply (different from `none` which suppresses both)
-- Auto-applied notifications get the same HTML treatment + LLM summary as held notifications
-- Weekly digest report (applied / pending / failed) via the same notifier list
+- Daily-digest email — once-per-day report, configurable hour, aggregates auto-applied + approved + failed + denied + still-held digest-class bumps
+- Digest-bump enrichment via OCI labels — resolve `org.opencontainers.image.revision` to upstream git SHA, diff commits between previous + new SHAs, feed to LLM for a real "what changed in this digest move" summary
+- Paired dep-recommendation lookup — when bumping a parent app, surface the recommended dep versions from the parent's official upstream compose
+- Scheduled deep-prune (`BUMPSIGHT_PRUNE_SCHEDULE`) — opt-in, periodic `image prune --filter until=N` + `volume prune` + `builder prune`
 - Rule ignore-file for `doctor`
 - Podman and `nerdctl` socket support
 - `quay.io` registry
