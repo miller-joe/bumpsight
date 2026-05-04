@@ -62,3 +62,33 @@ jobs:
           # consistently hung on multi-arch cache export during v0.2.1 builds).
           cache-from: type=registry,ref=ghcr.io/miller-joe/bumpsight:buildcache
           cache-to: type=registry,ref=ghcr.io/miller-joe/bumpsight:buildcache,mode=max
+
+  publish-release:
+    # Create the GitHub Release page with the CHANGELOG section for this
+    # tag as the body. Runs after npm + GHCR succeed so a failed publish
+    # doesn't leave a stub release pointing at nothing. Pre-v0.4.3 this
+    # was a manual step.
+    runs-on: ubuntu-latest
+    needs: [publish-npm, publish-image]
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract CHANGELOG section for this tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ ("^## "v"( |$)") { flag=1; next }
+            flag && /^## / { exit }
+            flag { print }
+          ' CHANGELOG.md > release-body.md
+          if [ ! -s release-body.md ]; then
+            echo "(No CHANGELOG entry for $version — see CHANGELOG.md.)" > release-body.md
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-body.md
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
