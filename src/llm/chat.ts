@@ -21,6 +21,11 @@ export interface ChatOptions {
   model?: string;
   /** Per-call timeout in milliseconds. */
   timeoutMs?: number;
+  /** v0.4.2: when true, AbortError (timeout) triggers one automatic retry.
+   *  Useful for routers like LiteLLM that walk fallback chains server-side
+   *  and occasionally exceed the client timeout — a second attempt usually
+   *  hits a faster provider in the chain. Default false. */
+  retryOnAbort?: boolean;
 }
 
 export interface ChatMessage {
@@ -47,9 +52,40 @@ function resolveBaseUrl(explicit?: string): string {
 
 const DEFAULT_MODEL = process.env.BUMPSIGHT_MODEL ?? "llama3.2";
 
+function defaultTimeoutMs(): number {
+  // 180s default since v0.4.2. Router gateways (LiteLLM) walk fallback
+  // chains server-side when a primary provider rate-limits — cumulative
+  // latency can exceed 60s and the operator-facing observation is just
+  // a vanished request that aborted client-side. 180s gives the chain
+  // room to settle. Override via opts.timeoutMs or BUMPSIGHT_LLM_TIMEOUT_MS.
+  const fromEnv = Number(process.env.BUMPSIGHT_LLM_TIMEOUT_MS);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 180_000;
+}
+
 export async function chat(
   messages: ChatMessage[],
   opts: ChatOptions = {},
+): Promise<string> {
+  if (opts.retryOnAbort) {
+    try {
+      return await chatOnce(messages, opts);
+    } catch (err) {
+      if (isAbortError(err)) return await chatOnce(messages, opts);
+      throw err;
+    }
+  }
+  return chatOnce(messages, opts);
+}
+
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { name?: string; message?: string };
+  return e.name === "AbortError" || /aborted/i.test(e.message ?? "");
+}
+
+async function chatOnce(
+  messages: ChatMessage[],
+  opts: ChatOptions,
 ): Promise<string> {
   const baseUrl = resolveBaseUrl(opts.baseUrl);
   const apiKey = opts.apiKey ?? process.env.BUMPSIGHT_LLM_KEY;
@@ -57,11 +93,7 @@ export async function chat(
   const controller = new AbortController();
   const timeout = setTimeout(
     () => controller.abort(),
-    // 60s is generous for OpenAI-compat gateways. Cloud routers (LiteLLM,
-    // Cerebras, Groq) typically reply in 1–10s; local Ollama is slower
-    // but should still complete within a minute on modest hardware.
-    // Override via `timeoutMs` for the rare 14B-on-CPU case.
-    opts.timeoutMs ?? 60_000,
+    opts.timeoutMs ?? defaultTimeoutMs(),
   );
 
   const headers: Record<string, string> = {

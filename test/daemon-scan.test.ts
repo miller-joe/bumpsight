@@ -98,6 +98,7 @@ describe("runScanOnce", () => {
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner,
+      pruneAfterApply: false,
     });
 
     expect(result.autoApplied).toBe(1);

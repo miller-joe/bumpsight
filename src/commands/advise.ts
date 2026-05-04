@@ -109,6 +109,7 @@ export async function getAdviseSummary(
         apiKey: opts.llmKey,
         model: opts.model,
         timeoutMs: opts.timeoutMs,
+        retryOnAbort: true,
       });
       return {
         ok: true,
@@ -143,6 +144,7 @@ export async function getAdviseSummary(
       apiKey: opts.llmKey,
       model: opts.model,
       timeoutMs: opts.timeoutMs,
+      retryOnAbort: true,
     });
     return {
       ok: true,

@@ -2,6 +2,7 @@ import type { Database as DB } from "better-sqlite3";
 import { findUpdate, setApplied, type UpdateRow } from "../state/db.js";
 import { rewriteImageTag } from "./compose.js";
 import { pullAndUp, type CommandRunner } from "./docker.js";
+import { pruneOldImage, stripTagFromRef } from "./prune.js";
 
 export interface ApplyDeps {
   db: DB;
@@ -9,6 +10,8 @@ export interface ApplyDeps {
   composeFiles: Record<string, string>;
   /** Test seam — defaults to the real spawn-based runner. */
   runner?: CommandRunner;
+  /** v0.4.2: when false, skip the post-apply targeted prune. Default true. */
+  pruneAfterApply?: boolean;
 }
 
 /**
@@ -63,6 +66,30 @@ export async function applyOne(
     serviceName: row.service,
     runner: deps.runner,
   });
-  setApplied(deps.db, row.id, { ok: result.ok, log: result.log });
+
+  // v0.4.2: targeted prune of the just-replaced image tag. Only attempted on
+  // a successful apply where the bump rewrote a concrete tag (not a moving
+  // tag — those still resolve through `:latest` and need the deep-prune
+  // path). Always best-effort: a prune failure never marks the apply failed.
+  let log = result.log;
+  const shouldPrune =
+    result.ok &&
+    !isMovingApply &&
+    deps.pruneAfterApply !== false &&
+    row.current_tag !== row.target_tag;
+  if (shouldPrune) {
+    try {
+      const prune = await pruneOldImage({
+        runner: deps.runner,
+        image: stripTagFromRef(row.image),
+        oldTag: row.current_tag,
+      });
+      log += `\n==== ${prune.log} ====`;
+    } catch (err) {
+      log += `\n==== prune: skipped (${(err as Error).message}) ====`;
+    }
+  }
+
+  setApplied(deps.db, row.id, { ok: result.ok, log });
   return findUpdate(deps.db, updateId)!;
 }

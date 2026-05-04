@@ -224,10 +224,16 @@ describe("applyOne", () => {
       return { exitCode: 0, combinedOutput: "" };
     };
 
-    await applyOne({ db, composeFiles: { appstack: file }, runner: counting }, id);
-    await applyOne({ db, composeFiles: { appstack: file }, runner: counting }, id);
+    await applyOne(
+      { db, composeFiles: { appstack: file }, runner: counting, pruneAfterApply: false },
+      id,
+    );
+    await applyOne(
+      { db, composeFiles: { appstack: file }, runner: counting, pruneAfterApply: false },
+      id,
+    );
 
-    // First call: pull + up = 2. Second call: noop = 0.
+    // First call: pull + up = 2. Second call: noop = 0. (Prune disabled in this test.)
     expect(calls).toBe(2);
     rmSync(file, { force: true });
   });

@@ -74,6 +74,9 @@ export interface ScanRunDeps {
   fetchManifestDigestFn?: typeof fetchManifestDigest;
   /** Test seam — defaults to the real spawn-based docker runner. */
   runner?: CommandRunner;
+  /** v0.4.2: forwarded to applyOne. When false, skip the post-apply
+   *  targeted prune. Default true. Tests usually pass false. */
+  pruneAfterApply?: boolean;
   /** Test seam — override advise. Returns null to skip the LLM section. */
   adviseFn?: typeof getAdviseSummary;
   /** Test seam — sleep helper for the rate limiter. */
@@ -181,7 +184,16 @@ export async function runScanOnce(
         let bump: BumpKind = "digest";
         let currentTagForRow = prev.digest.replace(/^sha256:/, "").slice(0, 12);
         let targetTagForRow = newDigest.replace(/^sha256:/, "").slice(0, 12);
-        let familyForRow: string | undefined;
+        // v0.4.2: For digest-class bumps where the source compose tag is a
+        // recognized moving tag (`:latest`, `:nightly`, etc.), mark the row
+        // as moving even when semver resolution fails. This is what tells
+        // applyOne to skip the compose-rewrite step (the file still says
+        // `:latest`); without this, the apply path tries to rewrite a 12-char
+        // digest prefix into a compose entry that says `latest` and fails
+        // with "image tag drift: expected <sha>, found latest".
+        let familyForRow: string | undefined = isMovingTag(ref.tag)
+          ? `moving:${ref.tag}`
+          : undefined;
 
         // Phase 2 happy path: both sides resolve to a semver tag we can
         // classify. Use the resolved pair as the row's current/target so the
@@ -245,6 +257,7 @@ export async function runScanOnce(
               db: deps.db,
               composeFiles: deps.composeFiles,
               runner: deps.runner,
+              pruneAfterApply: deps.pruneAfterApply,
             },
             row.id,
           );
@@ -317,6 +330,7 @@ export async function runScanOnce(
             db: deps.db,
             composeFiles: deps.composeFiles,
             runner: deps.runner,
+            pruneAfterApply: deps.pruneAfterApply,
           },
           row.id,
         );

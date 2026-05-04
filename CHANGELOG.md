@@ -2,6 +2,31 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.4.2 — 2026-05-04
+
+Four bug-fix-flavored items surfaced from operating-in-anger over the past 48 hours. The originally-planned features (daily-digest email, OCI revision-label enrichment, paired dep-recommendation lookup) are deferred to v0.4.3 to keep this release tight.
+
+### Added
+
+- **Built-in post-apply image prune.** After a successful version bump, bumpsight now removes the just-replaced image tag if no other container references it. Reports `freed N MB` in the apply log (and so in the apply-completion email). Always best-effort: a prune failure never marks the apply itself failed. Skipped for moving-tag bumps (the rolling tag still resolves the old digest implicitly via `:latest`). Disable with `pruneAfterApply: false` in `ApplyDeps` when calling programmatically. *Why this matters:* on Joe's homelab, version churn from 7 days of bumpsight-driven upgrades silently grew docker storage from ~68 GB to 145 GB because old image versions accumulated. A manual `docker image prune -a` reclaimed 49 GB. Going forward each apply self-cleans.
+- **`BUMPSIGHT_LLM_TIMEOUT_MS` env var.** Configurable LLM request timeout (default 180s, was hard-coded 60s). Routers like LiteLLM walk fallback chains server-side when a primary provider rate-limits — cumulative latency can exceed 60s and the operator-facing observation is just a vanished request that aborted client-side. 180s gives the chain room to settle.
+- **Automatic single retry on `AbortError` for advise calls.** Wrapped via a new opt-in `retryOnAbort: true` flag on `chat()`. Caller-controlled (only the daemon's advise path uses it). Catches the case where the first call timed out client-side but a second attempt likely lands on a different/faster provider in the chain.
+
+### Changed
+
+- **Default LLM timeout 60s → 180s.** See `BUMPSIGHT_LLM_TIMEOUT_MS` above for rationale. Override via env var or `chat()` opts when needed.
+- **Digest-class bumps on rolling tags now correctly skip compose rewrite.** Previously, a digest bump on a `:latest`-tagged service that didn't have a resolvable semver pair would attempt to rewrite `latest` → `<12-char-digest-prefix>` in compose and fail with `image tag drift: expected <sha>, found latest`. v0.4.2 sets `family = "moving:<tag>"` whenever the source compose tag matches `isMovingTag()`, so the apply path correctly skips rewrite and just runs `pull` + `up -d`. *Why this matters:* row 69's qbittorrent-mercury gluetun digest update failed twice with this exact error before being bypassed manually. Now self-heals.
+
+### Recommended (operator action — homelab compose update)
+
+- **Use an aligned `/stacks` mount in the bumpsight compose.** Replace the previous suggestion of `-v /path/to/stacks:/stacks` with the aligned form `-v /path/to/stacks:/path/to/stacks`. The non-aligned form breaks `docker compose up` for any target stack that uses a `./`-relative bind mount (e.g. `./php-override.ini`) — when bumpsight invokes compose from inside its container, the docker daemon resolves the relative path inside bumpsight's container view, which doesn't exist on the host. Aligned mount means container path == host path and relative binds resolve correctly. *Why this matters:* invoice-ninja 5.13.20 → 5.13.21 apply hit `error while creating mount source path '/stacks/invoice-ninja/php-override.ini': mkdir /stacks: read-only file system`, leaving the app container down until manual recovery from a host-aligned shell. Set `stacks_dir` in `bumpsight.yaml` to the same path you mounted (or env `BUMPSIGHT_STACKS_DIR`).
+
+### Notes
+
+- DB schema is unchanged from v0.4.1. Safe to roll forward and back across the v0.4.x line.
+- The `pruneOldImage` helper (`src/apply/prune.ts`) is exported for future use by a scheduled deep-prune feature (v0.4.3).
+- Carved out of the original v0.4.2 plan to keep this release tight, in the same spirit as v0.4.1.
+
 ## 0.4.1 — 2026-05-02
 
 Triggered by 7 days of operating-in-anger feedback. Closes the silent-failure loop, kills digest-bump email noise, captures what we send.

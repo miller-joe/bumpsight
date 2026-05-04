@@ -74,6 +74,7 @@ describe("HTTP server", () => {
           composeFiles: { appstack: file },
           port: 0,
           runner,
+          pruneAfterApply: false,
         }),
       async (port) => {
         const res = await fetch(
@@ -122,6 +123,7 @@ describe("HTTP server", () => {
           composeFiles: { appstack: file },
           port: 0,
           runner,
+          pruneAfterApply: false,
         }),
       async (port) => {
         const res = await fetch(
@@ -226,6 +228,7 @@ describe("HTTP server", () => {
           composeFiles: { [stackA]: fileA, [stackB]: fileB },
           port: 0,
           runner,
+          pruneAfterApply: false,
         }),
       async (port) => {
         const res = await fetch(`http://127.0.0.1:${port}/approve/tok-canonical`);
@@ -274,6 +277,7 @@ describe("HTTP server", () => {
           composeFiles: { appstack: file },
           port: 0,
           runner,
+          pruneAfterApply: false,
         }),
       async (port) => {
         await fetch(`http://127.0.0.1:${port}/approve/tok-idem`);

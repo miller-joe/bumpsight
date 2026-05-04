@@ -26,6 +26,9 @@ export interface HttpServerDeps {
   host?: string;
   /** Test seam for the apply step. */
   runner?: CommandRunner;
+  /** v0.4.2: forwarded to applyOne. When false, skip the post-apply
+   *  targeted prune. Default true. Tests usually pass false. */
+  pruneAfterApply?: boolean;
   log?: (msg: string) => void;
   /** v0.4.1: notifiers used to send the apply-completion email after a click-Approve runs. */
   notifiers?: Notifier[];
@@ -251,7 +254,7 @@ async function handleApprove(
     for (const r of all) {
       try {
         const after = await applyOne(
-          { db: deps.db, composeFiles: deps.composeFiles, runner: deps.runner },
+          { db: deps.db, composeFiles: deps.composeFiles, runner: deps.runner, pruneAfterApply: deps.pruneAfterApply },
           r.id,
         );
         log(`apply ${r.id} (${r.stack}/${r.service}): ${after.status}`);
