@@ -2,6 +2,39 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.4.3 — 2026-05-06
+
+The deferred-twice daily-digest finally lands. OCI revision-label enrichment + paired dep-recommendation lookup remain queued for v0.4.4 — kept this release scoped to one feature on purpose (same spirit as v0.4.1 / v0.4.2).
+
+### Added
+
+- **Daily-digest email.** Once per day at a configurable hour (`BUMPSIGHT_DIGEST_HOUR`, default `18`, local TZ; set to a negative value to disable), bumpsight emits a single rollup email summarising the day's activity:
+    - Apply failures (auto OR approved)
+    - Auto-applied successes
+    - Approved & applied successes
+    - Suppressed digest-class bumps (rolling-tag refs that v0.4.1 silenced from per-event email)
+
+  HTML body uses `<details>`/`<summary>` per item — closed by default with stack/service + version delta + bump kind; expand to see the persisted LLM advice from when the row dispatched (or apply log on failures). Empty days are silent (no email sent). Plain-text fallback inlines the same data with no collapse for non-HTML clients.
+
+- **`BUMPSIGHT_DIGEST_HOUR` env var** + matching `digest_hour:` config-file key. 0–23 fires once per local day at the first wake-up at-or-after that hour. Negative number disables the scheduler entirely.
+
+- **`findUndigestedSuppressed(db, sinceMs)`**, **`getLastDigestSent(db)`** state helpers. The first surfaces digest-class notified rows (status=`notified`, bump=`digest`, no `digested_at`) for the daily roll-up; the second is `MAX(digested_at)` and powers the once-per-local-day fire decision.
+
+- **`startDigestScheduler(deps)`** + standalone **`runDigestOnce(deps)`** in `src/daemon/digest.ts`. The scheduler wakes every 60s, asks `shouldFireDigest(now, lastSent, hour)`, and dispatches when the answer is yes. `runOnce()` is exposed on the runtime for tests / manual triggers.
+
+- **Digest emails are archived to the outbox** alongside per-event mail, with `kind: "digest"` and the row ids that were rolled up. Same retention rules as the v0.4.1 outbox.
+
+### Changed
+
+- **Daemon startup log** now prints the digest schedule alongside everything else (`digest=18:00 local` / `digest=off`).
+- **DB schema unchanged** from v0.4.2. The `digested_at` column has been there since v0.4.0; v0.4.3 is the release that finally writes to it.
+
+### Notes
+
+- A digest send only marks rows digested when at least one notifier delivers (or there are no notifiers configured). A notifier-failure run leaves rows un-digested for the next tick, mirroring v0.2.1's `setNotified` rule. Stops a transient SMTP throttle from silently burying a day's worth of activity.
+- The `runDigestOnce` window defaults to 25 hours (small overlap so border-of-window rows always show up exactly once). Override via `windowMs` if you call it programmatically.
+- LLM advice text in the digest is the persisted `advise_text` from the row's original notification — no fresh LLM calls. Means the digest is fast and shows you what was actually emailed when, not a re-roll of stochastic summaries.
+
 ## 0.4.2 — 2026-05-04
 
 Four bug-fix-flavored items surfaced from operating-in-anger over the past 48 hours. The originally-planned features (daily-digest email, OCI revision-label enrichment, paired dep-recommendation lookup) are deferred to v0.4.3 to keep this release tight.

@@ -1,6 +1,7 @@
 import { resolve, join } from "node:path";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { startDaemon, runScanOnce, buildComposeFileMap } from "../daemon/index.js";
+import { startDigestScheduler } from "../daemon/digest.js";
 import {
   buildRulesConfig,
   loadConfigFile,
@@ -107,6 +108,17 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     process.env.BUMPSIGHT_OUTBOX_KEEP ?? fileShape.outbox_keep_count ?? 200,
   );
 
+  // v0.4.3: digest hour (0-23, local TZ). Negative number disables.
+  const digestHourRaw =
+    process.env.BUMPSIGHT_DIGEST_HOUR ?? fileShape.digest_hour ?? 18;
+  const digestHour = Number(digestHourRaw);
+  if (Number.isNaN(digestHour)) {
+    process.stderr.write(
+      `bumpsight daemon: invalid digest hour "${digestHourRaw}" (expected 0-23, or <0 to disable)\n`,
+    );
+    return 2;
+  }
+
   const cfg: DaemonConfig = {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
@@ -123,6 +135,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     githubToken: process.env.GITHUB_TOKEN,
     outboxDir,
     outboxKeepCount,
+    digestHour,
   };
 
   const db = openDb({ path: cfg.dbPath });
@@ -143,7 +156,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       `notifiers=${notifiers.length}, ` +
       `policy=app:${cfg.rules.default.app}/deps:${cfg.rules.default.dependencies}, db=${cfg.dbPath}, ` +
       `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}, ` +
-      `advise=${cfg.llmUrl ? `on @ ${cfg.llmUrl} (${cfg.llmModel ?? "default-model"})` : "off"}`,
+      `advise=${cfg.llmUrl ? `on @ ${cfg.llmUrl} (${cfg.llmModel ?? "default-model"})` : "off"}, ` +
+      `digest=${cfg.digestHour < 0 ? "off" : `${String(cfg.digestHour).padStart(2, "0")}:00 local`}`,
   );
 
   if (opts.once) {
@@ -200,9 +214,23 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     log,
   });
 
+  const digestRuntime =
+    cfg.digestHour >= 0
+      ? startDigestScheduler({
+          db,
+          notifiers,
+          hour: cfg.digestHour,
+          publicUrl: cfg.publicUrl,
+          outboxDir: cfg.outboxDir,
+          outboxKeepCount: cfg.outboxKeepCount,
+          log,
+        })
+      : null;
+
   const shutdown = async (signal: string) => {
     log(`received ${signal}, draining…`);
     await runtime.stop();
+    if (digestRuntime) await digestRuntime.stop();
     await httpHandle.stop();
     db.close();
     process.exit(0);

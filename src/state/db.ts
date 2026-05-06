@@ -344,6 +344,42 @@ export function findUndigestedApplied(
     .all(cutoff) as UpdateRow[];
 }
 
+/**
+ * v0.4.3 daily-digest support: returns digest-class bumps that were marked
+ * notified within the window but never produced a per-event email (v0.4.1
+ * suppressed those — see daemon/index.ts dispatchGroup). They show up in the
+ * daily-digest rollup so the operator still sees them.
+ */
+export function findUndigestedSuppressed(
+  db: DB,
+  sinceMs: number,
+): UpdateRow[] {
+  const cutoff = Date.now() - sinceMs;
+  return db
+    .prepare(
+      `SELECT * FROM updates
+       WHERE bump = 'digest'
+         AND status = 'notified'
+         AND notified_at IS NOT NULL
+         AND notified_at >= ?
+         AND digested_at IS NULL
+       ORDER BY notified_at ASC`,
+    )
+    .all(cutoff) as UpdateRow[];
+}
+
+/**
+ * v0.4.3: timestamp of the most recent digest send (any row). Used by the
+ * scheduler to decide whether today's digest has already fired. Null when
+ * no digest has ever shipped on this DB.
+ */
+export function getLastDigestSent(db: DB): number | null {
+  const row = db
+    .prepare(`SELECT MAX(digested_at) AS t FROM updates`)
+    .get() as { t: number | null } | undefined;
+  return row?.t ?? null;
+}
+
 export function markDigested(db: DB, ids: number[]): void {
   if (ids.length === 0) return;
   const stmt = db.prepare(`UPDATE updates SET digested_at = ? WHERE id = ?`);

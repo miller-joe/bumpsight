@@ -39,6 +39,9 @@ export interface DaemonConfig {
   outboxDir?: string;
   /** Most recent N outbox files to keep. Default 200. */
   outboxKeepCount?: number;
+  /** v0.4.3: hour-of-day (0-23, local TZ) the daily-digest email fires.
+   *  Default 18. Set to a negative number to disable. */
+  digestHour: number;
 }
 
 /**
@@ -76,6 +79,7 @@ export interface FileConfigShape {
   ollama?: { host?: string; model?: string };
   outbox_dir?: string;
   outbox_keep_count?: number;
+  digest_hour?: number;
 }
 
 const VALID_ACTIONS: BumpAction[] = ["patch", "minor", "major", "notify", "none"];

@@ -133,6 +133,9 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 | `BUMPSIGHT_LLM_TIMEOUT_MS` | `180000` | Per-call LLM request timeout (ms). Default 180s since v0.4.2. Routers like LiteLLM walk fallback chains server-side and can exceed shorter timeouts; bump higher for slow local Ollama on CPU, lower for stricter SLAs. |
 | `OLLAMA_HOST` | (none) | Legacy Ollama base URL. Used as `<host>/v1` when `BUMPSIGHT_LLM_URL` is unset. |
 | `GITHUB_TOKEN` | (none) | Optional. Lifts the GitHub-anonymous rate limit when fetching upstream release notes. |
+| `BUMPSIGHT_DIGEST_HOUR` | `18` | Hour-of-day (0–23, local TZ) the daily-digest email fires. Set to a negative value (`-1`) to disable. Empty days produce no email. |
+| `BUMPSIGHT_OUTBOX_DIR` | `/var/lib/bumpsight/outbox` | Where every dispatched notification is archived as JSON (per-event + daily-digest). |
+| `BUMPSIGHT_OUTBOX_KEEP` | `200` | Most recent N outbox files retained; older ones unlinked on every write. |
 
 ### `/config/bumpsight.yaml`
 
@@ -300,11 +303,10 @@ Shipped:
 - v0.1: `doctor` (lint), `scan` (registry tag freshness), `advise` (LLM-summarised breaking changes)
 - v0.2: `daemon` mode — interval scheduler, semver-aware auto-apply policy, SQLite state, SMTP / Apprise notifiers, HTTP approve/deny server, automatic compose-file rewrite + `docker compose pull && up -d`, GHCR image (linux/amd64 + linux/arm64), HTML emails with action card at top, OpenAI-compatible LLM client (LiteLLM / Ollama / OpenAI / etc.), curated upstream-repo table for Docker Official images
 - v0.3: `:latest`-digest tracking with semver-pair resolution (Phase 1+2), `/queue` HTTP route, `report` policy, LSIO tag format support, dependency-image-aware advise prompts, GHCR per-tag manifest support, LLM opinion-fallback when no upstream notes, multi-arch buildx via GHCR cache
-- v0.4: split policy (`app` vs `dependencies` axes), apply-completion notifications + outbox archive + `advise_text` persistence (v0.4.1), advise reliability (180s default timeout, configurable `BUMPSIGHT_LLM_TIMEOUT_MS`, retry-on-AbortError), aligned-mount convention, rolling-tag apply path fix, post-apply targeted image prune (v0.4.2)
+- v0.4: split policy (`app` vs `dependencies` axes), apply-completion notifications + outbox archive + `advise_text` persistence (v0.4.1), advise reliability (180s default timeout, configurable `BUMPSIGHT_LLM_TIMEOUT_MS`, retry-on-AbortError), aligned-mount convention, rolling-tag apply path fix, post-apply targeted image prune (v0.4.2), daily-digest email rollup at configurable hour with `<details>`/`<summary>` per-row collapsibles (v0.4.3)
 
-Planned (v0.4.3+):
+Planned (v0.4.4+):
 
-- Daily-digest email — once-per-day report, configurable hour, aggregates auto-applied + approved + failed + denied + still-held digest-class bumps
 - Digest-bump enrichment via OCI labels — resolve `org.opencontainers.image.revision` to upstream git SHA, diff commits between previous + new SHAs, feed to LLM for a real "what changed in this digest move" summary
 - Paired dep-recommendation lookup — when bumping a parent app, surface the recommended dep versions from the parent's official upstream compose
 - Scheduled deep-prune (`BUMPSIGHT_PRUNE_SCHEDULE`) — opt-in, periodic `image prune --filter until=N` + `volume prune` + `builder prune`
