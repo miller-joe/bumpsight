@@ -2,6 +2,14 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.4.4 — 2026-05-06
+
+Image-only fix for v0.4.3. Same code, follow-up release pattern as v0.2.2.
+
+### Fixed
+
+- **Honor `$TZ` in the GHCR image.** The v0.4.3 daily-digest scheduler uses local wall-clock hour for its fire decision, but Alpine's bare image silently treats every `$TZ` as UTC because `tzdata` isn't bundled. v0.4.4 adds `tzdata` to the runtime layer so the configured TZ takes effect. Operators on UTC see no behavior change. Operators on a non-UTC TZ get their actual local 18:00 (or whatever they configured via `BUMPSIGHT_DIGEST_HOUR`) instead of UTC 18:00.
+
 ## 0.4.3 — 2026-05-06
 
 The deferred-twice daily-digest finally lands. OCI revision-label enrichment + paired dep-recommendation lookup remain queued for v0.4.4 — kept this release scoped to one feature on purpose (same spirit as v0.4.1 / v0.4.2).
