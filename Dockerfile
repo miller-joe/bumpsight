@@ -23,7 +23,10 @@ FROM node:20-alpine AS runtime
 # docker-cli + the compose v2 plugin so the daemon can shell out to
 # `docker compose` against the host's mounted /var/run/docker.sock.
 # tini gives us proper signal forwarding on SIGINT/SIGTERM.
-RUN apk add --no-cache docker-cli docker-cli-compose tini
+# tzdata so $TZ is honored — the v0.4.3 daily-digest scheduler uses local
+# wall-clock hour for its fire decision, and without tzdata Alpine treats
+# any TZ as UTC.
+RUN apk add --no-cache docker-cli docker-cli-compose tini tzdata
 
 ENV NODE_ENV=production
 WORKDIR /app
