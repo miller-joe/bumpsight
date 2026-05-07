@@ -136,7 +136,7 @@ function normalizeAxes(
   }
   if (value && typeof value === "object") {
     const app = parseAction(
-      (value as PolicyAxes).app ?? "major",
+      (value as PolicyAxes).app ?? "minor",
       `${where}.app`,
       log,
     );
@@ -172,14 +172,18 @@ export function buildRulesConfig(
   //   2. Legacy env var (BUMPSIGHT_AUTO_APPLY) — applies to the app axis only;
   //      deps stay on their own default ('none') unless explicitly overridden.
   //   3. File default (new {app,deps} object OR legacy single string)
-  //   4. Hard fallback: { app: "major", dependencies: "none" }
+  //   4. Hard fallback: { app: "minor", dependencies: "none" }
   //
-  // v0.5.0 changed the hard fallback from {notify, notify} to {major, none} —
-  // a Watchtower-like auto-everything for the primary service, and silent for
-  // dep images (Postgres / Redis / MariaDB / Vault / etc.) since those follow
-  // the parent app's release cadence. Operators who want the old "ask about
-  // every bump" behavior should set `default: notify` in their config.
-  let defaultAxes: PolicyAxes = { app: "major", dependencies: "none" };
+  // v0.5.x default: auto-apply patch + minor on the primary service, hold
+  // majors for human approval, and stay silent on dep images (Postgres /
+  // Redis / MariaDB / Vault / etc.) since those follow the parent app's
+  // release cadence. Pre-v0.5.0 was {notify, notify}; v0.5.0 briefly tried
+  // {major, none} (Watchtower-like, auto-everything-including-major) but
+  // that was too aggressive — semver explicitly flags majors as potentially
+  // breaking, so they should land in front of a human. v0.5.1 settled on
+  // {minor, none}. Operators who want the old "ask about every bump"
+  // behavior should set `default: { app: notify, dependencies: notify }`.
+  let defaultAxes: PolicyAxes = { app: "minor", dependencies: "none" };
   if (fileShape.default !== undefined) {
     defaultAxes = normalizeAxes(fileShape.default, "config.default", log);
   }

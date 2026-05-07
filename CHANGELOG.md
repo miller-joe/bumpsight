@@ -2,6 +2,15 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.1 — 2026-05-07
+
+Same-day correction to the v0.5.0 default. v0.5.0 set the hard fallback to `{ app: "major", dependencies: "none" }` — Watchtower-like, auto-everything-including-major. That was too aggressive: semver explicitly flags major bumps as potentially breaking, so they should land in front of a human review. v0.5.1 settles on `{ app: "minor", dependencies: "none" }` — auto-apply patches and minors (the bumps that come with a backwards-compat contract), hold majors for approval, stay silent on deps.
+
+### Changed
+
+- **Hard fallback policy: `{ app: "minor", dependencies: "none" }`** (was `{ app: "major", dependencies: "none" }` for the few hours v0.5.0 was the latest). Operators upgrading from v0.5.0 will see major-on-app bumps move from auto-applied back to held-for-approval. Operators upgrading from pre-v0.5.0 still see the same overall behavior shift v0.5.0 introduced (deps go silent by default; legacy single-axis configs map to `{ app: <value>, dependencies: "none" }`).
+- **Object-form fallback for missing `app:` field** also follows the new default — a config like `default: { dependencies: notify }` now resolves to `{ app: minor, dependencies: notify }` (was `major`).
+
 ## 0.5.0 — 2026-05-07
 
 Two related changes that change bumpsight's defaults toward the philosophy "deps follow the parent app's release cadence" — they're shipped together so the new policy and the new lookup feature reinforce each other.
