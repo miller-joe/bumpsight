@@ -137,10 +137,15 @@ export type BumpAction = "patch" | "minor" | "major" | "notify" | "none";
  * as dependency layers (Postgres, Redis, MariaDB, Vault, etc. — see
  * `isDependencyImage`).
  *
- * Typical conservative homelab default: `{ app: "minor", dependencies: "none" }`
- * — auto-apply patches + minors of the primary app, never touch deps without
- * being asked. Dependency major-upgrades against a parent app's pin risk
- * on-disk format breaks; bumpsight defers to the parent app's release cadence.
+ * v0.5.0 default: `{ app: "major", dependencies: "none" }` — Watchtower-like
+ * auto-apply of every classified bump on the primary service, silent on deps.
+ * Dep images follow the parent app's release cadence; bumpsight does not
+ * surface independent dep tag changes by default. Independent dep-major
+ * upgrades against a parent app's pin risk on-disk format breaks, so the
+ * canonical answer is "wait for the parent app to bump it."
+ *
+ * Conservative homelab posture: `{ app: "minor", dependencies: "none" }` —
+ * auto-apply patches + minors of the primary app, hold majors for approval.
  */
 export interface PolicyAxes {
   app: BumpAction;

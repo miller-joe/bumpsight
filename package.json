@@ -1,6 +1,6 @@
 {
   "name": "bumpsight",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "Docker image update advisor for self-hosters. Lints docker-compose files for anti-patterns, checks registries for newer tags in the same family, and uses a local LLM (Ollama) to summarize breaking changes from upstream release notes.",
   "license": "MIT",
   "author": "Joe Miller <joe@indivision.net> (https://github.com/miller-joe)",

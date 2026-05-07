@@ -49,9 +49,18 @@ export interface ImageRef {
 
 export function loadComposeFile(path: string): ComposeFile {
   const raw = readFileSync(path, "utf-8");
+  return parseComposeString(raw, path);
+}
+
+/**
+ * Parse compose YAML text without touching the filesystem. Used by the
+ * v0.5.0 paired-dep-recommendation lookup to inspect upstream compose files
+ * fetched over HTTP.
+ */
+export function parseComposeString(raw: string, where = "<string>"): ComposeFile {
   const parsed = parseYaml(raw) as unknown;
   if (!parsed || typeof parsed !== "object") {
-    throw new Error(`${path}: not a valid compose file`);
+    throw new Error(`${where}: not a valid compose file`);
   }
   return parsed as ComposeFile;
 }

@@ -8,6 +8,11 @@ import {
 } from "../releases/github.js";
 import { chat, type ChatMessage } from "../llm/chat.js";
 import { classifyBump, isDependencyImage } from "../daemon/rules.js";
+import {
+  findPairedDepBumps,
+  formatPairedDepReport,
+  type DepRecommendation,
+} from "../advise/paired-deps.js";
 
 export interface AdviseOptions {
   image: string;
@@ -41,6 +46,11 @@ export interface AdviseSummary {
   source?: "release-notes" | "general-knowledge";
   /** Short reason on failure — for the daemon log, not for users. */
   error?: string;
+  /** v0.5.0: paired-dep recommendations surfaced for app-major bumps.
+   *  When present, the corresponding text is also appended to `summary`. */
+  pairedDeps?: DepRecommendation[];
+  /** v0.5.0: source URL the upstream compose was fetched from. */
+  pairedDepsSource?: string;
 }
 
 /**
@@ -111,12 +121,22 @@ export async function getAdviseSummary(
         timeoutMs: opts.timeoutMs,
         retryOnAbort: true,
       });
+      const paired = await maybeLookupPairedDeps({
+        coords,
+        bumpKind,
+        isDepImage,
+        composeFile: opts.composeFile,
+        version: opts.to,
+        token: opts.githubToken ?? process.env.GITHUB_TOKEN,
+      });
       return {
         ok: true,
-        summary: summary.trim(),
+        summary: appendPairedReport(summary.trim(), paired),
         repo: coords ? `${coords.owner}/${coords.repo}` : undefined,
         releaseCount: 0,
         source: "general-knowledge",
+        pairedDeps: paired?.recommendations,
+        pairedDepsSource: paired?.sourceUrl,
       };
     } catch (err) {
       return {
@@ -146,12 +166,22 @@ export async function getAdviseSummary(
       timeoutMs: opts.timeoutMs,
       retryOnAbort: true,
     });
+    const paired = await maybeLookupPairedDeps({
+      coords,
+      bumpKind,
+      isDepImage,
+      composeFile: opts.composeFile,
+      version: opts.to,
+      token: opts.githubToken ?? process.env.GITHUB_TOKEN,
+    });
     return {
       ok: true,
-      summary: summary.trim(),
+      summary: appendPairedReport(summary.trim(), paired),
       repo: `${coords!.owner}/${coords!.repo}`,
       releaseCount: allBetween.length,
       source: "release-notes",
+      pairedDeps: paired?.recommendations,
+      pairedDepsSource: paired?.sourceUrl,
     };
   } catch (err) {
     return {
@@ -161,6 +191,51 @@ export async function getAdviseSummary(
       error: `llm: ${(err as Error).message}`,
     };
   }
+}
+
+interface PairedDepLookupArgs {
+  coords: Awaited<ReturnType<typeof resolveUpstreamRepo>>;
+  bumpKind: ReturnType<typeof classifyBump>;
+  isDepImage: boolean;
+  composeFile?: string;
+  version: string;
+  token?: string;
+}
+
+async function maybeLookupPairedDeps(
+  args: PairedDepLookupArgs,
+): Promise<Awaited<ReturnType<typeof findPairedDepBumps>> | null> {
+  // Only run on app-major bumps where we have both an upstream coords and a
+  // local compose file to diff against. This is intentionally narrow:
+  // dep-images themselves don't get a paired-dep lookup (they ARE the dep),
+  // and minor/patch bumps rarely move dep pins, so the network cost isn't
+  // worth it on every advise call.
+  if (args.bumpKind !== "major") return null;
+  if (args.isDepImage) return null;
+  if (!args.coords) return null;
+  if (!args.composeFile) return null;
+  try {
+    const result = await findPairedDepBumps(
+      args.coords,
+      args.version,
+      args.composeFile,
+      { token: args.token },
+    );
+    if (result.recommendations.length === 0) return null;
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+function appendPairedReport(
+  summary: string,
+  paired: Awaited<ReturnType<typeof findPairedDepBumps>> | null,
+): string {
+  if (!paired) return summary;
+  const report = formatPairedDepReport(paired);
+  if (!report) return summary;
+  return `${summary}\n${report}`;
 }
 
 export async function runAdvise(

@@ -2,6 +2,36 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.0 — 2026-05-07
+
+Two related changes that change bumpsight's defaults toward the philosophy "deps follow the parent app's release cadence" — they're shipped together so the new policy and the new lookup feature reinforce each other.
+
+### Changed (BREAKING DEFAULT)
+
+- **New default policy: `{ app: "major", dependencies: "none" }`** (Watchtower-like for the primary service, silent for dep images). Pre-v0.5.0 the hard fallback was `{ app: "notify", dependencies: "notify" }`. The new shape codifies what the v0.4.0 LLM advice was already telling operators: dependency images (Postgres / Redis / MariaDB / Vault / etc.) shouldn't have an independent upgrade lane in bumpsight — they follow the parent app's release cadence, and bumping them ahead of the parent risks on-disk format breaks, schema mismatch, or silent corruption. To keep the old "ask about every bump" behavior, set `default: notify` (legacy single-axis form) or `default: { app: notify, dependencies: notify }` in your config.
+- **Legacy single-axis configs** (e.g. `default: minor`) now map to `{ app: <value>, dependencies: "none" }` instead of `{ app: <value>, dependencies: "notify" }`. Same philosophy: silence deps unless explicitly opted in.
+- **`BUMPSIGHT_AUTO_APPLY` env** now applies to the app axis only. Pre-v0.5.0 it set both axes; that contradicts the new "deps follow parent" stance. Operators who actually want both axes driven by env should use `BUMPSIGHT_AUTO_UPDATE_APP` and `BUMPSIGHT_AUTO_UPDATE_DEPENDENCIES`.
+
+### Added
+
+- **Paired dep-recommendation lookup.** When advising on a held app-major bump, bumpsight now fetches the upstream parent app's compose file at the new version's git tag, finds dep services in it, and diffs their pins against the local stack. Differences are surfaced in a "Paired dependency recommendations" block at the bottom of the advise body (and persisted in the structured `pairedDeps` field on `AdviseSummary`):
+    - `bump`: same image family, different tag (e.g. `postgres:16` → `postgres:17`)
+    - `image-change`: image swapped (e.g. `redis:7` → `valkey/valkey:8`)
+    - `add`: a dep service appears in the upstream compose that isn't in the local one
+    
+  Triggered only on app-major holds where (a) the bump is on a non-dep image, (b) `coords` resolved to a GitHub repo, and (c) a local `composeFile` was supplied. Best-effort: any failure (network, missing compose, parse error) yields an empty result; the LLM advice still ships unchanged.
+
+- **`src/registry/upstream-compose.ts`** — `fetchUpstreamCompose(coords, version)`. Tries common compose paths (`docker-compose.yml`, `compose.yaml`, `examples/docker-compose.yml`, etc.) at common ref formats (`v{version}`, `{version}`, `release-{version}`). Returns the first hit that mentions `services:` (sanity check against README placeholders).
+
+- **`src/advise/paired-deps.ts`** — `findPairedDepBumps(coords, version, localComposePath)`. Service-name match wins over image-family match (operators often rename `postgresql` → `db` but keep the role). `formatPairedDepReport(result)` renders the block appended to advise text.
+
+- **`parseComposeString(raw, where?)`** — exposed from `src/compose/parse.ts` so the paired-deps lookup can parse upstream compose YAML without touching the filesystem.
+
+### Notes
+
+- v0.4.0 already had `KNOWN_DEPENDENCY_IMAGES` (Postgres / MariaDB / Mongo / Redis / Valkey / Elastic / OpenSearch / RabbitMQ / Kafka / Vault / Consul / Qdrant / Weaviate / Chroma / Milvus / etc.). The list was previously load-bearing only for LLM-advise softening; v0.5.0 makes it load-bearing for both the policy gate (the `dependencies` axis applies when this returns true) and the paired-deps diff (only services matching this list are reported).
+- Apply-time bundling of paired dep changes is intentionally NOT in this release. The v0.5.0 flow is report-only: surface the recommendation, the operator updates the compose file themselves before clicking Approve. Atomic multi-image rewrite during apply is a v0.5.1+ candidate.
+
 ## 0.4.4 — 2026-05-06
 
 Image-only fix for v0.4.3. Same code, follow-up release pattern as v0.2.2.

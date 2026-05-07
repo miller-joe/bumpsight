@@ -56,8 +56,11 @@ export interface DaemonConfig {
  *   default: minor
  *   stacks: { vault: patch }
  *
- * Legacy single-axis values are mapped to `{ app: <value>, dependencies: notify }`
- * — preserves the v0.3.x behavior of holding dep bumps for human approval.
+ * Legacy single-axis values are mapped to `{ app: <value>, dependencies: none }`
+ * — v0.5.0 changed the philosophy here: dep images (Postgres / Redis / MariaDB
+ * / Vault / etc.) follow the parent app's release cadence; bumpsight does not
+ * surface independent dep tag changes by default. Set `dependencies` explicitly
+ * if you want them tracked.
  * `report` (legacy) becomes `notify` (it was an underused FYI variant).
  */
 export type LegacyOrNewAction = BumpAction | "report" | PolicyAxes;
@@ -118,8 +121,9 @@ function parseAction(
 /**
  * Normalize a single config-file value (old single-string OR new {app,deps}
  * object) into the new PolicyAxes shape. Legacy strings map to
- * `{ app: <value>, dependencies: "notify" }` — preserves v0.3.x's
- * "ask about deps" default.
+ * `{ app: <value>, dependencies: "none" }` — v0.5.0 silences deps by default.
+ * Set `dependencies` explicitly in the new {app, dependencies} format if you
+ * want bumpsight to surface independent dep tag changes.
  */
 function normalizeAxes(
   value: LegacyOrNewAction,
@@ -128,16 +132,16 @@ function normalizeAxes(
 ): PolicyAxes {
   if (typeof value === "string") {
     const a = parseAction(value, where, log);
-    return { app: a, dependencies: "notify" };
+    return { app: a, dependencies: "none" };
   }
   if (value && typeof value === "object") {
     const app = parseAction(
-      (value as PolicyAxes).app ?? "notify",
+      (value as PolicyAxes).app ?? "major",
       `${where}.app`,
       log,
     );
     const dependencies = parseAction(
-      (value as PolicyAxes).dependencies ?? "notify",
+      (value as PolicyAxes).dependencies ?? "none",
       `${where}.dependencies`,
       log,
     );
@@ -165,16 +169,27 @@ export function buildRulesConfig(
 
   // Default policy resolution (in priority order):
   //   1. New env vars (BUMPSIGHT_AUTO_UPDATE_APP / BUMPSIGHT_AUTO_UPDATE_DEPENDENCIES)
-  //   2. Legacy env var (BUMPSIGHT_AUTO_APPLY) — applies to BOTH axes
+  //   2. Legacy env var (BUMPSIGHT_AUTO_APPLY) — applies to the app axis only;
+  //      deps stay on their own default ('none') unless explicitly overridden.
   //   3. File default (new {app,deps} object OR legacy single string)
-  //   4. Hard fallback: { app: "notify", dependencies: "notify" }
-  let defaultAxes: PolicyAxes = { app: "notify", dependencies: "notify" };
+  //   4. Hard fallback: { app: "major", dependencies: "none" }
+  //
+  // v0.5.0 changed the hard fallback from {notify, notify} to {major, none} —
+  // a Watchtower-like auto-everything for the primary service, and silent for
+  // dep images (Postgres / Redis / MariaDB / Vault / etc.) since those follow
+  // the parent app's release cadence. Operators who want the old "ask about
+  // every bump" behavior should set `default: notify` in their config.
+  let defaultAxes: PolicyAxes = { app: "major", dependencies: "none" };
   if (fileShape.default !== undefined) {
     defaultAxes = normalizeAxes(fileShape.default, "config.default", log);
   }
   if (opts.envDefault) {
     const a = parseAction(opts.envDefault, "BUMPSIGHT_AUTO_APPLY", log);
-    defaultAxes = { app: a, dependencies: a };
+    // v0.5.0: legacy env applies to the app axis only. Pre-v0.5.0 it set
+    // both axes to the same value, but that contradicts the new "deps follow
+    // parent app" philosophy — operators who actually want the env to drive
+    // both should set BUMPSIGHT_AUTO_UPDATE_APP and BUMPSIGHT_AUTO_UPDATE_DEPENDENCIES.
+    defaultAxes = { app: a, dependencies: defaultAxes.dependencies };
   }
   if (opts.envApp) {
     defaultAxes.app = parseAction(opts.envApp, "BUMPSIGHT_AUTO_UPDATE_APP", log);

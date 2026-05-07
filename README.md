@@ -16,7 +16,7 @@ Watchtower was archived 2025-12-17. Diun and What's Up Docker tell you a tag mov
 ## What you get
 
 - **Daemon mode** — one container, one config block, runs forever. Polls every `interval`. Auto-discovers every `compose.yaml` under `/stacks`.
-- **Semver-aware policy.** `patch` auto-applies patches only. `minor` adds minors. `major` opens the floodgates. `notify` always asks. `none` ignores. Set globally and override per stack.
+- **Semver-aware policy on two axes.** Each stack has an `app` axis (the primary service) and a `dependencies` axis (Postgres / Redis / MariaDB / Vault / etc.). Each axis takes `patch` / `minor` / `major` / `notify` / `none`. Default since v0.5.0: `{ app: major, dependencies: none }` — Watchtower-like for the app, silent for deps (deps follow the parent app's release cadence, not their own). Set globally and override per stack.
 - **One-click approve / deny.** Emails contain real URLs that, when clicked, pull and recreate the affected service via the host's Docker socket — or mark it denied and never bother you about that bump again.
 - **LLM-assisted risk read** for held bumps via any OpenAI-compatible LLM endpoint — LiteLLM (cloud fan-out), Ollama (local), OpenAI, vLLM, anything else that speaks `/v1/chat/completions`.
 - **SMTP and Apprise** notifiers built in. Apprise inherits its 70+ channels (Discord, ntfy, Slack, Gotify, …) without bumpsight having to embed them.
@@ -45,7 +45,10 @@ services:
     environment:
       BUMPSIGHT_NOTIFY: "smtp://user:pass@mail.example.com:587/?to=admin@example.com&from=bumpsight@example.com"
       BUMPSIGHT_PUBLIC_URL: "https://bump.example.com"
-      BUMPSIGHT_AUTO_APPLY: "patch"
+      # Default since v0.5.0: auto-apply everything classified on the app axis,
+      # silent on deps. Override per-stack in bumpsight.yaml. To restore the
+      # pre-v0.5.0 "ask about everything" behavior, set this to "notify".
+      BUMPSIGHT_AUTO_UPDATE_APP: "minor"           # auto patch+minor; hold majors for approval
       BUMPSIGHT_INTERVAL: "6h"
       # Any OpenAI-compatible LLM endpoint. See "LLM endpoint" below.
       BUMPSIGHT_LLM_URL: "http://litellm:4000/v1"
@@ -120,7 +123,9 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 |---|---|---|
 | `BUMPSIGHT_NOTIFY` | (none) | Comma-separated list of notifier URIs. See "Notification channels" below. |
 | `BUMPSIGHT_PUBLIC_URL` | (none) | Public-facing base URL of the daemon. Approve/deny links are only included in notifications when this is set. |
-| `BUMPSIGHT_AUTO_APPLY` | `notify` | Default policy: `patch` / `minor` / `major` / `notify` / `none`. |
+| `BUMPSIGHT_AUTO_APPLY` | (unset) | Legacy single-axis default — applies to the **app** axis only since v0.5.0 (pre-v0.5.0 it set both axes). Use `BUMPSIGHT_AUTO_UPDATE_APP` / `BUMPSIGHT_AUTO_UPDATE_DEPENDENCIES` for fine-grained control. |
+| `BUMPSIGHT_AUTO_UPDATE_APP` | `major` | Default app-axis policy: `patch` / `minor` / `major` / `notify` / `none`. |
+| `BUMPSIGHT_AUTO_UPDATE_DEPENDENCIES` | `none` | Default deps-axis policy. v0.5.0+ silences dep images by default; deps follow the parent app's cadence. Set to `notify` if you want bumpsight to surface dep tag changes. |
 | `BUMPSIGHT_INTERVAL` | `6h` | Scan interval. `30s`, `10m`, `6h`, `1d`. |
 | `BUMPSIGHT_STACKS_DIR` | `/stacks` | Root directory for auto-discovery (one level deep). |
 | `BUMPSIGHT_CONFIG` | `/config/bumpsight.yaml` | Path to the YAML config file. |
@@ -142,13 +147,23 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 Optional. Useful for per-stack overrides and committing your apply policy to git.
 
 ```yaml
-default: notify          # patch | minor | major | notify | none
+# v0.5.0+ two-axis form. Default: { app: major, dependencies: none } — auto-
+# apply everything classified on the primary service, silent on deps.
+default:
+  app: minor             # auto patch+minor on the app, hold majors for approval
+  dependencies: none     # silent — deps follow the parent app's release cadence
 
 stacks:
-  stalwart:    none      # mail server: never auto-bump (do-not-scan list lives here)
-  authentik:   none      # only ever apply manually
-  glance:      minor     # let dashboards float minors too
-  postgres:    patch     # patches yes, minors hold
+  stalwart:  { app: none, dependencies: none }    # never auto-bump
+  authentik: { app: none, dependencies: none }    # only ever apply manually
+  glance:    { app: major }                       # let dashboards float everything
+  postgres:  { app: patch }                       # patches yes, minors hold
+
+# Legacy single-axis form is still accepted (mapped to `{ app: <value>,
+# dependencies: none }` since v0.5.0). To restore the pre-v0.5.0 "ask about
+# every bump" behavior on both axes, use:
+#
+#   default: { app: notify, dependencies: notify }
 
 interval: 6h
 notify:
@@ -304,11 +319,12 @@ Shipped:
 - v0.2: `daemon` mode — interval scheduler, semver-aware auto-apply policy, SQLite state, SMTP / Apprise notifiers, HTTP approve/deny server, automatic compose-file rewrite + `docker compose pull && up -d`, GHCR image (linux/amd64 + linux/arm64), HTML emails with action card at top, OpenAI-compatible LLM client (LiteLLM / Ollama / OpenAI / etc.), curated upstream-repo table for Docker Official images
 - v0.3: `:latest`-digest tracking with semver-pair resolution (Phase 1+2), `/queue` HTTP route, `report` policy, LSIO tag format support, dependency-image-aware advise prompts, GHCR per-tag manifest support, LLM opinion-fallback when no upstream notes, multi-arch buildx via GHCR cache
 - v0.4: split policy (`app` vs `dependencies` axes), apply-completion notifications + outbox archive + `advise_text` persistence (v0.4.1), advise reliability (180s default timeout, configurable `BUMPSIGHT_LLM_TIMEOUT_MS`, retry-on-AbortError), aligned-mount convention, rolling-tag apply path fix, post-apply targeted image prune (v0.4.2), daily-digest email rollup at configurable hour with `<details>`/`<summary>` per-row collapsibles (v0.4.3)
+- v0.5: **BREAKING DEFAULT** — new policy fallback `{ app: major, dependencies: none }` (Watchtower-like for the app, silent for deps; pre-v0.5.0 was `{ notify, notify }`). Paired dep-recommendation lookup — when advising on a held app-major bump, fetches the parent app's upstream compose at the new tag and surfaces dep-pin diffs in the advise email (`bump` / `image-change` / `add` recommendations).
 
-Planned (v0.4.4+):
+Planned (v0.5.1+):
 
 - Digest-bump enrichment via OCI labels — resolve `org.opencontainers.image.revision` to upstream git SHA, diff commits between previous + new SHAs, feed to LLM for a real "what changed in this digest move" summary
-- Paired dep-recommendation lookup — when bumping a parent app, surface the recommended dep versions from the parent's official upstream compose
+- Apply-time bundling of paired dep changes — let Approve on a major bundle the dep pin rewrites alongside the app rewrite, atomically
 - Scheduled deep-prune (`BUMPSIGHT_PRUNE_SCHEDULE`) — opt-in, periodic `image prune --filter until=N` + `volume prune` + `builder prune`
 - Rule ignore-file for `doctor`
 - Podman and `nerdctl` socket support
