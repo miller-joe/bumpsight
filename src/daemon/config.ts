@@ -42,6 +42,10 @@ export interface DaemonConfig {
   /** v0.4.3: hour-of-day (0-23, local TZ) the daily-digest email fires.
    *  Default 18. Set to a negative number to disable. */
   digestHour: number;
+  /** v0.5.2: scheduled deep-prune interval in ms. 0 disables. Off by default
+   *  per the "ships to other people's homelabs, defaults must work zero-config"
+   *  principle — operators opt in via BUMPSIGHT_PRUNE_SCHEDULE. */
+  pruneIntervalMs: number;
 }
 
 /**
@@ -83,6 +87,9 @@ export interface FileConfigShape {
   outbox_dir?: string;
   outbox_keep_count?: number;
   digest_hour?: number;
+  /** v0.5.2: schedule deep prune (image/volume/builder). Same duration syntax
+   *  as `interval`. Empty/missing disables. */
+  prune_schedule?: string;
 }
 
 const VALID_ACTIONS: BumpAction[] = ["patch", "minor", "major", "notify", "none"];

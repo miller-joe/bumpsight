@@ -2,6 +2,29 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.2 — 2026-05-08
+
+Opt-in scheduled deep prune. Complements the v0.4.2 post-apply targeted prune, which only removes the just-replaced image tag and never touches dangling layers from cancelled builds, orphaned anonymous volumes, or the buildx cache. Over months of homelab churn those accumulate (52.6 GB reclaimed manually after a few months on Joe's setup); this gives operators a no-config-required cron without standing up a separate prune cron.
+
+### Added
+
+- **`BUMPSIGHT_PRUNE_SCHEDULE` env / `prune_schedule:` config field.** When set to a duration like `7d`, the daemon runs three docker prune commands on that interval and logs total reclaimed bytes:
+  1. `docker image prune --filter until=168h -af` — dangling images plus tagged images older than a week with no container reference.
+  2. `docker volume prune -f` — anonymous volumes not in use.
+  3. `docker builder prune -af` — buildx cache.
+
+  Off by default per the "ships to other people's homelabs, defaults must work zero-config" principle. Per-step failures don't abort the next step; transient docker hiccups don't permanently stop the schedule. First run starts 30s after daemon startup so the startup log gets to flush first.
+
+- **`src/apply/deep-prune.ts`** — `runDeepPrune({ runner?, imageAgeFilter?, skipVolumes?, skipBuilder? })`. Returns `{ steps, totalReclaimedBytes, summary }`. Reusable from CLI / tests.
+- **`src/daemon/deep-prune.ts`** — `startDeepPruneScheduler({ intervalMs, log, runner?, ... })`. Returns `{ stop(), runOnce() }`, mirroring the existing digest-scheduler shape.
+- **`parseReclaimed(output)`** — handles both `Total reclaimed space: 1.23GB` (image/volume) and `Total: 1.23GB` (buildx) formats. Returns 0 on unrecognized output.
+
+### Notes
+
+- The startup banner now reports `prune=every <interval>` or `prune=off` alongside the existing scan/digest fields.
+- Volumes and the builder cache can be individually skipped via `skipVolumes` / `skipBuilder` on the function — exposed for future per-stack overrides; no env knob yet.
+- A "skip if pool free space > N%" guard was discussed in roadmap notes but deferred — `docker image prune` is essentially free when there's nothing to remove, so the guard's main benefit (saving CPU on idle hosts) wasn't worth the cross-platform complexity for this release.
+
 ## 0.5.1 — 2026-05-07
 
 Same-day correction to the v0.5.0 default. v0.5.0 set the hard fallback to `{ app: "major", dependencies: "none" }` — Watchtower-like, auto-everything-including-major. That was too aggressive: semver explicitly flags major bumps as potentially breaking, so they should land in front of a human review. v0.5.1 settles on `{ app: "minor", dependencies: "none" }` — auto-apply patches and minors (the bumps that come with a backwards-compat contract), hold majors for approval, stay silent on deps.

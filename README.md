@@ -141,6 +141,7 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 | `BUMPSIGHT_DIGEST_HOUR` | `18` | Hour-of-day (0–23, local TZ) the daily-digest email fires. Set to a negative value (`-1`) to disable. Empty days produce no email. |
 | `BUMPSIGHT_OUTBOX_DIR` | `/var/lib/bumpsight/outbox` | Where every dispatched notification is archived as JSON (per-event + daily-digest). |
 | `BUMPSIGHT_OUTBOX_KEEP` | `200` | Most recent N outbox files retained; older ones unlinked on every write. |
+| `BUMPSIGHT_PRUNE_SCHEDULE` | (unset) | Opt-in deep prune interval — `24h`, `7d`, etc. When set, bumpsight runs `docker image prune --filter until=168h -af`, `docker volume prune -f`, and `docker builder prune -af` on that interval and logs total reclaimed bytes. Off by default. |
 
 ### `/config/bumpsight.yaml`
 
@@ -221,6 +222,7 @@ When a scan finds a new tag in the same family, bumpsight:
     - `https://your-bump-url/approve/<token>` — when clicked, marks the row approved and runs the same apply path as above.
     - `https://your-bump-url/deny/<token>` — marks the row denied. bumpsight will not re-prompt for this exact bump.
 5. **Post-apply prune (v0.4.2+):** after a successful, non-moving-tag apply, bumpsight removes the *just-replaced* image tag if no other container references it. Reports `freed N MB` in the apply log + completion email. Always best-effort; a prune failure never marks the apply itself failed. Skipped for moving-tag bumps (`:latest` digest changes etc. — the rolling tag still resolves the old digest implicitly). This keeps disk usage from creeping up over time as bumpsight applies multiple version bumps in succession.
+6. **Scheduled deep prune (v0.5.2+, opt-in):** set `BUMPSIGHT_PRUNE_SCHEDULE=7d` (or any interval) and bumpsight runs `docker image prune --filter until=168h -af`, `docker volume prune -f`, and `docker builder prune -af` on that cadence. Cleans up dangling layers from cancelled builds, orphaned anonymous volumes, and the buildx cache — all things the targeted post-apply prune deliberately leaves alone. Logs total reclaimed bytes per pass. Off by default; per-step failures don't abort the next step or stop the schedule.
 
 ### Rolling-tag (`:latest`, `:nightly`, …) semantics
 
@@ -320,13 +322,12 @@ Shipped:
 - v0.2: `daemon` mode — interval scheduler, semver-aware auto-apply policy, SQLite state, SMTP / Apprise notifiers, HTTP approve/deny server, automatic compose-file rewrite + `docker compose pull && up -d`, GHCR image (linux/amd64 + linux/arm64), HTML emails with action card at top, OpenAI-compatible LLM client (LiteLLM / Ollama / OpenAI / etc.), curated upstream-repo table for Docker Official images
 - v0.3: `:latest`-digest tracking with semver-pair resolution (Phase 1+2), `/queue` HTTP route, `report` policy, LSIO tag format support, dependency-image-aware advise prompts, GHCR per-tag manifest support, LLM opinion-fallback when no upstream notes, multi-arch buildx via GHCR cache
 - v0.4: split policy (`app` vs `dependencies` axes), apply-completion notifications + outbox archive + `advise_text` persistence (v0.4.1), advise reliability (180s default timeout, configurable `BUMPSIGHT_LLM_TIMEOUT_MS`, retry-on-AbortError), aligned-mount convention, rolling-tag apply path fix, post-apply targeted image prune (v0.4.2), daily-digest email rollup at configurable hour with `<details>`/`<summary>` per-row collapsibles (v0.4.3)
-- v0.5: **BREAKING DEFAULT** — new policy fallback `{ app: minor, dependencies: none }` since v0.5.1 (auto patch+minor on the app, hold majors, silent deps; pre-v0.5.0 was `{ notify, notify }`). Paired dep-recommendation lookup — when advising on a held app-major bump, fetches the parent app's upstream compose at the new tag and surfaces dep-pin diffs in the advise email (`bump` / `image-change` / `add` recommendations).
+- v0.5: **BREAKING DEFAULT** — new policy fallback `{ app: minor, dependencies: none }` since v0.5.1 (auto patch+minor on the app, hold majors, silent deps; pre-v0.5.0 was `{ notify, notify }`). Paired dep-recommendation lookup — when advising on a held app-major bump, fetches the parent app's upstream compose at the new tag and surfaces dep-pin diffs in the advise email (`bump` / `image-change` / `add` recommendations). v0.5.2: opt-in scheduled deep-prune via `BUMPSIGHT_PRUNE_SCHEDULE` (image + volume + builder prune on a configurable interval).
 
-Planned (v0.5.1+):
+Planned:
 
 - Digest-bump enrichment via OCI labels — resolve `org.opencontainers.image.revision` to upstream git SHA, diff commits between previous + new SHAs, feed to LLM for a real "what changed in this digest move" summary
 - Apply-time bundling of paired dep changes — let Approve on a major bundle the dep pin rewrites alongside the app rewrite, atomically
-- Scheduled deep-prune (`BUMPSIGHT_PRUNE_SCHEDULE`) — opt-in, periodic `image prune --filter until=N` + `volume prune` + `builder prune`
 - Rule ignore-file for `doctor`
 - Podman and `nerdctl` socket support
 - `quay.io` registry

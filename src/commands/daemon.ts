@@ -2,6 +2,7 @@ import { resolve, join } from "node:path";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { startDaemon, runScanOnce, buildComposeFileMap } from "../daemon/index.js";
 import { startDigestScheduler } from "../daemon/digest.js";
+import { startDeepPruneScheduler } from "../daemon/deep-prune.js";
 import {
   buildRulesConfig,
   loadConfigFile,
@@ -119,6 +120,21 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     return 2;
   }
 
+  // v0.5.2: optional deep-prune schedule. Empty / missing = off.
+  const pruneScheduleRaw =
+    process.env.BUMPSIGHT_PRUNE_SCHEDULE ?? fileShape.prune_schedule ?? "";
+  let pruneIntervalMs = 0;
+  if (pruneScheduleRaw.trim()) {
+    try {
+      pruneIntervalMs = parseDuration(pruneScheduleRaw);
+    } catch (err) {
+      process.stderr.write(
+        `bumpsight daemon: invalid BUMPSIGHT_PRUNE_SCHEDULE "${pruneScheduleRaw}": ${(err as Error).message}\n`,
+      );
+      return 2;
+    }
+  }
+
   const cfg: DaemonConfig = {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
@@ -136,6 +152,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     outboxDir,
     outboxKeepCount,
     digestHour,
+    pruneIntervalMs,
   };
 
   const db = openDb({ path: cfg.dbPath });
@@ -157,7 +174,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       `policy=app:${cfg.rules.default.app}/deps:${cfg.rules.default.dependencies}, db=${cfg.dbPath}, ` +
       `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}, ` +
       `advise=${cfg.llmUrl ? `on @ ${cfg.llmUrl} (${cfg.llmModel ?? "default-model"})` : "off"}, ` +
-      `digest=${cfg.digestHour < 0 ? "off" : `${String(cfg.digestHour).padStart(2, "0")}:00 local`}`,
+      `digest=${cfg.digestHour < 0 ? "off" : `${String(cfg.digestHour).padStart(2, "0")}:00 local`}, ` +
+      `prune=${cfg.pruneIntervalMs > 0 ? `every ${pruneScheduleRaw}` : "off"}`,
   );
 
   if (opts.once) {
@@ -227,10 +245,19 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
         })
       : null;
 
+  const pruneRuntime =
+    cfg.pruneIntervalMs > 0
+      ? startDeepPruneScheduler({
+          intervalMs: cfg.pruneIntervalMs,
+          log,
+        })
+      : null;
+
   const shutdown = async (signal: string) => {
     log(`received ${signal}, draining…`);
     await runtime.stop();
     if (digestRuntime) await digestRuntime.stop();
+    if (pruneRuntime) await pruneRuntime.stop();
     await httpHandle.stop();
     db.close();
     process.exit(0);
