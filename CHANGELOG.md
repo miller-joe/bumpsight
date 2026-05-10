@@ -2,6 +2,38 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.4 — 2026-05-10
+
+Apply-time bundling of paired dep changes. Extends the v0.5.0 paired-dep lookup from report-only to an atomic multi-image rewrite that fires when an operator clicks Approve on an app-major bump. Opt-in per stack — defaults stay off so existing deployments are unaffected.
+
+### Added
+
+- **`apply_paired_deps` config + `BUMPSIGHT_APPLY_PAIRED_DEPS` env var.** Accepts either a bare boolean (apply to all stacks) or the `{ default, stacks }` object for per-stack control. Off when unset — bundling never auto-runs without explicit opt-in.
+
+  ```yaml
+  apply_paired_deps:
+    default: false
+    stacks:
+      outline: true        # bundle paired deps for outline only
+  ```
+
+- **`paired_deps_json` column on `updates`.** The v0.5.0 paired-dep lookup already captures structured recommendations at hold time; v0.5.4 now persists them on the row alongside `advise_text` so apply-time has the same data the operator saw in the email when they clicked Approve. Idempotent migration in `openDb()` for existing DBs.
+- **`src/apply/paired-deps-plan.ts`** — `buildBundlePlan(composePath, recommendations)` reads the live compose, drift-checks each `kind: "bump"` recommendation against the originally-observed pin, and returns `{ rewrites, skipped }`. `add` (new dep) and `image-change` (e.g. `redis` → `valkey`) are always routed to `skipped` so they stay in the operator's hands. `formatBundleLog(plan)` renders the summary line that lands in `apply_log` and the applied-email log section.
+
+### Changed
+
+- **`applyOne` is now atomic across the primary + bundled deps.** A pre-apply snapshot of the compose file is captured before any rewrites; if any paired-dep rewrite fails its drift check, or the subsequent `docker compose pull`/`up -d` exits non-zero, the snapshot is restored and the row is marked failed. Half-rewritten compose files no longer ride into the next apply.
+- **`pullAndUp` accepts `serviceName: string | string[]`.** Bundled applies pass `[primary, ...deps]` so a single pull and single `up -d` cover the whole bundle. Backwards compatible — single-string callers still work identically.
+- **Daemon hold-notify writes `paired_deps_json` alongside `advise_text`.** Only when the v0.5.0 lookup returned recommendations; rows without paired deps stay null.
+- **Startup banner reports bundling state.** `bundle_paired_deps=off` / `on (all stacks)` / `default=off on=outline` so the operator can verify their config without `--once`.
+
+### Notes
+
+- Drift between hold time and apply time is handled non-destructively: a drifted paired-dep entry is logged as `paired-dep skipped: <service> — local tag drifted since hold` and left alone. The primary apply still proceeds. This way a manual dep bump between approval and click doesn't turn a routine apply into a failure.
+- `kind: "bump"` is the only category that bundles automatically. The decision is deliberate: `add` and `image-change` change the shape of the stack (new service, swapped runtime), and the upstream's recommended pin alone isn't enough to verify volumes/configs/networks will roundtrip. Those still show up in the email, just not in the automatic rewrite.
+- Bundling is intentionally skipped on moving-tag applies (`row.family?.startsWith("moving:")`) — those don't touch the compose pin to begin with, so there's no bundling to do.
+- Bundling reads the snapshot captured at hold time; if you'd rather apply against a fresh upstream pin, deny the existing row and let the next scan re-discover.
+
 ## 0.5.3 — 2026-05-10
 
 Apply-email polish. Two small fixes that compound: shrink the captured apply log at the source, then hide what's left behind a spoiler so a clean log doesn't dominate the email.

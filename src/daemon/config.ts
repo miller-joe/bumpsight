@@ -46,6 +46,20 @@ export interface DaemonConfig {
    *  per the "ships to other people's homelabs, defaults must work zero-config"
    *  principle — operators opt in via BUMPSIGHT_PRUNE_SCHEDULE. */
   pruneIntervalMs: number;
+  /** v0.5.4: when bundling is enabled for a stack, an Approve on an app-major
+   *  bump triggers atomic dep-pin rewrites alongside the app pin (drawing from
+   *  the paired-dep recommendations the v0.5.0 lookup captured at hold time).
+   *  Defaulted off — `add` / `image-change` recommendations are never bundled
+   *  automatically (those need operator judgment); only same-image tag bumps
+   *  ride along with the parent. */
+  applyPairedDeps: ApplyPairedDepsConfig;
+}
+
+export interface ApplyPairedDepsConfig {
+  /** Global default. Off unless explicitly enabled. */
+  default: boolean;
+  /** Per-stack overrides. Wins over `default` when present. */
+  stacks: Record<string, boolean>;
 }
 
 /**
@@ -90,6 +104,15 @@ export interface FileConfigShape {
   /** v0.5.2: schedule deep prune (image/volume/builder). Same duration syntax
    *  as `interval`. Empty/missing disables. */
   prune_schedule?: string;
+  /** v0.5.4: opt-in apply-time bundling of paired dep changes. Either a bare
+   *  boolean (default for every stack) or `{ default?: boolean, stacks?: {…} }`
+   *  for per-stack control. Off when missing. */
+  apply_paired_deps?: boolean | ApplyPairedDepsFileShape;
+}
+
+export interface ApplyPairedDepsFileShape {
+  default?: boolean;
+  stacks?: Record<string, boolean>;
 }
 
 const VALID_ACTIONS: BumpAction[] = ["patch", "minor", "major", "notify", "none"];
@@ -221,4 +244,64 @@ export function buildRulesConfig(
   }
 
   return { default: defaultAxes, stacks };
+}
+
+/**
+ * v0.5.4: resolve the apply-paired-deps opt-in config. Three sources, last
+ * wins (so an env override beats config beats hard-coded default):
+ *   1. Hard default → `{ default: false, stacks: {} }`
+ *   2. `apply_paired_deps` in bumpsight.yaml (boolean OR `{default,stacks}`)
+ *   3. `BUMPSIGHT_APPLY_PAIRED_DEPS` env var → overrides default only
+ */
+export function buildApplyPairedDepsConfig(
+  fileShape: FileConfigShape,
+  envValue: string | undefined,
+  log?: (msg: string) => void,
+): ApplyPairedDepsConfig {
+  let cfg: ApplyPairedDepsConfig = { default: false, stacks: {} };
+  if (fileShape.apply_paired_deps !== undefined) {
+    if (typeof fileShape.apply_paired_deps === "boolean") {
+      cfg = { default: fileShape.apply_paired_deps, stacks: {} };
+    } else if (
+      fileShape.apply_paired_deps &&
+      typeof fileShape.apply_paired_deps === "object"
+    ) {
+      const fs = fileShape.apply_paired_deps;
+      cfg = {
+        default: fs.default ?? false,
+        stacks: { ...(fs.stacks ?? {}) },
+      };
+    } else {
+      throw new Error(
+        `config.apply_paired_deps: expected boolean or {default, stacks} object`,
+      );
+    }
+  }
+  if (envValue !== undefined) {
+    const lc = envValue.trim().toLowerCase();
+    if (lc === "true" || lc === "1" || lc === "yes" || lc === "on") {
+      cfg.default = true;
+    } else if (lc === "false" || lc === "0" || lc === "no" || lc === "off" || lc === "") {
+      cfg.default = false;
+    } else {
+      log?.(
+        `BUMPSIGHT_APPLY_PAIRED_DEPS: unrecognized value "${envValue}", ignoring`,
+      );
+    }
+  }
+  return cfg;
+}
+
+/**
+ * Per-stack lookup with default fallback. Used by apply to decide whether to
+ * bundle paired-dep rewrites on a given Approve click / auto-apply pass.
+ */
+export function isPairedDepBundlingEnabled(
+  cfg: ApplyPairedDepsConfig,
+  stack: string,
+): boolean {
+  if (Object.prototype.hasOwnProperty.call(cfg.stacks, stack)) {
+    return cfg.stacks[stack]!;
+  }
+  return cfg.default;
 }

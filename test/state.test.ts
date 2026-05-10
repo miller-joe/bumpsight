@@ -8,6 +8,7 @@ import {
   setNotified,
   setDecision,
   setApplied,
+  setPairedDeps,
   digest,
 } from "../src/state/db.js";
 import type { Database as DB } from "better-sqlite3";
@@ -258,6 +259,29 @@ describe("digest tracking helpers", () => {
     db.close();
     const fs = await import("node:fs");
     fs.unlinkSync(tmp);
+  });
+
+  it("setPairedDeps persists the JSON blob on a row", () => {
+    const id = recordUpdate(db, {
+      stack: "outline",
+      service: "outline",
+      image: "outlinewiki/outline:0.84.0",
+      currentTag: "0.84.0",
+      targetTag: "0.85.0",
+      bump: "major",
+    });
+    const blob = JSON.stringify([
+      {
+        upstreamService: "postgresql",
+        upstreamImage: "postgres:17-alpine",
+        localImage: "postgres:16-alpine",
+        localService: "outline-postgres",
+        kind: "bump",
+      },
+    ]);
+    setPairedDeps(db, id, blob);
+    const row = findUpdate(db, id)!;
+    expect(row.paired_deps_json).toBe(blob);
   });
 
   it("openDb migrates an old-schema DB by rebuilding the updates table", async () => {

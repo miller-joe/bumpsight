@@ -29,6 +29,7 @@ export interface UpdateRow {
   apply_log: string | null;
   digested_at: number | null;
   advise_text: string | null;
+  paired_deps_json: string | null;
 }
 
 const SCHEMA = `
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS updates (
   apply_log       TEXT,
   digested_at     INTEGER,
   advise_text     TEXT,
+  paired_deps_json TEXT,
   UNIQUE (stack, service, current_tag, target_tag)
 );
 CREATE INDEX IF NOT EXISTS idx_updates_status ON updates(status);
@@ -125,6 +127,20 @@ function migrate(db: DB): void {
     .get() as { sql: string } | undefined;
   if (u2 && !/\badvise_text\b/.test(u2.sql)) {
     db.exec("ALTER TABLE updates ADD COLUMN advise_text TEXT");
+  }
+
+  // v0.5.4: persist the paired-dep recommendations alongside the advise body
+  // so the apply step can atomically bundle dep rewrites with the app rewrite
+  // when bundling is opted in for a stack. Stored as JSON
+  // (DepRecommendation[]); nullable when the lookup didn't run or produced
+  // nothing.
+  const u3 = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u3 && !/\bpaired_deps_json\b/.test(u3.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN paired_deps_json TEXT");
   }
 }
 
@@ -319,6 +335,19 @@ export function setApplied(db: DB, id: number, r: ApplyResult): void {
  */
 export function setAdviseText(db: DB, id: number, text: string): void {
   db.prepare(`UPDATE updates SET advise_text = ? WHERE id = ?`).run(text, id);
+}
+
+/**
+ * v0.5.4: persist the structured paired-dep recommendations on the row.
+ * Captured at hold-time alongside the advise body so apply-time bundling
+ * has the same set of recommendations the operator saw in the email when
+ * they clicked Approve. Pass the JSON string (DepRecommendation[]).
+ */
+export function setPairedDeps(db: DB, id: number, json: string): void {
+  db.prepare(`UPDATE updates SET paired_deps_json = ? WHERE id = ?`).run(
+    json,
+    id,
+  );
 }
 
 /**

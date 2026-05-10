@@ -4,6 +4,7 @@ import { startDaemon, runScanOnce, buildComposeFileMap } from "../daemon/index.j
 import { startDigestScheduler } from "../daemon/digest.js";
 import { startDeepPruneScheduler } from "../daemon/deep-prune.js";
 import {
+  buildApplyPairedDepsConfig,
   buildRulesConfig,
   loadConfigFile,
   type DaemonConfig,
@@ -135,6 +136,13 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     }
   }
 
+  // v0.5.4: opt-in apply-time bundling of paired dep changes. Off by default.
+  const applyPairedDeps = buildApplyPairedDepsConfig(
+    fileShape,
+    process.env.BUMPSIGHT_APPLY_PAIRED_DEPS,
+    (msg) => process.stderr.write(`bumpsight daemon: ${msg}\n`),
+  );
+
   const cfg: DaemonConfig = {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
@@ -153,6 +161,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     outboxKeepCount,
     digestHour,
     pruneIntervalMs,
+    applyPairedDeps,
   };
 
   const db = openDb({ path: cfg.dbPath });
@@ -175,7 +184,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       `public_url=${cfg.publicUrl ?? "(unset — links disabled)"}, ` +
       `advise=${cfg.llmUrl ? `on @ ${cfg.llmUrl} (${cfg.llmModel ?? "default-model"})` : "off"}, ` +
       `digest=${cfg.digestHour < 0 ? "off" : `${String(cfg.digestHour).padStart(2, "0")}:00 local`}, ` +
-      `prune=${cfg.pruneIntervalMs > 0 ? `every ${pruneScheduleRaw}` : "off"}`,
+      `prune=${cfg.pruneIntervalMs > 0 ? `every ${pruneScheduleRaw}` : "off"}, ` +
+      `bundle_paired_deps=${describeBundling(cfg.applyPairedDeps)}`,
   );
 
   if (opts.once) {
@@ -192,6 +202,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       notifyIntervalMs: cfg.notifyIntervalMs,
       outboxDir: cfg.outboxDir,
       outboxKeepCount: cfg.outboxKeepCount,
+      applyPairedDeps: cfg.applyPairedDeps,
     });
     log(
       `scan: ${result.scanned} services, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held)`,
@@ -216,6 +227,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     githubToken: cfg.githubToken,
     outboxDir: cfg.outboxDir,
     outboxKeepCount: cfg.outboxKeepCount,
+    applyPairedDeps: cfg.applyPairedDeps,
   });
 
   const runtime = startDaemon(cfg, {
@@ -230,6 +242,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     outboxDir: cfg.outboxDir,
     outboxKeepCount: cfg.outboxKeepCount,
     log,
+    applyPairedDeps: cfg.applyPairedDeps,
   });
 
   const digestRuntime =
@@ -268,6 +281,20 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
   return await new Promise<number>(() => {
     /* daemon runs until SIGINT/SIGTERM */
   });
+}
+
+function describeBundling(
+  cfg: DaemonConfig["applyPairedDeps"],
+): string {
+  const overrides = Object.entries(cfg.stacks);
+  if (!cfg.default && overrides.length === 0) return "off";
+  if (cfg.default && overrides.length === 0) return "on (all stacks)";
+  const onStacks = overrides.filter(([, v]) => v).map(([k]) => k);
+  const offStacks = overrides.filter(([, v]) => !v).map(([k]) => k);
+  const parts: string[] = [cfg.default ? "default=on" : "default=off"];
+  if (onStacks.length > 0) parts.push(`on=${onStacks.join(",")}`);
+  if (offStacks.length > 0) parts.push(`off=${offStacks.join(",")}`);
+  return parts.join(" ");
 }
 
 /**

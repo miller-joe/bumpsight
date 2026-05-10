@@ -45,7 +45,9 @@ export const realRunner: CommandRunner = async (command, args, opts = {}) => {
 
 export interface ApplyOptions {
   composePath: string;
-  serviceName: string;
+  /** Service to operate on. v0.5.4 accepts an array so paired-dep bundling
+   *  can pull + restart the primary and its bundled deps in the same step. */
+  serviceName: string | string[];
   /** Per-step timeout in milliseconds. Default 10 minutes. */
   timeoutMs?: number;
   /** Test indirection. Defaults to the real spawn-based runner. */
@@ -67,6 +69,9 @@ export interface ApplyResult {
 export async function pullAndUp(opts: ApplyOptions): Promise<ApplyResult> {
   const runner = opts.runner ?? realRunner;
   const timeoutMs = opts.timeoutMs ?? 10 * 60_000;
+  const services = Array.isArray(opts.serviceName)
+    ? opts.serviceName
+    : [opts.serviceName];
 
   // --quiet suppresses the per-layer progress redraws. Without a TTY,
   // compose's "plain" progress mode emits each redraw as a fresh newline
@@ -76,7 +81,7 @@ export async function pullAndUp(opts: ApplyOptions): Promise<ApplyResult> {
   // success and errors still surface on stderr.
   const pull = await runner(
     "docker",
-    ["compose", "-f", opts.composePath, "pull", "--quiet", opts.serviceName],
+    ["compose", "-f", opts.composePath, "pull", "--quiet", ...services],
     { timeoutMs },
   );
   if (pull.exitCode !== 0) {
@@ -89,7 +94,7 @@ export async function pullAndUp(opts: ApplyOptions): Promise<ApplyResult> {
 
   const up = await runner(
     "docker",
-    ["compose", "-f", opts.composePath, "up", "-d", opts.serviceName],
+    ["compose", "-f", opts.composePath, "up", "-d", ...services],
     { timeoutMs },
   );
   return {

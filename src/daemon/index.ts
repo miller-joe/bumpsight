@@ -26,7 +26,9 @@ import type { Notifier, NotifyMessage, NotifyLink } from "../notify/types.js";
 import { applyOne } from "../apply/index.js";
 import type { CommandRunner } from "../apply/docker.js";
 import { getAdviseSummary, type AdviseSummary } from "../commands/advise.js";
-import { setAdviseText } from "../state/db.js";
+import { setAdviseText, setPairedDeps } from "../state/db.js";
+import type { ApplyPairedDepsConfig } from "./config.js";
+import { isPairedDepBundlingEnabled } from "./config.js";
 
 export interface ScanRunResult {
   /** Number of services examined across all compose files. */
@@ -77,6 +79,9 @@ export interface ScanRunDeps {
   /** v0.4.2: forwarded to applyOne. When false, skip the post-apply
    *  targeted prune. Default true. Tests usually pass false. */
   pruneAfterApply?: boolean;
+  /** v0.5.4: per-stack opt-in for apply-time paired-dep bundling. Off when
+   *  missing. Forwarded to applyOne after the stack lookup. */
+  applyPairedDeps?: ApplyPairedDepsConfig;
   /** Test seam — override advise. Returns null to skip the LLM section. */
   adviseFn?: typeof getAdviseSummary;
   /** Test seam — sleep helper for the rate limiter. */
@@ -258,6 +263,9 @@ export async function runScanOnce(
               composeFiles: deps.composeFiles,
               runner: deps.runner,
               pruneAfterApply: deps.pruneAfterApply,
+              bundlePairedDeps:
+                deps.applyPairedDeps !== undefined &&
+                isPairedDepBundlingEnabled(deps.applyPairedDeps, stack),
             },
             row.id,
           );
@@ -331,6 +339,9 @@ export async function runScanOnce(
             composeFiles: deps.composeFiles,
             runner: deps.runner,
             pruneAfterApply: deps.pruneAfterApply,
+            bundlePairedDeps:
+              deps.applyPairedDeps !== undefined &&
+              isPairedDepBundlingEnabled(deps.applyPairedDeps, stack),
           },
           row.id,
         );
@@ -445,6 +456,16 @@ export async function runScanOnce(
         // the operator actually saw without re-rolling the dice on the LLM.
         if (advise?.ok && advise.summary) {
           setAdviseText(deps.db, entry.row.id, advise.summary);
+        }
+        // v0.5.4: persist the structured paired-dep recommendations so a
+        // later Approve click can bundle the dep rewrites atomically with
+        // the app rewrite when bundling is opted-in for this stack.
+        if (advise?.ok && advise.pairedDeps && advise.pairedDeps.length > 0) {
+          setPairedDeps(
+            deps.db,
+            entry.row.id,
+            JSON.stringify(advise.pairedDeps),
+          );
         }
       }
     }
@@ -981,6 +1002,8 @@ export interface StartDaemonDeps {
   fetchManifestDigestFn?: typeof fetchManifestDigest;
   runner?: CommandRunner;
   adviseFn?: typeof getAdviseSummary;
+  /** v0.5.4: per-stack opt-in for paired-dep bundling. Forwarded to scans. */
+  applyPairedDeps?: ApplyPairedDepsConfig;
 }
 
 /**
@@ -1017,6 +1040,7 @@ export function startDaemon(
           fetchManifestDigestFn: deps.fetchManifestDigestFn,
           runner: deps.runner,
           adviseFn: deps.adviseFn,
+          applyPairedDeps: deps.applyPairedDeps,
         });
         const ms = Date.now() - started;
         deps.log(

@@ -15,6 +15,10 @@ import type { CommandRunner } from "../apply/docker.js";
 import type { Notifier } from "../notify/types.js";
 import { dispatchAppliedNotification } from "../daemon/index.js";
 import { getAdviseSummary } from "../commands/advise.js";
+import {
+  isPairedDepBundlingEnabled,
+  type ApplyPairedDepsConfig,
+} from "../daemon/config.js";
 
 export interface HttpServerDeps {
   db: DB;
@@ -46,6 +50,10 @@ export interface HttpServerDeps {
   outboxDir?: string;
   /** Most recent N outbox files to keep. Defaults to 200. */
   outboxKeepCount?: number;
+  /** v0.5.4: per-stack opt-in for apply-time paired-dep bundling. When set,
+   *  an Approve click on an app-major bump triggers atomic dep-pin rewrites
+   *  alongside the app pin (drawn from the v0.5.0 paired-dep snapshot). */
+  applyPairedDeps?: ApplyPairedDepsConfig;
 }
 
 export interface HttpServerHandle {
@@ -254,7 +262,15 @@ async function handleApprove(
     for (const r of all) {
       try {
         const after = await applyOne(
-          { db: deps.db, composeFiles: deps.composeFiles, runner: deps.runner, pruneAfterApply: deps.pruneAfterApply },
+          {
+            db: deps.db,
+            composeFiles: deps.composeFiles,
+            runner: deps.runner,
+            pruneAfterApply: deps.pruneAfterApply,
+            bundlePairedDeps:
+              deps.applyPairedDeps !== undefined &&
+              isPairedDepBundlingEnabled(deps.applyPairedDeps, r.stack),
+          },
           r.id,
         );
         log(`apply ${r.id} (${r.stack}/${r.service}): ${after.status}`);
