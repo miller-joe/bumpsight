@@ -912,11 +912,17 @@ function buildAppliedHtml(opts: AppliedHtmlOpts): string {
       : "";
 
   const applyLogSection = row.apply_log
-    ? `
+    ? (() => {
+        const lines = row.apply_log.split("\n").length;
+        const kb = (row.apply_log.length / 1024).toFixed(1);
+        return `
       <div style="margin-top:24px;">
-        <h3 style="margin:0 0 8px 0;font-size:14px;color:#1e293b;">Apply log</h3>
-        <pre style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:12px;line-height:1.4;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:14px 16px;white-space:pre-wrap;margin:0;">${e(row.apply_log)}</pre>
-      </div>`
+        <details style="margin:0;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;">
+          <summary style="cursor:pointer;padding:10px 14px;font-size:14px;color:#1e293b;font-weight:600;list-style:none;">Apply log <span style="color:#64748b;font-weight:400;font-size:12px;">(${lines} line${lines === 1 ? "" : "s"} · ${kb} KB)</span></summary>
+          <pre style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:12px;line-height:1.4;background:#f8fafc;border-top:1px solid #e2e8f0;border-radius:0 0 6px 6px;padding:14px 16px;white-space:pre-wrap;margin:0;">${e(row.apply_log)}</pre>
+        </details>
+      </div>`;
+      })()
     : "";
 
   return `<!doctype html>

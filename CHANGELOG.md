@@ -2,6 +2,21 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.3 — 2026-05-10
+
+Apply-email polish. Two small fixes that compound: shrink the captured apply log at the source, then hide what's left behind a spoiler so a clean log doesn't dominate the email.
+
+### Changed
+
+- **Pass `--quiet` to `docker compose pull` during apply.** Without a TTY, compose's plain progress mode emits every per-layer redraw as a separate newline (e.g. `xxxxxxxxxxxx Downloading [=>  ] 96.53MB/3.862GB` repeated for every status update). On a multi-GB image that ballooned the captured `apply_log` past 100KB and the resulting hold/applied email past 250KB. With `--quiet`, stdout is empty on success and errors still surface on stderr — apply logs on a successful pull are now near-empty (typically just the final `Container X Recreated` line from the `up` step).
+- **Apply log section is now collapsed by default in HTML emails.** Both per-event mails (`buildAppliedHtml` in `src/daemon/index.ts`) and the daily digest (`renderRow` in `src/notify/digest.ts`) wrap the apply log `<pre>` in a `<details>` element. The `<summary>` advertises line count and size so the operator can decide at a glance whether it's worth opening (e.g. `Apply log (1348 lines · 124.6 KB)`). Plain-text bodies are unchanged — the `───── apply log ─────` divider stays.
+
+### Notes
+
+- The `--quiet` change only affects apply-time pulls; tag discovery still uses the registry HTTP API (no shell-out, no progress lines to silence).
+- `<details>` is supported by Gmail web, Apple Mail, Thunderbird, iOS/Android Mail. Outlook desktop renders `<details>` as flat content (no collapse) — graceful degradation, not a regression.
+- The combination cuts a typical large applied-email from ~265KB to ~5KB and leaves operators with one-glance triage instead of a wall of progress bars.
+
 ## 0.5.2 — 2026-05-08
 
 Opt-in scheduled deep prune. Complements the v0.4.2 post-apply targeted prune, which only removes the just-replaced image tag and never touches dangling layers from cancelled builds, orphaned anonymous volumes, or the buildx cache. Over months of homelab churn those accumulate (52.6 GB reclaimed manually after a few months on Joe's setup); this gives operators a no-config-required cron without standing up a separate prune cron.

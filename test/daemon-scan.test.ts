@@ -104,7 +104,7 @@ describe("runScanOnce", () => {
     expect(result.autoApplied).toBe(1);
     expect(result.autoAppliedOk).toBe(1);
     expect(calls).toHaveLength(2);
-    expect(calls[0]!.args).toEqual(["compose", "-f", file, "pull", "jellyfin"]);
+    expect(calls[0]!.args).toEqual(["compose", "-f", file, "pull", "--quiet", "jellyfin"]);
     expect(calls[1]!.args).toEqual(["compose", "-f", file, "up", "-d", "jellyfin"]);
     // Compose file actually got rewritten
     expect(readFileSync(file, "utf-8")).toContain("linuxserver/jellyfin:10.10.8");

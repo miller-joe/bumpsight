@@ -132,6 +132,28 @@ describe("buildDigestEmail", () => {
     expect(sections.failures).toHaveLength(1);
     expect(sections.suppressedDigests).toHaveLength(1);
   });
+
+  it("collapses apply log behind a details summary with size info", () => {
+    const log = "line1\nline2\nline3";
+    const built = buildDigestEmail({
+      rows: [
+        fakeRow({
+          id: 5,
+          stack: "ghost",
+          service: "ghost",
+          status: "failed",
+          apply_log: log,
+        }),
+      ],
+    });
+    expect(built).not.toBeNull();
+    const html = built!.message.htmlBody;
+    // Apply log is wrapped in a <details> summary, not a bare <pre>, and the
+    // summary advertises the line count + size so the operator can decide
+    // whether it is worth opening.
+    expect(html).toMatch(/<details[^>]*>\s*<summary[^>]*>Apply log <span[^>]*>\(3 lines · 0\.0 KB\)<\/span><\/summary>/);
+    expect(html).toContain("line1\nline2\nline3");
+  });
 });
 
 describe("shouldFireDigest", () => {

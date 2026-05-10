@@ -118,6 +118,28 @@ describe("pullAndUp", () => {
     expect(r.log).toContain("==== docker compose up");
   });
 
+  it("passes --quiet to docker compose pull", async () => {
+    const calls: { command: string; args: string[] }[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push({ command, args });
+      return { exitCode: 0, combinedOutput: "" };
+    };
+    await pullAndUp({
+      composePath: "/x.yaml",
+      serviceName: "app",
+      runner,
+    });
+    expect(calls[0].args).toEqual([
+      "compose",
+      "-f",
+      "/x.yaml",
+      "pull",
+      "--quiet",
+      "app",
+    ]);
+    expect(calls[1].args).not.toContain("--quiet");
+  });
+
   it("short-circuits when pull fails", async () => {
     let calls = 0;
     const runner: CommandRunner = async () => {

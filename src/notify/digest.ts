@@ -227,11 +227,17 @@ function renderHtml(
       : "";
 
     const applyLogSection = row.apply_log
-      ? `
+      ? (() => {
+          const lines = row.apply_log.split("\n").length;
+          const kb = (row.apply_log.length / 1024).toFixed(1);
+          return `
         <div style="margin-top:10px;">
-          <div style="font-size:11px;color:#64748b;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.04em;">Apply log</div>
-          <pre style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:11px;line-height:1.4;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;padding:10px 12px;white-space:pre-wrap;margin:0;">${e(row.apply_log)}</pre>
-        </div>`
+          <details style="margin:0;border:1px solid #e2e8f0;border-radius:4px;background:#f8fafc;">
+            <summary style="cursor:pointer;padding:6px 12px;font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:0.04em;list-style:none;">Apply log <span style="text-transform:none;letter-spacing:0;">(${lines} line${lines === 1 ? "" : "s"} · ${kb} KB)</span></summary>
+            <pre style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:11px;line-height:1.4;background:#f8fafc;border-top:1px solid #e2e8f0;border-radius:0 0 4px 4px;padding:10px 12px;white-space:pre-wrap;margin:0;">${e(row.apply_log)}</pre>
+          </details>
+        </div>`;
+        })()
       : "";
 
     return `

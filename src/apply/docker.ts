@@ -68,9 +68,15 @@ export async function pullAndUp(opts: ApplyOptions): Promise<ApplyResult> {
   const runner = opts.runner ?? realRunner;
   const timeoutMs = opts.timeoutMs ?? 10 * 60_000;
 
+  // --quiet suppresses the per-layer progress redraws. Without a TTY,
+  // compose's "plain" progress mode emits each redraw as a fresh newline
+  // (e.g. `xxxxxxxxxxxx Downloading [=>  ] 96.53MB/3.862GB` 100s of times),
+  // which on a multi-GB pull can balloon the captured log past 100KB and
+  // the resulting hold-email past 250KB. With --quiet, stdout is empty on
+  // success and errors still surface on stderr.
   const pull = await runner(
     "docker",
-    ["compose", "-f", opts.composePath, "pull", opts.serviceName],
+    ["compose", "-f", opts.composePath, "pull", "--quiet", opts.serviceName],
     { timeoutMs },
   );
   if (pull.exitCode !== 0) {
