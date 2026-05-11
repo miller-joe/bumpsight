@@ -30,6 +30,8 @@ import { setAdviseText, setPairedDeps } from "../state/db.js";
 import type { ApplyPairedDepsConfig } from "./config.js";
 import { isPairedDepBundlingEnabled } from "./config.js";
 
+const BRAND_LOGO_INLINE = `<svg viewBox="0 0 96 96" width="36" height="36" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;flex:0 0 auto;" role="img" aria-label="bumpsight"><ellipse cx="20" cy="48" rx="6" ry="14" fill="#2563eb" fill-opacity="0.08"/><ellipse cx="20" cy="48" rx="6" ry="14"/><ellipse cx="48" cy="48" rx="5" ry="11"/><ellipse cx="76" cy="48" rx="4" ry="8"/><path d="M20 34 L48 37 L76 40"/><path d="M20 62 L48 59 L76 56"/><circle cx="20" cy="48" r="2.5" fill="#2563eb" stroke="none"/></svg>`;
+
 export interface ScanRunResult {
   /** Number of services examined across all compose files. */
   scanned: number;
@@ -672,6 +674,13 @@ function buildHoldHtml(opts: HoldHtmlOpts): string {
 <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="600" style="max-width:600px;background:#ffffff;border-radius:8px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0f172a;">
 <tr><td style="padding:24px;">
 
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:0 0 18px 0;">
+    <tr>
+      <td style="padding-right:10px;vertical-align:middle;">${BRAND_LOGO_INLINE}</td>
+      <td style="vertical-align:middle;"><div style="font-size:18px;font-weight:600;color:#0f172a;">bumpsight</div></td>
+    </tr>
+  </table>
+
   <!-- Action card -->
   <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:18px 20px;margin-bottom:24px;">
     <p style="margin:0 0 14px 0;font-size:14px;line-height:1.5;color:#1e3a8a;">
@@ -952,6 +961,13 @@ function buildAppliedHtml(opts: AppliedHtmlOpts): string {
 <tr><td align="center">
 <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="600" style="max-width:600px;background:#ffffff;border-radius:8px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0f172a;">
 <tr><td style="padding:24px;">
+
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:0 0 18px 0;">
+    <tr>
+      <td style="padding-right:10px;vertical-align:middle;">${BRAND_LOGO_INLINE}</td>
+      <td style="vertical-align:middle;"><div style="font-size:18px;font-weight:600;color:#0f172a;">bumpsight</div></td>
+    </tr>
+  </table>
 
   ${banner}
 

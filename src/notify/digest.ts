@@ -1,6 +1,8 @@
 import type { UpdateRow } from "../state/db.js";
 import type { NotifyMessage } from "./types.js";
 
+const BRAND_LOGO_INLINE = `<svg viewBox="0 0 96 96" width="36" height="36" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;flex:0 0 auto;" role="img" aria-label="bumpsight"><ellipse cx="20" cy="48" rx="6" ry="14" fill="#2563eb" fill-opacity="0.08"/><ellipse cx="20" cy="48" rx="6" ry="14"/><ellipse cx="48" cy="48" rx="5" ry="11"/><ellipse cx="76" cy="48" rx="4" ry="8"/><path d="M20 34 L48 37 L76 40"/><path d="M20 62 L48 59 L76 56"/><circle cx="20" cy="48" r="2.5" fill="#2563eb" stroke="none"/></svg>`;
+
 /**
  * v0.4.3 daily-digest email. Aggregates the day's bumpsight activity into a
  * single rollup so the operator's inbox isn't flooded by per-event emails for
@@ -271,7 +273,12 @@ function renderHtml(
 <tr><td align="center">
 <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="640" style="max-width:640px;background:#ffffff;border-radius:8px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#0f172a;">
 <tr><td style="padding:24px;">
-  <h2 style="margin:0 0 4px 0;font-size:18px;color:#0f172a;">Bumpsight daily digest</h2>
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:0 0 4px 0;">
+    <tr>
+      <td style="padding-right:10px;vertical-align:middle;">${BRAND_LOGO_INLINE}</td>
+      <td style="vertical-align:middle;"><h2 style="margin:0;font-size:18px;color:#0f172a;">Bumpsight daily digest</h2></td>
+    </tr>
+  </table>
   <div style="font-size:12px;color:#64748b;">${e(label)}</div>
   ${cfgs.map(sectionHtml).join("")}
   ${queueFooter}

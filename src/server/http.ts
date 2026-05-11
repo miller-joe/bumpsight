@@ -20,6 +20,8 @@ import {
   type ApplyPairedDepsConfig,
 } from "../daemon/config.js";
 
+const BRAND_LOGO_INLINE = `<svg viewBox="0 0 96 96" width="32" height="32" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;flex:0 0 auto;" role="img" aria-label="bumpsight"><ellipse cx="20" cy="48" rx="6" ry="14" fill="#2563eb" fill-opacity="0.08"/><ellipse cx="20" cy="48" rx="6" ry="14"/><ellipse cx="48" cy="48" rx="5" ry="11"/><ellipse cx="76" cy="48" rx="4" ry="8"/><path d="M20 34 L48 37 L76 40"/><path d="M20 62 L48 59 L76 56"/><circle cx="20" cy="48" r="2.5" fill="#2563eb" stroke="none"/></svg>`;
+
 export interface HttpServerDeps {
   db: DB;
   /** Stack name → compose file path. Approvals may trigger apply. */
@@ -210,9 +212,9 @@ function queuePage(d: QueueData): string {
 
   return `<!doctype html>
 <html><head><meta charset=utf-8><title>bumpsight queue</title>
-<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:60rem;margin:2rem auto;padding:0 1rem;color:#0f172a;background:#f1f5f9}h1{margin:0 0 0.5rem;font-size:1.5rem}p.lede{color:#64748b;margin:0 0 1rem;}code{background:#fff;padding:1px 4px;border-radius:3px;font-size:12px;}table{background:#fff;}</style>
+<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:60rem;margin:2rem auto;padding:0 1rem;color:#0f172a;background:#f1f5f9}h1{margin:0 0 0.5rem;font-size:1.5rem;display:flex;align-items:center;gap:10px;}p.lede{color:#64748b;margin:0 0 1rem;}code{background:#fff;padding:1px 4px;border-radius:3px;font-size:12px;}table{background:#fff;}</style>
 </head><body>
-  <h1>bumpsight queue</h1>
+  <h1>${BRAND_LOGO_INLINE}<span>bumpsight queue</span></h1>
   <p class="lede">${total} bump record(s) tracked. Refresh after clicking approve/deny.</p>
   ${section("Pending", "#1e3a8a", d.pending, true)}
   ${section("Notified — awaiting approval", "#1e3a8a", d.notified, true)}
@@ -363,8 +365,8 @@ function writeHtml(res: ServerResponse, status: number, html: string): void {
 
 function page(title: string, body: string): string {
   return `<!doctype html><meta charset=utf-8><title>${escapeHtml(title)}</title>
-<style>body{font:14px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a}h1{margin:0 0 1rem;font-size:1.4rem}.k{color:#555}code{background:#f4f4f4;padding:.1rem .3rem;border-radius:.2rem}</style>
-<h1>${escapeHtml(title)}</h1>
+<style>body{font:14px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#1a1a1a}h1{margin:0 0 1rem;font-size:1.4rem;display:flex;align-items:center;gap:10px;}.k{color:#555}code{background:#f4f4f4;padding:.1rem .3rem;border-radius:.2rem}</style>
+<h1>${BRAND_LOGO_INLINE}<span>${escapeHtml(title)}</span></h1>
 <p>${body}</p>`;
 }
 
