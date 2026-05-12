@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -597,6 +597,119 @@ describe("runScanOnce", () => {
     expect(result.autoApplied).toBe(0);
     expect(result.held).toBe(1);
     expect(calls).toHaveLength(0); // docker compose was never invoked
+    rmSync(file, { force: true });
+  });
+
+  it("v0.5.5: digest-class bumps persist OCI-label enrichment into advise_text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-v055-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    let digest = "sha256:aaaaaaaaaaaa1111";
+    const fakeListTags = async () => [{ name: "latest", digest }];
+
+    const enrichCalls: Array<{ prev: string; next: string }> = [];
+    const enrichDigestFn = async (opts: {
+      prevDigest: string;
+      newDigest: string;
+    }) => {
+      enrichCalls.push({ prev: opts.prevDigest, next: opts.newDigest });
+      return {
+        ok: true,
+        summary: "Digest range: abc…def on github.com/owner/repo (3 commits)\n\n- feat: x",
+        prevRevision: "abc",
+        newRevision: "def",
+        repo: "owner/repo",
+      };
+    };
+
+    const deps = {
+      db,
+      notifiers: [] as Notifier[],
+      rules: { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+      llmUrl: "http://llm/v1",
+      enrichDigestFn: enrichDigestFn as never,
+    };
+
+    // First scan records the digest silently.
+    await runScanOnce(deps);
+    expect(enrichCalls).toHaveLength(0);
+
+    digest = "sha256:bbbbbbbbbbbb2222";
+    const result = await runScanOnce(deps);
+    expect(result.held).toBe(1);
+    expect(enrichCalls).toHaveLength(1);
+    expect(enrichCalls[0]!.prev).toBe("sha256:aaaaaaaaaaaa1111");
+    expect(enrichCalls[0]!.next).toBe("sha256:bbbbbbbbbbbb2222");
+
+    const { listByStatus: list } = await import("../src/state/db.js");
+    const rows = list(db, "notified");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.advise_text).toContain("Digest range");
+    expect(rows[0]!.advise_text).toContain("github.com/owner/repo");
+
+    rmSync(file, { force: true });
+  });
+
+  it("v0.5.5: skipped digest enrichment leaves advise_text null without breaking the row", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-v055-skip-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    let digest = "sha256:aaaaaaaaaaaa1111";
+    const fakeListTags = async () => [{ name: "latest", digest }];
+
+    const enrichDigestFn = async () => ({
+      ok: false,
+      error: "no revision labels",
+    });
+
+    const deps = {
+      db,
+      notifiers: [] as Notifier[],
+      rules: { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+      llmUrl: "http://llm/v1",
+      enrichDigestFn: enrichDigestFn as never,
+    };
+    await runScanOnce(deps);
+    digest = "sha256:bbbbbbbbbbbb2222";
+    const result = await runScanOnce(deps);
+    expect(result.held).toBe(1);
+    const { listByStatus: list } = await import("../src/state/db.js");
+    const rows = list(db, "notified");
+    expect(rows[0]!.advise_text).toBeNull();
+    rmSync(file, { force: true });
+  });
+
+  it("v0.5.5: enrichment is skipped when LLM is not configured", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-v055-nollm-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    let digest = "sha256:aaaaaaaaaaaa1111";
+    const fakeListTags = async () => [{ name: "latest", digest }];
+
+    const enrichDigestFn = vi.fn();
+    const deps = {
+      db,
+      notifiers: [] as Notifier[],
+      rules: { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: fakeListTags as never,
+      // no llmUrl
+      enrichDigestFn: enrichDigestFn as never,
+    };
+    await runScanOnce(deps);
+    digest = "sha256:bbbbbbbbbbbb2222";
+    await runScanOnce(deps);
+    expect(enrichDigestFn).not.toHaveBeenCalled();
     rmSync(file, { force: true });
   });
 

@@ -141,6 +141,105 @@ export interface FetchReleasesOptions {
   signal?: AbortSignal;
 }
 
+export interface GithubCommit {
+  sha: string;
+  shortSha: string;
+  message: string;
+  authorName: string | null;
+  authorEmail: string | null;
+  authoredAt: string | null;
+  url: string;
+}
+
+export interface CompareResult {
+  /** Commits introduced from `base` → `head`. May be truncated by GitHub
+   *  to 250 entries; `totalCommits` reflects the underlying count. */
+  commits: GithubCommit[];
+  /** Total commits according to GitHub. */
+  totalCommits: number;
+  /** GitHub HTML compare URL. */
+  htmlUrl: string;
+  /** True when the compare response indicated the diff is too large
+   *  and GitHub elided some commits. */
+  truncated: boolean;
+}
+
+export interface FetchCompareOptions {
+  token?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * v0.5.5: GitHub "compare two commits" API. Used by digest-bump
+ * enrichment — given the OCI `revision` labels from prior and new
+ * image digests, this returns the commit messages that landed in
+ * between, which the LLM then summarises.
+ *
+ * GitHub returns at most 250 commits per response. For digest-class
+ * bumps that's almost always plenty (most images rebuild on every
+ * commit), but `truncated` is propagated so callers can note the gap.
+ */
+export async function fetchCommitsBetween(
+  coords: RepoCoords,
+  base: string,
+  head: string,
+  opts: FetchCompareOptions = {},
+): Promise<CompareResult> {
+  if (!base || !head) {
+    throw new Error("fetchCommitsBetween: base and head are required");
+  }
+  if (base === head) {
+    return {
+      commits: [],
+      totalCommits: 0,
+      htmlUrl: `https://github.com/${coords.owner}/${coords.repo}/commit/${head}`,
+      truncated: false,
+    };
+  }
+  const url = `https://api.github.com/repos/${encodeURIComponent(coords.owner)}/${encodeURIComponent(coords.repo)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+  const res = await fetch(url, { headers, signal: opts.signal });
+  if (!res.ok) {
+    throw new Error(
+      `GitHub compare: ${res.status} ${res.statusText} for ${coords.owner}/${coords.repo} ${base}...${head}`,
+    );
+  }
+  const body = (await res.json()) as {
+    total_commits?: number;
+    html_url?: string;
+    commits?: Array<{
+      sha: string;
+      html_url: string;
+      commit: {
+        message: string;
+        author?: { name?: string; email?: string; date?: string } | null;
+      };
+    }>;
+    status?: string;
+  };
+  const commits: GithubCommit[] = (body.commits ?? []).map((c) => ({
+    sha: c.sha,
+    shortSha: c.sha.slice(0, 7),
+    message: c.commit.message,
+    authorName: c.commit.author?.name ?? null,
+    authorEmail: c.commit.author?.email ?? null,
+    authoredAt: c.commit.author?.date ?? null,
+    url: c.html_url,
+  }));
+  const totalCommits = body.total_commits ?? commits.length;
+  const truncated = totalCommits > commits.length;
+  return {
+    commits,
+    totalCommits,
+    htmlUrl: body.html_url ?? `https://github.com/${coords.owner}/${coords.repo}/compare/${base}...${head}`,
+    truncated,
+  };
+}
+
 export async function fetchReleases(
   coords: RepoCoords,
   opts: FetchReleasesOptions = {},

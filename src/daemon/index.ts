@@ -29,6 +29,10 @@ import { getAdviseSummary, type AdviseSummary } from "../commands/advise.js";
 import { setAdviseText, setPairedDeps } from "../state/db.js";
 import type { ApplyPairedDepsConfig } from "./config.js";
 import { isPairedDepBundlingEnabled } from "./config.js";
+import {
+  enrichDigestBump,
+  type DigestEnrichmentResult,
+} from "../advise/digest-enrichment.js";
 
 const BRAND_LOGO_INLINE = `<svg viewBox="0 0 96 96" width="36" height="36" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;flex:0 0 auto;" role="img" aria-label="bumpsight"><ellipse cx="20" cy="48" rx="6" ry="14" fill="#2563eb" fill-opacity="0.08"/><ellipse cx="20" cy="48" rx="6" ry="14"/><ellipse cx="48" cy="48" rx="5" ry="11"/><ellipse cx="76" cy="48" rx="4" ry="8"/><path d="M20 34 L48 37 L76 40"/><path d="M20 62 L48 59 L76 56"/><circle cx="20" cy="48" r="2.5" fill="#2563eb" stroke="none"/></svg>`;
 
@@ -86,6 +90,8 @@ export interface ScanRunDeps {
   applyPairedDeps?: ApplyPairedDepsConfig;
   /** Test seam — override advise. Returns null to skip the LLM section. */
   adviseFn?: typeof getAdviseSummary;
+  /** v0.5.5: test seam — override digest-class enrichment. */
+  enrichDigestFn?: typeof enrichDigestBump;
   /** Test seam — sleep helper for the rate limiter. */
   sleepFn?: (ms: number) => Promise<void>;
 }
@@ -253,6 +259,28 @@ export async function runScanOnce(
         // Advance the stored digest now so a re-scan before the user acts
         // doesn't keep refiring the same bump.
         saveDigest(deps.db, ref.raw, ref.tag, newDigest, newResolved ?? null);
+
+        // v0.5.5: for true digest-class bumps (no semver resolved), enrich
+        // the row with an OCI-label-driven commit-range summary. Falls back
+        // silently when labels are absent. The daily-digest renderer picks
+        // up `advise_text` automatically.
+        if (bump === "digest" && deps.llmUrl) {
+          const enrichment = await safeEnrichDigest(
+            {
+              image: ref.raw,
+              prevDigest: prev.digest,
+              newDigest,
+              llmUrl: deps.llmUrl,
+              llmKey: deps.llmKey,
+              model: deps.llmModel,
+              githubToken: deps.githubToken,
+            },
+            deps.enrichDigestFn,
+          );
+          if (enrichment.ok && enrichment.summary) {
+            setAdviseText(deps.db, row.id, enrichment.summary);
+          }
+        }
 
         if (decision === "auto-apply") {
           // applyOne sees row.family === `moving:${tag}` and skips the
@@ -749,6 +777,17 @@ async function safeAdvise(
   }
 }
 
+async function safeEnrichDigest(
+  opts: Parameters<typeof enrichDigestBump>[0],
+  fn?: typeof enrichDigestBump,
+): Promise<DigestEnrichmentResult> {
+  try {
+    return await (fn ?? enrichDigestBump)(opts);
+  } catch (err) {
+    return { ok: false, error: `enrich threw: ${(err as Error).message}` };
+  }
+}
+
 /**
  * Given a digest from a moving tag (e.g. `:latest`), return the most-precise
  * semver-shaped tag in the registry that shares it. Used to classify
@@ -1020,6 +1059,8 @@ export interface StartDaemonDeps {
   adviseFn?: typeof getAdviseSummary;
   /** v0.5.4: per-stack opt-in for paired-dep bundling. Forwarded to scans. */
   applyPairedDeps?: ApplyPairedDepsConfig;
+  /** v0.5.5: test seam — override digest-class enrichment. */
+  enrichDigestFn?: typeof enrichDigestBump;
 }
 
 /**
@@ -1057,6 +1098,7 @@ export function startDaemon(
           runner: deps.runner,
           adviseFn: deps.adviseFn,
           applyPairedDeps: deps.applyPairedDeps,
+          enrichDigestFn: deps.enrichDigestFn,
         });
         const ms = Date.now() - started;
         deps.log(

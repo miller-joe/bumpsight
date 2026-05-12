@@ -2,6 +2,31 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.5 — 2026-05-12
+
+Digest-bump enrichment via OCI labels. Digest-class bumps (moving tags like `:latest` where bumpsight can't resolve the change to a semver pair) used to land in the daily digest as bare `digest sha256:abc… → sha256:def…` lines with no context. v0.5.5 decodes that pair into a real upstream commit range and produces an LLM summary of what changed.
+
+### Added
+
+- **`src/registry/oci-config.ts`** — two-hop registry walker that fetches the OCI image config blob for a given `(image, digest)` and extracts its labels. Supports docker.io and ghcr.io, follows manifest lists / image indices to the linux/amd64 manifest (with linux/arm64 + first-non-attestation fallbacks), and never throws. Returns `{ labels: {} }` on any failure path so callers can fall through cleanly.
+- **`extractRevision()` / `extractSourceUrl()` / `parseGithubUrl()` helpers.** Canonical OCI labels (`org.opencontainers.image.revision`, `org.opencontainers.image.source`) take precedence, with the older `org.label-schema.vcs-ref` / `org.label-schema.vcs-url` accepted as fallbacks for older images. `parseGithubUrl` tolerates `git+https://` schemes, `.git` suffixes, and `www.github.com`.
+- **`src/releases/github.ts` — `fetchCommitsBetween(coords, base, head)`** hits the GitHub Compare API (`/repos/{owner}/{repo}/compare/{base}...{head}`), returning a normalized `CompareResult` with `commits`, `totalCommits`, `htmlUrl`, and a `truncated` flag (GitHub caps responses at 250 commits). `base === head` short-circuits to an empty list without calling the API.
+- **`src/advise/digest-enrichment.ts`** — `enrichDigestBump({ image, prevDigest, newDigest, llmUrl?, ... })` orchestrates the full pipeline: parallel label fetch for both digests → extract revision SHAs and source URL → parse the github.com repo → call the compare API → cap commit list at 30 → feed commit subjects to the LLM → render a summary block with `Digest range: abc…def on github.com/owner/repo (N commits)`, the compare URL, and either the LLM summary or the raw commit-subject list when LLM is unavailable. Never throws.
+- **Daemon hook in `scanRunOnce`.** When `bump === "digest"` (semver resolution unavailable) and an LLM URL is configured, the daemon enriches the row inline and persists the rendered summary into `advise_text` via the existing column. The daily-digest renderer picks it up automatically — no changes needed in the digest email path. Hooked through a new `enrichDigestFn` test seam on `ScanRunDeps` / `StartDaemonDeps`.
+
+### Changed
+
+- **Daily-digest "suppressed digests" section.** Rows that previously rendered with only the `sha256:X…` delta now show an LLM-decoded "what changed" summary when OCI labels are present upstream. When labels are absent (older images, images built without `--label`), the row renders exactly as before — graceful fallback, no config needed.
+
+### Notes
+
+- **Includes the unreleased post-v0.5.4 commit `ad58a1e`** that integrates the inline `bumpsight` SVG mark into the held-bump and applied-result email HTML, the queue page header, and the daily-digest email header. (No image attachment / no CID — inline `<svg>` so every mail client renders it without dragging an additional MIME part.)
+- **Falls back gracefully on every axis.** Missing labels, non-GitHub source, GitHub API errors, LLM unreachable — each failure mode produces either an empty `advise_text` (treated identically to today's behavior) or a structured commit-subject list without an LLM summary. The hold flow never aborts.
+- **No new config.** Enrichment fires whenever the existing `llmUrl` / `BUMPSIGHT_LLM_URL` is set, which is also the prerequisite for the current advise pipeline. Operators without an LLM see the v0.5.4 behavior unchanged.
+- **Registry calls.** Each digest-class bump that triggers enrichment performs up to four registry HTTP calls (token + manifest + arch-manifest + config-blob, per side). Docker Hub anon rate limits (100/6h) are well above this — a homelab with a few dozen `:latest`-pinned services bumps rarely enough that the budget isn't a concern.
+- **GitHub compare API.** Anonymous compare works (60 req/h) but a `GITHUB_TOKEN` lifts the limit to 5,000/h. The existing daemon plumbing already forwards the token from compose env.
+- **Why not enrich at email render time?** Persisting the summary at scan time means the daily-digest path stays simple (read `advise_text`, render), and means a single LLM/GitHub call per digest change instead of one per digest email.
+
 ## 0.5.4 — 2026-05-10
 
 Apply-time bundling of paired dep changes. Extends the v0.5.0 paired-dep lookup from report-only to an atomic multi-image rewrite that fires when an operator clicks Approve on an app-major bump. Opt-in per stack — defaults stay off so existing deployments are unaffected.
