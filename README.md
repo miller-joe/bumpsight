@@ -142,6 +142,7 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 | `BUMPSIGHT_OUTBOX_DIR` | `/var/lib/bumpsight/outbox` | Where every dispatched notification is archived as JSON (per-event + daily-digest). |
 | `BUMPSIGHT_OUTBOX_KEEP` | `200` | Most recent N outbox files retained; older ones unlinked on every write. |
 | `BUMPSIGHT_PRUNE_SCHEDULE` | (unset) | Opt-in deep prune interval — `24h`, `7d`, etc. When set, bumpsight runs `docker image prune --filter until=168h -af`, `docker volume prune -f`, and `docker builder prune -af` on that interval and logs total reclaimed bytes. Off by default. |
+| `BUMPSIGHT_WATCH_INTERVAL` | (scan interval) | Poll cadence for `watched_releases` — `6h`, `1d`, etc. Only used when `watched_releases` is configured. Defaults to `BUMPSIGHT_INTERVAL`. |
 
 ### `/config/bumpsight.yaml`
 
@@ -175,11 +176,28 @@ notify:
 # stacks_dir: /stacks       # override the auto-discovery root if needed
 # compose_files: []         # explicit allowlist; when set, bypasses auto-discovery
 public_url: https://bump.example.com
+
+# Optional (v0.5.7): watch non-Docker upstreams that ship as GitHub Releases —
+# a binary you pin by hand (git-lfs, a CLI), a tool in a build:-only container,
+# anything with no compose image: line for the scanner to see. Notify-only.
+# watch_interval: 1d                 # poll cadence (defaults to `interval`)
+# watched_releases:
+#   - repo: git-lfs/git-lfs          # owner/repo on GitHub (required)
+#     current: "3.7.0"               # the version you have installed (required)
+#     name: git-lfs                  # optional display label (defaults to repo name)
+#     policy: notify                 # notify (default) | none (disable this entry)
+#     include_prerelease: false      # optional; track pre-releases too
 ```
 
 The stack name is the **basename of the directory holding the compose file** — `/stacks/jellyfin/compose.yaml` → stack `jellyfin`.
 
 By default bumpsight scans every `<stacks_dir>/<name>/compose.{yaml,yml}` it finds. To opt a stack out, set its policy to `none`. Hidden directories (starting with `.`) are skipped automatically — that gives you a quick archive convention.
+
+### Watched releases (non-Docker upstreams)
+
+The scanner only sees Docker images referenced by an `image:` key in a discovered compose file. Versions that live anywhere else are invisible to it — a binary baked into a Dockerfile by a hardcoded version pin (`GIT_LFS_VERSION=3.7.0`), a tool installed into a `build:`-only container, a CLI you drop into `/usr/local/bin`. There's no registry tag for the scanner to compare, so those silently fall behind.
+
+`watched_releases` (v0.5.7, opt-in) covers them. Declare the upstream GitHub repo and the version you currently have installed; bumpsight polls GitHub Releases on `watch_interval` and emails when a newer release appears. It's **notify-only** — bumpsight can't install a host binary, so there are no Approve/Deny links. The email tells you what's new (with the usual LLM release-note summary when an LLM is configured) and reminds you to update the pin yourself, then bump `current:` for that entry. Each newer release fires exactly one email until you update `current` or a newer one lands. Set `policy: none` to silence an entry without removing it; pre-releases are ignored unless `include_prerelease: true`.
 
 ## Notification channels
 

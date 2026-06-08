@@ -2,6 +2,23 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.7 — 2026-06-08
+
+Watched releases — opt-in tracking of non-Docker upstreams. Bumpsight's scan loop only sees Docker images referenced by an `image:` key in a discovered compose file. Versions that live elsewhere — a binary baked into a Dockerfile by a hardcoded pin, a tool in a `build:`-only container — never produce a compose image tag, so the scanner is structurally blind to them. (This is exactly the gap that let a git-lfs 3.3.0 → 3.6.1 bump on a dev container go unflagged.) `watched_releases` closes it: declare the upstream GitHub repo + your installed version, and bumpsight polls GitHub Releases and emails when a newer one appears. **Notify-only** — bumpsight can't install a host binary, so there are no Approve/Deny links; the email tells you to update the pin yourself and bump `current:` afterward.
+
+### Added
+
+- **`watched_releases` config (`src/daemon/config.ts`).** A top-level list in `bumpsight.yaml`: each entry is `{ repo: "owner/repo", current: "<installed version>", name?, policy?: notify|none, include_prerelease?: bool }`. `buildWatchedReleases()` validates entries independently — a malformed one is logged and **skipped**, never fatal, so a typo in an opt-in extra can't take down the core image-watching daemon. Duplicate repos collapse to the first. Empty/absent by default (zero-config principle).
+- **`src/daemon/watched-releases.ts`** — `runWatchedReleasesOnce()` polls each repo via the existing `fetchReleases()` client, filters drafts (and pre-releases unless opted in), picks the newest release in the same version family as `current` via `findLatestInFamily()`, and emails when it's newer. Reuses `getAdviseSummary()` (with a `repo` override) for the upstream release-note LLM summary, and the existing notify + outbox layers (archive `kind: "watched-release"`). `startWatchedReleasesScheduler()` mirrors the deep-prune/digest schedulers (first run after a startup delay, then every `watch_interval`).
+- **`watched_releases` state table (`src/state/db.ts`).** Tracks `current` / `latest_seen` / `notified_tag` / `notified_at` / `checked_at` / `advise_text` per repo. `notified_tag` dedups so each newer release fires exactly one email until the operator updates `current` or a newer release lands. Helpers: `getWatchedReleaseState`, `recordWatchedCheck`, `recordWatchedNotified`. Created via `CREATE TABLE IF NOT EXISTS` — no migration needed.
+- **`watch_interval` config / `BUMPSIGHT_WATCH_INTERVAL` env.** Poll cadence (same duration syntax as `interval`); defaults to the scan interval. Wired through `--once` (single poll then exit) and the long-running daemon (scheduler + clean shutdown). New startup-log field `watched_releases=N repo(s) every <interval>` / `off`.
+
+### Notes
+
+- **Dedup contract matches the image path.** A row is only marked notified once the message actually delivered, so a transient SMTP failure leaves it eligible to re-fire next poll (same as `setNotified`). With no notifiers configured, delivery is a successful no-op and the row advances.
+- **Why notify-only.** Bumpsight holds the docker socket and rewrites compose files; it has no mechanism to install a host/container binary, and `patch/minor/major` auto-apply axes would be meaningless. The email's job is to surface the gap and point at the manual fix.
+- **Releases are slow + cheap to poll.** One GitHub API call per repo per `watch_interval`. A `GITHUB_TOKEN` (already forwarded by the daemon) lifts the anonymous 60/h limit to 5,000/h.
+
 ## 0.5.6 — 2026-06-07
 
 Failed applies are now non-destructive. Fixes a latent compose-drift bug: a single-service auto-apply whose `docker compose pull`/`up -d` step failed left the compose file rewritten to the new tag even though that image was never pulled. The stack kept running the old image, so the drift was invisible — until the next recreate/reboot, which then failed with `No such image`. (A failed apply against a bad/nonexistent target tag would poison *every* future recreate.) Surfaced when a homelab reboot tried to recreate stacks whose composes had been left pinned to never-pulled tags by earlier failed applies (onlyoffice 9.4.0.1; the original n8n 2.19.0 incident was the first sighting).

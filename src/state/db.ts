@@ -73,6 +73,23 @@ CREATE TABLE IF NOT EXISTS tag_digests (
   seen_at       INTEGER NOT NULL,
   PRIMARY KEY (image, tag)
 );
+
+-- v0.5.7: watched_releases — opt-in tracking of non-Docker upstreams that
+-- ship as GitHub Releases (e.g. a manually-pinned binary like git-lfs). These
+-- have no compose image: line, so the normal scan loop can't see them. The
+-- operator declares the installed version + the upstream repo; bumpsight polls
+-- GitHub Releases and emails (notify-only — it can't apply a host binary) when
+-- a newer release appears. notified_tag dedups so each newer release fires
+-- exactly one email until the operator updates current or a newer one lands.
+CREATE TABLE IF NOT EXISTS watched_releases (
+  repo          TEXT PRIMARY KEY,   -- "owner/repo" — the dedup/state key
+  current       TEXT NOT NULL,      -- operator-declared installed version
+  latest_seen   TEXT,              -- newest upstream release observed (informational)
+  notified_tag  TEXT,              -- upstream tag the last email was about (dedup)
+  notified_at   INTEGER,
+  checked_at    INTEGER,
+  advise_text   TEXT
+);
 `;
 
 /**
@@ -455,4 +472,66 @@ export function digest(db: DB, sinceMs: number): DigestStats {
     )
     .all(cutoff) as UpdateRow[];
   return { applied, pendingApproval, failed, recentApplies };
+}
+
+// ─── v0.5.7: watched-releases state ──────────────────────────────────────────
+
+export interface WatchedReleaseStateRow {
+  repo: string;
+  current: string;
+  latest_seen: string | null;
+  notified_tag: string | null;
+  notified_at: number | null;
+  checked_at: number | null;
+  advise_text: string | null;
+}
+
+export function getWatchedReleaseState(
+  db: DB,
+  repo: string,
+): WatchedReleaseStateRow | undefined {
+  return db
+    .prepare(`SELECT * FROM watched_releases WHERE repo = ?`)
+    .get(repo) as WatchedReleaseStateRow | undefined;
+}
+
+/**
+ * Record a poll result for a watched repo. Upserts the operator-declared
+ * `current` version and the newest release seen, plus the check timestamp.
+ * Deliberately leaves `notified_tag` / `notified_at` / `advise_text` alone —
+ * those are owned by {@link recordWatchedNotified} so a re-check between
+ * polls never clears the dedup marker.
+ */
+export function recordWatchedCheck(
+  db: DB,
+  repo: string,
+  current: string,
+  latestSeen: string | null,
+): void {
+  db.prepare(
+    `INSERT INTO watched_releases (repo, current, latest_seen, checked_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(repo) DO UPDATE SET
+       current = excluded.current,
+       latest_seen = excluded.latest_seen,
+       checked_at = excluded.checked_at`,
+  ).run(repo, current, latestSeen, Date.now());
+}
+
+/**
+ * Mark that a notification went out for `notifiedTag`. Called only after the
+ * email actually delivered, so a transient SMTP failure leaves the row eligible
+ * to re-fire on the next poll (same robustness contract as setNotified).
+ */
+export function recordWatchedNotified(
+  db: DB,
+  repo: string,
+  notifiedTag: string,
+  adviseText: string | null,
+): void {
+  db.prepare(
+    `UPDATE watched_releases
+       SET notified_tag = ?, notified_at = ?, advise_text = ?
+     WHERE repo = ?`,
+  ).run(notifiedTag, Date.now(), adviseText, repo);
 }

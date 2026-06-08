@@ -53,6 +53,35 @@ export interface DaemonConfig {
    *  automatically (those need operator judgment); only same-image tag bumps
    *  ride along with the parent. */
   applyPairedDeps: ApplyPairedDepsConfig;
+  /** v0.5.7: opt-in non-Docker upstreams to watch via GitHub Releases (e.g. a
+   *  manually-pinned binary like git-lfs that has no compose image: line).
+   *  Notify-only — bumpsight can't apply a host binary. Empty by default. */
+  watchedReleases: WatchedReleaseSpec[];
+  /** v0.5.7: how often the watched-releases poll runs. Milliseconds. Only used
+   *  when watchedReleases is non-empty. */
+  watchIntervalMs: number;
+}
+
+/**
+ * v0.5.7: a resolved watched-release entry. The operator declares the upstream
+ * GitHub repo and the version they currently have installed; bumpsight polls
+ * releases and emails (notify-only) when a newer one appears.
+ */
+export interface WatchedReleaseSpec {
+  /** "owner/repo" as written in config — the dedup/state key. */
+  repo: string;
+  owner: string;
+  repoName: string;
+  /** Display label in the email. Defaults to the repo name. */
+  name: string;
+  /** Operator-declared installed version (bare, e.g. "3.6.1"). */
+  current: string;
+  /** notify (default) emails on a newer release; none disables without
+   *  removing the entry. (No auto-apply — bumpsight can't install a host
+   *  binary, so patch/minor/major would be meaningless here.) */
+  policy: "notify" | "none";
+  /** When false (default), GitHub pre-releases are ignored. */
+  includePrerelease: boolean;
 }
 
 export interface ApplyPairedDepsConfig {
@@ -108,6 +137,24 @@ export interface FileConfigShape {
    *  boolean (default for every stack) or `{ default?: boolean, stacks?: {…} }`
    *  for per-stack control. Off when missing. */
   apply_paired_deps?: boolean | ApplyPairedDepsFileShape;
+  /** v0.5.7: opt-in non-Docker upstreams to watch via GitHub Releases. */
+  watched_releases?: WatchedReleaseFileShape[];
+  /** v0.5.7: poll cadence for watched_releases (same duration syntax as
+   *  `interval`). Defaults to the scan interval when unset. */
+  watch_interval?: string;
+}
+
+export interface WatchedReleaseFileShape {
+  /** "owner/repo" on GitHub. Required. */
+  repo?: string;
+  /** Installed version. Required. */
+  current?: string | number;
+  /** Display label. Defaults to the repo name. */
+  name?: string;
+  /** "notify" (default) or "none". */
+  policy?: string;
+  /** Track pre-releases too. Default false. */
+  include_prerelease?: boolean;
 }
 
 export interface ApplyPairedDepsFileShape {
@@ -304,4 +351,75 @@ export function isPairedDepBundlingEnabled(
     return cfg.stacks[stack]!;
   }
   return cfg.default;
+}
+
+/**
+ * v0.5.7: resolve the opt-in `watched_releases` list. Each entry is validated
+ * independently — a malformed one is logged and skipped rather than throwing,
+ * so a typo in an opt-in extra never takes down the core image-watching
+ * daemon. Duplicate repos collapse to the first (they'd share one state key).
+ */
+export function buildWatchedReleases(
+  fileShape: FileConfigShape,
+  log?: (msg: string) => void,
+): WatchedReleaseSpec[] {
+  const raw = fileShape.watched_releases;
+  if (!raw) return [];
+  if (!Array.isArray(raw)) {
+    log?.(`config.watched_releases: expected a list, ignoring`);
+    return [];
+  }
+  const out: WatchedReleaseSpec[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const where = `config.watched_releases[${i}]`;
+    const entry = raw[i];
+    if (!entry || typeof entry !== "object") {
+      log?.(`${where}: not a mapping, skipping`);
+      continue;
+    }
+    const repo = typeof entry.repo === "string" ? entry.repo.trim() : "";
+    const slash = repo.indexOf("/");
+    const owner = slash > 0 ? repo.slice(0, slash) : "";
+    const repoName = slash > 0 ? repo.slice(slash + 1) : "";
+    if (!owner || !repoName || repoName.includes("/")) {
+      log?.(`${where}: invalid repo "${repo}" (expected "owner/repo"), skipping`);
+      continue;
+    }
+    if (entry.current === undefined || entry.current === null) {
+      log?.(`${where} (${repo}): missing "current" version, skipping`);
+      continue;
+    }
+    const current = String(entry.current).trim();
+    if (!current) {
+      log?.(`${where} (${repo}): empty "current" version, skipping`);
+      continue;
+    }
+    const policyRaw =
+      typeof entry.policy === "string" ? entry.policy.trim().toLowerCase() : "notify";
+    if (policyRaw !== "notify" && policyRaw !== "none") {
+      log?.(
+        `${where} (${repo}): invalid policy "${entry.policy}" (expected notify | none), skipping`,
+      );
+      continue;
+    }
+    if (seen.has(repo)) {
+      log?.(`${where}: duplicate repo "${repo}", keeping the first entry`);
+      continue;
+    }
+    seen.add(repo);
+    out.push({
+      repo,
+      owner,
+      repoName,
+      name:
+        typeof entry.name === "string" && entry.name.trim()
+          ? entry.name.trim()
+          : repoName,
+      current,
+      policy: policyRaw,
+      includePrerelease: entry.include_prerelease === true,
+    });
+  }
+  return out;
 }

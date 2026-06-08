@@ -4,8 +4,13 @@ import { startDaemon, runScanOnce, buildComposeFileMap } from "../daemon/index.j
 import { startDigestScheduler } from "../daemon/digest.js";
 import { startDeepPruneScheduler } from "../daemon/deep-prune.js";
 import {
+  runWatchedReleasesOnce,
+  startWatchedReleasesScheduler,
+} from "../daemon/watched-releases.js";
+import {
   buildApplyPairedDepsConfig,
   buildRulesConfig,
+  buildWatchedReleases,
   loadConfigFile,
   type DaemonConfig,
 } from "../daemon/config.js";
@@ -143,6 +148,25 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     (msg) => process.stderr.write(`bumpsight daemon: ${msg}\n`),
   );
 
+  // v0.5.7: opt-in non-Docker upstreams watched via GitHub Releases. Empty by
+  // default — malformed entries are warned + skipped, never fatal.
+  const watchedReleases = buildWatchedReleases(fileShape, (msg) =>
+    process.stderr.write(`bumpsight daemon: ${msg}\n`),
+  );
+  const watchIntervalRaw =
+    process.env.BUMPSIGHT_WATCH_INTERVAL ?? fileShape.watch_interval ?? intervalRaw;
+  let watchIntervalMs = intervalMs;
+  if (watchIntervalRaw !== intervalRaw) {
+    try {
+      watchIntervalMs = parseDuration(watchIntervalRaw);
+    } catch (err) {
+      process.stderr.write(
+        `bumpsight daemon: invalid BUMPSIGHT_WATCH_INTERVAL "${watchIntervalRaw}": ${(err as Error).message}\n`,
+      );
+      return 2;
+    }
+  }
+
   const cfg: DaemonConfig = {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
@@ -162,6 +186,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     digestHour,
     pruneIntervalMs,
     applyPairedDeps,
+    watchedReleases,
+    watchIntervalMs,
   };
 
   const db = openDb({ path: cfg.dbPath });
@@ -185,7 +211,8 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       `advise=${cfg.llmUrl ? `on @ ${cfg.llmUrl} (${cfg.llmModel ?? "default-model"})` : "off"}, ` +
       `digest=${cfg.digestHour < 0 ? "off" : `${String(cfg.digestHour).padStart(2, "0")}:00 local`}, ` +
       `prune=${cfg.pruneIntervalMs > 0 ? `every ${pruneScheduleRaw}` : "off"}, ` +
-      `bundle_paired_deps=${describeBundling(cfg.applyPairedDeps)}`,
+      `bundle_paired_deps=${describeBundling(cfg.applyPairedDeps)}, ` +
+      `watched_releases=${cfg.watchedReleases.length > 0 ? `${cfg.watchedReleases.length} repo(s) every ${watchIntervalRaw}` : "off"}`,
   );
 
   if (opts.once) {
@@ -209,6 +236,27 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     );
     for (const [k, v] of Object.entries(result.errors)) {
       log(`scan-error: ${k}: ${v}`);
+    }
+    if (cfg.watchedReleases.length > 0) {
+      const watch = await runWatchedReleasesOnce({
+        db,
+        specs: cfg.watchedReleases,
+        notifiers,
+        llmUrl: cfg.llmUrl,
+        llmKey: cfg.llmKey,
+        llmModel: cfg.llmModel,
+        githubToken: cfg.githubToken,
+        notifyIntervalMs: cfg.notifyIntervalMs,
+        outboxDir: cfg.outboxDir,
+        outboxKeepCount: cfg.outboxKeepCount,
+        log,
+      });
+      log(
+        `watch: ${watch.checked} repo(s), ${watch.behind} behind, ${watch.notified} notified`,
+      );
+      for (const [repo, err] of Object.entries(watch.errors)) {
+        log(`watch-error: ${repo}: ${err}`);
+      }
     }
     db.close();
     return 0;
@@ -266,11 +314,30 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
         })
       : null;
 
+  const watchRuntime =
+    cfg.watchedReleases.length > 0
+      ? startWatchedReleasesScheduler({
+          db,
+          specs: cfg.watchedReleases,
+          notifiers,
+          llmUrl: cfg.llmUrl,
+          llmKey: cfg.llmKey,
+          llmModel: cfg.llmModel,
+          githubToken: cfg.githubToken,
+          notifyIntervalMs: cfg.notifyIntervalMs,
+          outboxDir: cfg.outboxDir,
+          outboxKeepCount: cfg.outboxKeepCount,
+          intervalMs: cfg.watchIntervalMs,
+          log,
+        })
+      : null;
+
   const shutdown = async (signal: string) => {
     log(`received ${signal}, draining…`);
     await runtime.stop();
     if (digestRuntime) await digestRuntime.stop();
     if (pruneRuntime) await pruneRuntime.stop();
+    if (watchRuntime) await watchRuntime.stop();
     await httpHandle.stop();
     db.close();
     process.exit(0);
