@@ -218,6 +218,7 @@ When a scan finds a new tag in the same family, bumpsight:
 1. **Classifies** the bump as `patch` / `minor` / `major` / `unknown` against the previous tag.
 2. **Decides** based on the policy for that stack (or the default).
 3. **Auto-apply path:** rewrites the compose file to swap only the tag (preserving comments, formatting, other services), then runs `docker compose -f <file> pull <service>` followed by `... up -d <service>` against the host's Docker socket. The combined log is stored in the SQLite state.
+    - **Failure is non-destructive (v0.5.6+):** if the `pull`/`up -d` step fails, bumpsight rolls the compose file back to its pre-apply tag and marks the row `failed`. A failed apply never leaves the compose pinned to a tag that wasn't successfully pulled — that drift would be invisible until the next `up`/reboot, and a bad target tag would otherwise poison every future recreate. The stack stays on its last-known-good image; re-triggering the bump re-applies cleanly. (Before v0.5.6 only paired-dep *bundled* applies rolled back; a plain single-service bump left the rewrite in place.)
 4. **Hold path:** sends an HTML email with the action card at top — instruction + styled Approve / Deny buttons — followed by metadata and the LLM release-note summary.
     - `https://your-bump-url/approve/<token>` — when clicked, marks the row approved and runs the same apply path as above.
     - `https://your-bump-url/deny/<token>` — marks the row denied. bumpsight will not re-prompt for this exact bump.

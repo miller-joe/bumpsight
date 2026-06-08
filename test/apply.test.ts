@@ -219,6 +219,11 @@ describe("applyOne", () => {
 
     expect(after.status).toBe("failed");
     expect(after.apply_log).toContain("boom");
+    // v0.5.6: a failed docker step must roll the compose back to its pre-apply
+    // tag — never leave it pinned to a tag that wasn't successfully pulled.
+    const onDisk = readFileSync(file, "utf-8");
+    expect(onDisk).toContain("nginx:1.27");
+    expect(onDisk).not.toContain("nginx:1.28");
     rmSync(file, { force: true });
   });
 

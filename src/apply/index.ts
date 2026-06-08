@@ -64,7 +64,12 @@ export async function applyOne(
   const plan: BundlePlanResult = bundling
     ? buildBundlePlan(composePath, parsePairedDepsJson(row.paired_deps_json))
     : { rewrites: [], skipped: [] };
-  const composeSnapshot = bundling ? readFileSync(composePath, "utf-8") : null;
+  // Snapshot the compose before ANY rewrite so a failed apply (a rewrite drift
+  // OR a failed docker pull/up) can be rolled back. A failed apply must never
+  // leave the compose pinning a tag that wasn't successfully pulled — that drift
+  // is invisible until the next recreate/reboot, and a bad target poisons every
+  // future recreate. Moving-tag applies don't rewrite, so they need no snapshot.
+  const composeSnapshot = !isMovingApply ? readFileSync(composePath, "utf-8") : null;
   const restoreSnapshot = () => {
     if (composeSnapshot !== null) {
       writeFileSync(composePath, composeSnapshot, "utf-8");
@@ -125,11 +130,14 @@ export async function applyOne(
     runner: deps.runner,
   });
 
-  // If docker failed AND we bundled rewrites, roll the compose back so the
-  // operator's next apply isn't fighting half-rewritten pins. Without
-  // bundling we leave the rewrite in place (current behavior — operator can
-  // re-trigger after fixing the docker-side problem).
-  if (!result.ok && plan.rewrites.length > 0) {
+  // On ANY docker failure, roll the compose back to its pre-apply state. A
+  // failed apply must leave the stack on its last-known-good (pulled, running)
+  // image — never pinned to a tag that wasn't successfully pulled, which would
+  // otherwise detonate on the next recreate/reboot. The row is still marked
+  // `failed` and notified; a re-trigger re-applies cleanly from the restored
+  // tag. (Before v0.5.6 only bundled applies rolled back; a plain single-service
+  // bump left the rewrite in place and silently drifted the compose.)
+  if (!result.ok) {
     restoreSnapshot();
   }
 

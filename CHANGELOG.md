@@ -2,6 +2,14 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.6 — 2026-06-07
+
+Failed applies are now non-destructive. Fixes a latent compose-drift bug: a single-service auto-apply whose `docker compose pull`/`up -d` step failed left the compose file rewritten to the new tag even though that image was never pulled. The stack kept running the old image, so the drift was invisible — until the next recreate/reboot, which then failed with `No such image`. (A failed apply against a bad/nonexistent target tag would poison *every* future recreate.) Surfaced when a homelab reboot tried to recreate stacks whose composes had been left pinned to never-pulled tags by earlier failed applies (onlyoffice 9.4.0.1; the original n8n 2.19.0 incident was the first sighting).
+
+### Fixed
+
+- **`src/apply/index.ts` — roll the compose back on any docker failure, not just bundled applies.** The pre-apply compose snapshot is now taken for every non-moving apply (previously only when paired-dep bundling was active), and `restoreSnapshot()` runs whenever `pullAndUp` fails (previously only when `plan.rewrites.length > 0`). A failed apply now always leaves the compose on its last-known-good, pulled, running tag; the row is still marked `failed` and the completion notification still fires, and re-triggering re-applies cleanly. Moving-tag applies are unaffected (they never rewrite). Regression test added in `test/apply.test.ts` asserting the compose is restored to the original tag after a failed docker step.
+
 ## 0.5.5 — 2026-05-12
 
 Digest-bump enrichment via OCI labels. Digest-class bumps (moving tags like `:latest` where bumpsight can't resolve the change to a semver pair) used to land in the daily digest as bare `digest sha256:abc… → sha256:def…` lines with no context. v0.5.5 decodes that pair into a real upstream commit range and produces an LLM summary of what changed.
