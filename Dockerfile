@@ -26,7 +26,9 @@ FROM node:20-alpine AS runtime
 # tzdata so $TZ is honored — the v0.4.3 daily-digest scheduler uses local
 # wall-clock hour for its fire decision, and without tzdata Alpine treats
 # any TZ as UTC.
-RUN apk add --no-cache docker-cli docker-cli-compose tini tzdata
+# git: optional, for BUMPSIGHT_GIT_COMMIT — commits the rewritten compose when
+# the target stack dir is a git working copy. No-op when the feature is off.
+RUN apk add --no-cache docker-cli docker-cli-compose tini tzdata git
 
 ENV NODE_ENV=production
 WORKDIR /app

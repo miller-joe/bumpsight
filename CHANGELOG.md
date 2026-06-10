@@ -2,6 +2,20 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.5.8 — 2026-06-09
+
+Commit-on-apply — when a target stack directory is a git working copy, an auto- or approved bump commits the rewritten compose file so the change lands as a tracked commit instead of leaving the tree dirty. Opt-in (`BUMPSIGHT_GIT_COMMIT`, default off) so it never touches git in deployments that don't keep their stacks under version control. (Pairs with the homelab move to check out each `infra/<stack>` repo directly at its live deploy dir.)
+
+### Added
+
+- **`src/apply/git.ts` — `commitComposeChange()`.** Best-effort: stages and commits the rewritten compose file when its parent dir is a git working copy. Auto-detects via `rev-parse --is-inside-work-tree`; a non-repo is a silent no-op. Skips empty commits (nothing staged). Passes `-c safe.directory=*` on every call so the root-running container can operate on stack dirs owned by an unprivileged uid. Commit author comes from the repo's own git config — bumpsight imposes none. Optional `git push` (`BUMPSIGHT_GIT_PUSH`, default off); a push failure is logged, never fatal.
+- **`applyOne` wiring (`src/apply/index.ts`).** After a successful, tag-rewriting apply (moving-tag applies don't touch the file), commits the bump with message `<stack>: bump <service> <from> -> <to>` (paired-dep bumps appended). Mirrors the prune step — a git failure is logged but never fails the apply. Gated by `gitCommit`/`gitPush` deps, falling back to the env flags.
+- **`git` added to the runtime image.** No-op when the feature is off.
+
+### Tests
+
+- `test/apply-git.test.ts` (5) — commits a staged change; skips non-repos silently; no empty commit when nothing staged; best-effort on commit failure; pushes when opted in.
+
 ## 0.5.7 — 2026-06-08
 
 Watched releases — opt-in tracking of non-Docker upstreams. Bumpsight's scan loop only sees Docker images referenced by an `image:` key in a discovered compose file. Versions that live elsewhere — a binary baked into a Dockerfile by a hardcoded pin, a tool in a `build:`-only container — never produce a compose image tag, so the scanner is structurally blind to them. (This is exactly the gap that let a git-lfs 3.3.0 → 3.6.1 bump on a dev container go unflagged.) `watched_releases` closes it: declare the upstream GitHub repo + your installed version, and bumpsight polls GitHub Releases and emails when a newer one appears. **Notify-only** — bumpsight can't install a host binary, so there are no Approve/Deny links; the email tells you to update the pin yourself and bump `current:` afterward.

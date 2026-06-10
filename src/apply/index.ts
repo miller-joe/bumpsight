@@ -4,6 +4,7 @@ import { findUpdate, setApplied, type UpdateRow } from "../state/db.js";
 import { rewriteImageTag } from "./compose.js";
 import { pullAndUp, type CommandRunner } from "./docker.js";
 import { pruneOldImage, stripTagFromRef } from "./prune.js";
+import { commitComposeChange } from "./git.js";
 import {
   buildBundlePlan,
   formatBundleLog,
@@ -23,6 +24,14 @@ export interface ApplyDeps {
    *  pins alongside the primary pin using the recommendations captured at
    *  hold time. Default false. */
   bundlePairedDeps?: boolean;
+  /** When true, commit the rewritten compose file if its stack dir is a git
+   *  working copy (so auto-bumps land as tracked commits instead of leaving
+   *  the tree dirty). Opt-in; falls back to the BUMPSIGHT_GIT_COMMIT env flag.
+   *  Best-effort — a git failure never fails the apply. Default false. */
+  gitCommit?: boolean;
+  /** When true (and gitCommit is on), also `git push` after committing.
+   *  Falls back to BUMPSIGHT_GIT_PUSH. Default false. */
+  gitPush?: boolean;
 }
 
 /**
@@ -163,6 +172,38 @@ export async function applyOne(
       log += `\n==== ${prune.log} ====`;
     } catch (err) {
       log += `\n==== prune: skipped (${(err as Error).message}) ====`;
+    }
+  }
+
+  // Commit the rewritten compose when the stack dir is a git working copy and
+  // the feature is enabled. Best-effort, opt-in — only on a successful apply
+  // that actually rewrote a tag (moving-tag applies don't touch the file).
+  // Mirrors prune: a git failure is logged but never fails the apply.
+  const gitCommit =
+    deps.gitCommit ??
+    (process.env.BUMPSIGHT_GIT_COMMIT === "true" ||
+      process.env.BUMPSIGHT_GIT_COMMIT === "1");
+  if (result.ok && !isMovingApply && gitCommit) {
+    try {
+      const depBumps = plan.rewrites.map(
+        (r) => `${r.serviceName} ${r.currentTag}->${r.newTag}`,
+      );
+      const message =
+        `${row.stack}: bump ${row.service} ${row.current_tag} -> ${row.target_tag}` +
+        (depBumps.length ? ` (+${depBumps.join(", ")})` : "");
+      const gitPush =
+        deps.gitPush ??
+        (process.env.BUMPSIGHT_GIT_PUSH === "true" ||
+          process.env.BUMPSIGHT_GIT_PUSH === "1");
+      const c = await commitComposeChange({
+        composePath,
+        message,
+        push: gitPush,
+        runner: deps.runner,
+      });
+      if (c.log) log += `\n==== ${c.log} ====`;
+    } catch (err) {
+      log += `\n==== git: skipped (${(err as Error).message}) ====`;
     }
   }
 
