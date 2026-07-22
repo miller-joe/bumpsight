@@ -20,7 +20,9 @@ jobs:
           registry-url: https://registry.npmjs.org/
           cache: npm
       # OIDC trusted publishing requires npm >= 11.5.1; node 20 ships npm 10.x.
-      - run: npm install -g npm@latest
+      # Pin to npm 11 (not @latest): npm 12+ requires Node >= 22, which would
+      # fail this Node-20 job. npm 11.x supports OIDC and runs on Node 20.17+.
+      - run: npm install -g npm@11
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
