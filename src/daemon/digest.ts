@@ -11,6 +11,8 @@ import { buildDigestEmail } from "../notify/digest.js";
 import { archiveMessage } from "../notify/outbox.js";
 import { notifyAll } from "../notify/index.js";
 import type { Notifier } from "../notify/types.js";
+import { isDependencyImage } from "./rules.js";
+import { parseImageRef } from "../compose/parse.js";
 
 /**
  * v0.4.3 daily-digest scheduler.
@@ -98,9 +100,13 @@ export async function runDigestOnce(
   // section they'd be email-invisible. Non-digest held rows only — digest-class
   // held rows are already covered by `suppressed`. These are NOT marked
   // digested (they persist as `notified` until the operator acts).
-  const needsDecision = listNeedsDecision(deps.db, nowMs).filter(
-    (r) => r.bump !== "digest",
-  );
+  const needsDecision = listNeedsDecision(deps.db, nowMs).filter((r) => {
+    if (r.bump === "digest") return false;
+    // v0.6.0: dependencies stay quiet in email (the dependency special case) —
+    // they're surfaced in the GUI for individual review, not the digest nudge.
+    const ref = parseImageRef(r.image);
+    return !isDependencyImage(ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name);
+  });
   if (rows.length === 0 && needsDecision.length === 0) {
     deps.log("digest: nothing to report — skipping send");
     return false;

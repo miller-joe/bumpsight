@@ -144,9 +144,10 @@ describe("runScanOnce", () => {
   });
 
   it("dedups: one notification covers multiple stacks running the same image", async () => {
-    const a = makeStack("vault-a", "hashicorp/vault:1.21.0");
-    const b = makeStack("vault-b", "hashicorp/vault:1.21.0");
-    const c = makeStack("vault-c", "hashicorp/vault:1.21.0");
+    // Use a non-dependency app image — deps are surfaced GUI-only (no email).
+    const a = makeStack("grafana-a", "grafana/grafana:1.21.0");
+    const b = makeStack("grafana-b", "grafana/grafana:1.21.0");
+    const c = makeStack("grafana-c", "grafana/grafana:1.21.0");
     const db = openDb({ path: ":memory:" });
     const sent: NotifyMessage[] = [];
     const notifier: Notifier = {
@@ -246,9 +247,10 @@ describe("runScanOnce", () => {
     rmSync(b.file, { force: true });
   });
 
-  it("under split policy with deps='none': dep image is silently skipped while app proceeds", async () => {
-    // app=notify still asks; deps=none silently skips. Build a multi-service
-    // stack where one is the app and one is a known dep image.
+  it("under split policy with deps='none': dep is surfaced in the GUI but stays out of email", async () => {
+    // v0.6.0 dependency special case: app=notify emails; deps=none no longer
+    // hides the dep — it's recorded + notified (GUI-visible for individual
+    // review) but never emailed.
     const dir = mkdtempSync(join(tmpdir(), "bumpsight-split-"));
     const file = join(dir, "compose.yaml");
     writeFileSync(
@@ -279,11 +281,16 @@ describe("runScanOnce", () => {
       listTagsFn: fakeListTags as never,
     });
 
-    // Only the app got an ask email; postgres was skipped silently.
-    expect(result.held).toBe(1);
+    // Both are held; the app emailed, postgres did NOT email but IS recorded.
+    expect(result.held).toBe(2);
     expect(sent).toHaveLength(1);
     expect(sent[0]!.body).toContain("outline");
     expect(sent[0]!.body).not.toContain("postgres");
+    // postgres (the dep) is surfaced in the GUI as a notified row.
+    const { listByStatus: list } = await import("../src/state/db.js");
+    const notified = list(db, "notified");
+    expect(notified.some((r) => r.image.includes("postgres"))).toBe(true);
+    expect(notified.some((r) => r.image.includes("outline"))).toBe(true);
 
     rmSync(file, { force: true });
   });
@@ -754,23 +761,22 @@ describe("buildComposeFileMap", () => {
 });
 
 describe("v0.6.0 reconcile + mute", () => {
-  it("reconcileOpenRows dismisses skips, requeues (deletes) auto-applies, keeps holds", () => {
+  it("reconcileOpenRows requeues auto-applies, keeps holds, and never touches deps", () => {
     const db = openDb({ path: ":memory:" });
     const rules = { default: { app: "minor" as const, dependencies: "none" as const }, stacks: {} };
     // app major → hold (kept)
     const major = recordUpdate(db, { stack: "outline", service: "outline", image: "outlinewiki/outline:1", currentTag: "1.0.0", targetTag: "2.0.0", bump: "major" });
     // app minor → auto-apply → deleted so the scan re-applies the current delta
     const minor = recordUpdate(db, { stack: "grafana", service: "grafana", image: "grafana/grafana:1", currentTag: "10.0.0", targetTag: "10.1.0", bump: "minor" });
-    // dep major → skip under deps:none → dismissed (kept in history)
+    // dep major → NEVER reconciled (dependency special case — stays in the GUI)
     const dep = recordUpdate(db, { stack: "outline", service: "pg", image: "postgres:16", currentTag: "16", targetTag: "17", bump: "major" });
     for (const id of [major, minor, dep]) db.prepare("UPDATE updates SET status='notified' WHERE id=?").run(id);
 
     const rec = reconcileOpenRows(db, rules);
-    expect(rec).toEqual({ dismissed: 1, requeued: 1 });
+    expect(rec).toEqual({ dismissed: 0, requeued: 1 });
     expect(findUpdate(db, major)!.superseded).toBeNull();       // held stays
     expect(findUpdate(db, minor)).toBeUndefined();              // auto-apply → deleted (scan re-applies)
-    expect(findUpdate(db, dep)!.superseded).toBe(1);
-    expect(findUpdate(db, dep)!.dismiss_reason).toBe("skip");
+    expect(findUpdate(db, dep)!.superseded).toBeNull();         // dep left alone, still visible
   });
 
   it("a muted service is skipped by the scan (no new rows surface)", async () => {

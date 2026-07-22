@@ -218,6 +218,15 @@ Browse to the HTTP port (default `9100`) for the dashboard — the primary surfa
 - **Recent activity** — a timeline of what was applied, failed, or denied.
 - **Per-stack policy** — see each stack's effective `app` / `dependencies` policy and its source (default / config / UI override), and change it inline. Overrides are stored in state (not by editing your `bumpsight.yaml`) and take effect on the next scan.
 
+### Dependencies are a documented special case
+
+Databases, caches, and brokers (Postgres, Redis, MariaDB, MySQL, Valkey, RabbitMQ, …) get different treatment from app images, on purpose:
+
+- **They never auto-apply and never email.** A Postgres 15→18 or MySQL 8→9 is an on-disk format change — you don't upgrade the database independently, you wait for the parent app to declare support and follow *its* migration. Upgrading it yourself risks a corrupt data volume. So `dependencies: none` keeps them **quiet in email** (this is the same "skip" behaviour as before).
+- **But they're still reachable in the GUI.** Rather than vanishing silently, dependency updates collect in a collapsed **"⚠ Dependency updates held back"** section on the dashboard, each with a `⚠ DEPENDENCY` badge. You get a **path to update one** ("Update anyway", behind a confirm) if you know the app supports it, or to **ignore it** — without cluttering your real app-decision queue and without bumpsight ever nudging you to do the risky thing.
+
+This split — *silent in email, visible-but-quarantined in the GUI* — is the intended behaviour. Set `dependencies: minor` if you do want dep patch/minor to auto-apply (major always holds).
+
 Actions are token-addressed and POST over a same-origin JSON request (CSRF-guarded). The server is unauthenticated by default — fine behind a LAN/Tailscale boundary. To require a key, set `BUMPSIGHT_UI_TOKEN`; the dashboard then prompts for it (`?key=…`) and POST actions require it. The email `GET /approve/:token` and `/deny/:token` links keep working regardless.
 
 ## Notification channels

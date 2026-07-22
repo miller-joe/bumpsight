@@ -258,7 +258,9 @@ export async function runScanOnce(
           ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
         );
         const decision = decideAction(deps.rules, stack, bump, isDep);
-        if (decision === "skip") {
+        // v0.6.0: dependency bumps are always surfaced in the GUI (see the
+        // semver-path note). Only a non-dependency skip stays invisible.
+        if (decision === "skip" && !isDep) {
           // Still advance stored digest so we don't refire on every scan.
           saveDigest(
             deps.db,
@@ -382,6 +384,10 @@ export async function runScanOnce(
               ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
               : undefined,
           );
+        } else if (isDep) {
+          // Dependency held → GUI-visible, never emailed.
+          result.held += 1;
+          setNotified(deps.db, row.id);
         } else {
           result.held += 1;
           heldRows.push({ row, composePath, serviceName });
@@ -401,7 +407,11 @@ export async function runScanOnce(
         ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
       );
       const decision = decideAction(deps.rules, stack, bump, isDep);
-      if (decision === "skip") continue;
+      // v0.6.0 dependency special case: dependency bumps are ALWAYS surfaced in
+      // the GUI for individual review/ignore, but stay out of email. So
+      // `deps: none` means "quiet + never auto-apply", not "invisible". A
+      // non-dependency `app: none` stays hidden as before.
+      if (decision === "skip" && !isDep) continue;
 
       // v0.6.0: every discovered row gets a token (see the digest-path note
       // above) — the dashboard is now token-addressed for all actions.
@@ -459,6 +469,11 @@ export async function runScanOnce(
             ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
             : undefined,
         );
+      } else if (isDep) {
+        // Dependency held → GUI-visible for individual review, never emailed
+        // (not added to heldRows, so it skips the email dispatch entirely).
+        result.held += 1;
+        setNotified(deps.db, row.id);
       } else {
         result.held += 1;
         heldRows.push({ row, composePath, serviceName });
@@ -1260,6 +1275,9 @@ export function reconcileOpenRows(
     const isDep = isDependencyImage(
       ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
     );
+    // v0.6.0: dependencies are always kept in the GUI for individual review —
+    // never reconciled away (that's the documented dependency special case).
+    if (isDep) continue;
     const decision = decideAction(rules, r.stack, r.bump as BumpKind, isDep);
     if (decision === "skip") {
       dismissRow(db, r.id, "skip");

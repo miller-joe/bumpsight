@@ -291,6 +291,27 @@ describe("HTTP server", () => {
     );
   });
 
+  it("dashboard quarantines dependencies into a warning-labelled section", async () => {
+    const db = openDb({ path: ":memory:" });
+    // an app (grafana) and a dependency (postgres), both held/notified
+    recordUpdate(db, { stack: "app", service: "grafana", image: "grafana/grafana:10", currentTag: "10.0.0", targetTag: "10.1.0", bump: "minor", approvalToken: "tok-app" });
+    recordUpdate(db, { stack: "app", service: "pg", image: "postgres:16", currentTag: "16", targetTag: "17", bump: "major", approvalToken: "tok-dep" });
+    db.prepare("UPDATE updates SET status='notified', notified_at=?").run(Date.now());
+    await withServer(
+      () => startHttpServer({ db, composeFiles: {}, port: 0 }),
+      async (port) => {
+        const body = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+        expect(body).toContain("Dependency updates held back");
+        expect(body).toContain("⚠ DEPENDENCY");
+        expect(body).toContain("Update anyway"); // the path to update a dep
+        // the dep card and app card both render, but the dep is in the collapsed section
+        const main = body.split('<details class="deps-section"')[0];
+        expect(main).toContain("bsAct('tok-app','approve')"); // app in main queue
+        expect(main).not.toContain("bsAct('tok-dep','approve')"); // dep NOT in main queue
+      },
+    );
+  });
+
   it("POST /api/stacks/:stack/policy persists an override", async () => {
     const db = openDb({ path: ":memory:" });
     await withServer(

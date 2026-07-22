@@ -20,7 +20,12 @@ import {
   SNOOZE_FOREVER,
   type UpdateRow,
 } from "../state/db.js";
-import { applyStackPolicyOverrides, type RulesConfig } from "../daemon/rules.js";
+import {
+  applyStackPolicyOverrides,
+  isDependencyImage,
+  type RulesConfig,
+} from "../daemon/rules.js";
+import { parseImageRef } from "../compose/parse.js";
 import { fromDisplay, toDisplay } from "../util/display.js";
 import { parseDuration } from "../util/duration.js";
 import { applyOne } from "../apply/index.js";
@@ -640,21 +645,35 @@ function adviseBlock(row: UpdateRow): string {
   return `<details class="advise"><summary>release-note summary</summary><pre>${escapeHtml(row.advise_text)}</pre></details>`;
 }
 
-function decisionCard(row: UpdateRow): string {
+/** v0.6.0: is this row a known dependency image (DB / cache / broker / …)? */
+function isDepRow(row: UpdateRow): boolean {
+  const ref = parseImageRef(row.image);
+  return isDependencyImage(
+    ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+  );
+}
+
+function decisionCard(row: UpdateRow, isDep = false): string {
   const t = escapeHtml(row.approval_token ?? "");
-  return `<div class="card" data-row data-stack="${escapeHtml(row.stack)}" data-bump="${escapeHtml(row.bump)}" data-search="${escapeHtml(`${row.stack} ${row.service} ${row.image}`.toLowerCase())}">
+  const depTag = isDep
+    ? `<span class="badge b-dep" title="This is a database/cache/broker. Upgrading it independently of its parent app risks on-disk format breaks — usually you wait for the app to bump it.">⚠ DEPENDENCY</span>`
+    : "";
+  const applyLabel = isDep ? "Update anyway" : "Approve &amp; apply";
+  const applyConfirm = isDep
+    ? `if(confirm('This is a DEPENDENCY (${escapeHtml(row.image)}). Upgrading a database/cache independently of its app can corrupt data. Update anyway?'))bsAct('${t}','approve')`
+    : `bsAct('${t}','approve')`;
+  return `<div class="card${isDep ? " card-dep" : ""}" data-row data-stack="${escapeHtml(row.stack)}" data-bump="${escapeHtml(row.bump)}" data-search="${escapeHtml(`${row.stack} ${row.service} ${row.image}`.toLowerCase())}">
     <div class="card-head">
-      <div class="card-title"><strong>${escapeHtml(row.stack)}</strong> <span class="muted">/ ${escapeHtml(row.service)}</span> ${bumpBadge(row.bump)}</div>
+      <div class="card-title"><strong>${escapeHtml(row.stack)}</strong> <span class="muted">/ ${escapeHtml(row.service)}</span> ${bumpBadge(row.bump)} ${depTag}</div>
       <div class="muted small">${escapeHtml(row.image)}</div>
     </div>
     <div class="card-delta">${delta(row)}</div>
     ${adviseBlock(row)}
     <div class="actions">
-      <button class="btn btn-green" onclick="bsAct('${t}','approve')">Approve &amp; apply</button>
+      <button class="btn ${isDep ? "btn-amber" : "btn-green"}" onclick="${applyConfirm}">${applyLabel}</button>
       <button class="btn btn-slate" onclick="bsAct('${t}','deny')" title="Reject this version; a newer one can still surface">Deny</button>
-      <button class="btn btn-ghost" onclick="bsSnooze('${t}',{duration:'1d'})">Snooze 1d</button>
-      <button class="btn btn-ghost" onclick="bsSnooze('${t}',{duration:'7d'})">7d</button>
-      <button class="btn btn-ghost" onclick="if(confirm('Mute this app? You will stop seeing all updates for it until you un-mute.'))bsAct('${t}','mute')" title="Stop surfacing any updates for this app">Mute app</button>
+      <button class="btn btn-ghost" onclick="bsSnooze('${t}',{duration:'7d'})">Snooze</button>
+      <button class="btn btn-ghost" onclick="if(confirm('Mute this app? You will stop seeing all updates for it until you un-mute.'))bsAct('${t}','mute')" title="Stop surfacing any updates for this app">${isDep ? "Ignore this dep" : "Mute app"}</button>
     </div>
   </div>`;
 }
@@ -813,10 +832,26 @@ function dashboardPage(deps: HttpServerDeps): string {
   );
   const all = listAllUpdates(deps.db);
 
+  // v0.6.0: dependencies are kept OUT of the main decision queue (you generally
+  // don't upgrade a DB/cache independently of its parent app) but remain
+  // reachable in a collapsed, warning-labelled section so there's a path to
+  // update one when you decide to.
+  const appNeeds = needs.filter((r) => !isDepRow(r));
+  const depNeeds = needs.filter((r) => isDepRow(r));
+
   const needsHtml =
-    needs.length > 0
-      ? needs.map(decisionCard).join("")
+    appNeeds.length > 0
+      ? appNeeds.map((r) => decisionCard(r, false)).join("")
       : `<p class="muted">Nothing waiting on you. 🎉</p>`;
+
+  const depsHtml =
+    depNeeds.length > 0
+      ? `<details class="deps-section">
+          <summary>⚠ Dependency updates held back <span class="count count-amber">${depNeeds.length}</span></summary>
+          <p class="muted small" style="margin:8px 0 12px;">These are databases / caches / brokers. bumpsight holds them back because you normally wait for the parent app to bump its own dependency — upgrading independently risks on-disk format breaks. Update one only if you know the app supports it.</p>
+          <div class="cards">${depNeeds.map((r) => decisionCard(r, true)).join("")}</div>
+        </details>`
+      : "";
 
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -833,8 +868,9 @@ function dashboardPage(deps: HttpServerDeps): string {
 </header>
 <main>
   <section>
-    <h2>Needs decision <span class="count">${needs.length}</span></h2>
+    <h2>Needs decision <span class="count">${appNeeds.length}</span></h2>
     <div class="cards">${needsHtml}</div>
+    ${depsHtml}
     ${snoozedSection(all, now)}
     ${mutedAppsSection(deps)}
   </section>
@@ -889,7 +925,15 @@ h2{font-size:15px;margin:0 0 12px;display:flex;align-items:center;gap:8px}
 .btn-green{background:#16a34a;color:#fff;border-color:#16a34a}
 .btn-blue{background:var(--accent);color:#fff;border-color:var(--accent)}
 .btn-slate{background:#475569;color:#fff;border-color:#475569}
+.btn-amber{background:#b45309;color:#fff;border-color:#b45309}
 .btn-ghost{background:transparent}
+.b-dep{background:#fef3c7;color:#92400e;border:1px solid #f59e0b;font-weight:700;letter-spacing:.03em}
+@media (prefers-color-scheme:dark){.b-dep{background:#78350f;color:#fde68a;border-color:#f59e0b}}
+.card-dep{border-color:#f59e0b}
+.count-amber{background:#b45309}
+details.deps-section{margin-top:16px;background:var(--card);border:1px solid #f59e0b;border-radius:10px;padding:8px 14px}
+details.deps-section>summary{cursor:pointer;padding:6px 0;font-size:14px;font-weight:600;color:#b45309}
+@media (prefers-color-scheme:dark){details.deps-section>summary{color:#fbbf24}}
 .badge{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:999px;vertical-align:middle}
 .b-green{background:#dcfce7;color:#14532d}.b-red{background:#fee2e2;color:#7f1d1d}.b-blue{background:#dbeafe;color:#1e3a8a}.b-amber{background:#fef3c7;color:#92400e}.b-slate{background:#e2e8f0;color:#334155}
 @media (prefers-color-scheme:dark){.b-green{background:#14532d;color:#bbf7d0}.b-red{background:#7f1d1d;color:#fecaca}.b-blue{background:#1e3a8a;color:#bfdbfe}.b-amber{background:#78350f;color:#fde68a}.b-slate{background:#334155;color:#cbd5e1}}
