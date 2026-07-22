@@ -724,7 +724,7 @@ function perAppSection(rows: UpdateRow[]): string {
           </div>`;
         })
         .join("");
-      return `<details class="stack" data-stack="${escapeHtml(stack)}" open>
+      return `<details class="stack" data-stack="${escapeHtml(stack)}">
         <summary><strong>${escapeHtml(stack)}</strong> <span class="muted small">${services.size} service(s)</span></summary>
         ${svcHtml}
       </details>`;
@@ -841,8 +841,8 @@ function dashboardPage(deps: HttpServerDeps): string {
 
   const needsHtml =
     appNeeds.length > 0
-      ? appNeeds.map((r) => decisionCard(r, false)).join("")
-      : `<p class="muted">Nothing waiting on you. 🎉</p>`;
+      ? `<div class="cards">${appNeeds.map((r) => decisionCard(r, false)).join("")}</div>`
+      : SUNNY_DAY;
 
   const depsHtml =
     depNeeds.length > 0
@@ -861,39 +861,65 @@ function dashboardPage(deps: HttpServerDeps): string {
 </head><body>
 <header class="topbar">
   <div class="brand">${BRAND_LOGO_INLINE}<span>bumpsight</span></div>
+  <nav class="tabs">
+    <button class="tab" data-tab="dashboard" onclick="bsTab('dashboard')">Dashboard${appNeeds.length > 0 ? ` <span class="count">${appNeeds.length}</span>` : ""}</button>
+    <button class="tab" data-tab="history" onclick="bsTab('history')">History</button>
+    <button class="tab" data-tab="policies" onclick="bsTab('policies')">Policies</button>
+  </nav>
   <div class="topbar-right">
-    <input id="filter" class="filter" type="search" placeholder="filter by stack / service / image…" oninput="bsFilter()">
+    <input id="filter" class="filter" type="search" placeholder="filter…" oninput="bsFilter()">
     <label class="auto"><input type="checkbox" id="autorefresh" checked onchange="bsToggleAuto(this)"> auto-refresh</label>
   </div>
 </header>
 <main>
-  <section>
-    <h2>Needs decision <span class="count">${appNeeds.length}</span></h2>
-    <div class="cards">${needsHtml}</div>
-    ${depsHtml}
-    ${snoozedSection(all, now)}
-    ${mutedAppsSection(deps)}
-  </section>
+  <div class="tab-panel" data-panel="dashboard">
+    <section>
+      <h2>Needs decision <span class="count">${appNeeds.length}</span></h2>
+      ${needsHtml}
+      ${depsHtml}
+      ${snoozedSection(all, now)}
+      ${mutedAppsSection(deps)}
+    </section>
+    <section>
+      <h2>Recent activity</h2>
+      ${timelineSection(all)}
+    </section>
+  </div>
 
-  <section>
-    <h2>Update history by app</h2>
-    ${perAppSection(all)}
-  </section>
+  <div class="tab-panel" data-panel="history">
+    <section>
+      <h2>Update history by app</h2>
+      <p class="muted small">Click a stack to expand its history. Your open/closed choices are remembered.</p>
+      ${perAppSection(all)}
+    </section>
+  </div>
 
-  <section>
-    <h2>Recent activity</h2>
-    ${timelineSection(all)}
-  </section>
-
-  <section>
-    <h2>Per-stack policy</h2>
-    <p class="muted small">Overrides apply on the next scan. <code>notify</code> = always ask; <code>none</code> = ignore this stack.</p>
-    ${policySection(deps)}
-  </section>
+  <div class="tab-panel" data-panel="policies">
+    <section>
+      <h2>Per-stack policy</h2>
+      <p class="muted small">Overrides apply on the next scan. <code>notify</code> = always ask; <code>none</code> = ignore this stack.</p>
+      ${policySection(deps)}
+    </section>
+  </div>
 </main>
 <script>${DASH_JS}</script>
 </body></html>`;
 }
+
+/** Shown in the Dashboard tab when nothing needs a human decision. */
+const SUNNY_DAY = `<div class="sunny">
+  <svg viewBox="0 0 120 120" width="128" height="128" aria-hidden="true">
+    <circle cx="60" cy="60" r="24" fill="#fbbf24"/>
+    <g stroke="#fbbf24" stroke-width="5" stroke-linecap="round">
+      <line x1="60" y1="12" x2="60" y2="26"/><line x1="60" y1="94" x2="60" y2="108"/>
+      <line x1="12" y1="60" x2="26" y2="60"/><line x1="94" y1="60" x2="108" y2="60"/>
+      <line x1="26" y1="26" x2="36" y2="36"/><line x1="84" y1="84" x2="94" y2="94"/>
+      <line x1="94" y1="26" x2="84" y2="36"/><line x1="36" y1="84" x2="26" y2="94"/>
+    </g>
+  </svg>
+  <div class="sunny-title">All clear</div>
+  <div class="sunny-sub">No decisions waiting on you. Everything's auto-applying or rolling on its own.</div>
+</div>`;
 
 const DASH_CSS = `
 :root{--bg:#f1f5f9;--card:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--accent:#2563eb;--code:#f1f5f9;}
@@ -952,6 +978,20 @@ table.policy th{text-align:left;padding:8px 10px;font-size:12px;color:var(--mute
 table.policy td{padding:8px 10px;border-top:1px solid var(--line);font-size:13px}
 select{padding:4px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)}
 .hide{display:none !important}
+/* tabs */
+.tabs{display:flex;gap:4px;flex:1 1 auto;margin:0 12px}
+.tab{border:0;background:transparent;color:var(--muted);font:inherit;font-size:14px;padding:7px 14px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:6px}
+.tab:hover{background:var(--bg)}
+.tab.active{background:var(--bg);color:var(--ink);font-weight:600}
+.tab .count{background:var(--accent)}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+/* sunny day */
+.sunny{text-align:center;padding:56px 20px 40px}
+.sunny svg{display:block;margin:0 auto 8px}
+.sunny-title{font-size:20px;font-weight:600;color:var(--ink)}
+.sunny-sub{font-size:14px;color:var(--muted);margin-top:6px}
+@media (max-width:640px){.tabs{order:3;flex-basis:100%;margin:6px 0 0}.topbar{flex-wrap:wrap}}
 `;
 
 const DASH_JS = `
@@ -985,6 +1025,19 @@ function bsFilter(){
     el.classList.toggle('hide', q!=='' && !el.getAttribute('data-search').includes(q));
   });
 }
+// tabs — remembered across reloads
+function bsTab(name){
+  localStorage.setItem('bsTab',name);
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.getAttribute('data-tab')===name));
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active',p.getAttribute('data-panel')===name));
+}
+bsTab(localStorage.getItem('bsTab')||'dashboard');
+// history accordions — remember open/closed per stack (default closed)
+document.querySelectorAll('details.stack[data-stack]').forEach(d=>{
+  const key='bsStack:'+d.getAttribute('data-stack');
+  if(localStorage.getItem(key)==='1')d.open=true;
+  d.addEventListener('toggle',()=>localStorage.setItem(key,d.open?'1':'0'));
+});
 setInterval(()=>{
   if(!bsAuto)return;
   const a=document.activeElement;
