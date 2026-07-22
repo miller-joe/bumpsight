@@ -208,9 +208,13 @@ export type Decision = "auto-apply" | "hold" | "skip";
  *   notify → never auto-apply; hold for human approval.
  *   none   → silent skip.
  *
- * `unknown` and `digest` bumps are always held — they don't carry a
- * semver classification we can reason about safely. `none` still skips
- * them silently, since the operator explicitly asked for silence.
+ * `digest` (moving-tag) bumps AUTO-APPLY under any auto-apply policy: pinning
+ * `:latest`/`:main` is itself the operator's opt-in to the author's rolling
+ * releases (and the author's opt-in to shipping usable `:latest` builds), so
+ * bumpsight rolls them forward rather than second-guessing an unknowable
+ * change. Set the stack to `notify` to be asked even for moving tags, or `none`
+ * to skip. `unknown` bumps (a non-moving tag we genuinely can't classify) are
+ * still held.
  */
 export function decideAction(
   config: RulesConfig,
@@ -222,7 +226,8 @@ export function decideAction(
   const action = isDependency ? axes.dependencies : axes.app;
   if (action === "none") return "skip";
   if (action === "notify") return "hold";
-  if (bump === "unknown" || bump === "digest") return "hold";
+  if (bump === "digest") return "auto-apply";
+  if (bump === "unknown") return "hold";
   const allowed: Record<Exclude<BumpAction, "notify" | "none">, BumpKind[]> = {
     patch: ["patch"],
     minor: ["patch", "minor"],

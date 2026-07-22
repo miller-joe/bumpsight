@@ -105,12 +105,16 @@ describe("decideAction (v0.4.0 split-axis policy)", () => {
     expect(decideAction(cfg, "any", "major", false)).toBe("skip");
   });
 
-  it("never auto-applies an unknown or digest bump regardless of policy", () => {
+  it("holds an unknown bump, but AUTO-APPLIES a digest (moving-tag) bump under any auto-apply policy", () => {
     for (const action of ["patch", "minor", "major"] as const) {
       const cfg = both(action);
       expect(decideAction(cfg, "any", "unknown", false)).toBe("hold");
-      expect(decideAction(cfg, "any", "digest", false)).toBe("hold");
+      // v0.6.0: pinning :latest opts into rolling updates → digest auto-applies.
+      expect(decideAction(cfg, "any", "digest", false)).toBe("auto-apply");
     }
+    // notify still holds a digest (operator wants to be asked); none skips it.
+    expect(decideAction(both("notify"), "any", "digest", false)).toBe("hold");
+    expect(decideAction(both("none"), "any", "digest", false)).toBe("skip");
   });
 
   it("uses the dependencies axis for dependency images", () => {

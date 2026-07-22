@@ -476,7 +476,7 @@ describe("runScanOnce", () => {
     rmSync(file, { force: true });
   });
 
-  it("digest tracking Phase 2: falls back to digest hold when prior side has no resolved tag", async () => {
+  it("digest tracking Phase 2: an unresolvable digest bump AUTO-APPLIES under an auto-apply policy", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bumpsight-phase2-fallback-"));
     const file = join(dir, "compose.yaml");
     writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
@@ -502,7 +502,8 @@ describe("runScanOnce", () => {
       return { exitCode: 0, combinedOutput: "ok" };
     };
 
-    // Even under `major` policy, fallback should hold.
+    // v0.6.0: a moving-tag digest bump auto-applies under an auto-apply policy
+    // (pinning :latest is the opt-in). It pulls + recreates via the runner.
     const result = await runScanOnce({
       db,
       notifiers: [notifier],
@@ -510,13 +511,11 @@ describe("runScanOnce", () => {
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner,
+      movingDeltaFn: async () => ({}), // hermetic — no registry hit
     });
-    expect(result.autoApplied).toBe(0);
-    expect(result.held).toBe(1);
-    expect(calls).toHaveLength(0);
-    // v0.4.1: digest-class bumps no longer fire per-event email; row is
-    // recorded + held for the daily digest.
-    expect(sent).toHaveLength(0);
+    expect(result.autoApplied).toBe(1);
+    expect(result.held).toBe(0);
+    expect(calls.length).toBeGreaterThan(0); // pull + up ran
     rmSync(file, { force: true });
   });
 
@@ -578,7 +577,7 @@ describe("runScanOnce", () => {
     rmSync(file, { force: true });
   });
 
-  it("digest tracking: never auto-applies a digest bump even under 'major' policy", async () => {
+  it("digest tracking: a digest bump auto-applies under an auto-apply policy, holds under 'notify'", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bumpsight-latest-"));
     const file = join(dir, "compose.yaml");
     writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
@@ -592,6 +591,7 @@ describe("runScanOnce", () => {
       return { exitCode: 0, combinedOutput: "" };
     };
 
+    // major policy → moving-tag digest auto-applies (pull + recreate)
     const deps = {
       db,
       notifiers: [] as Notifier[],
@@ -599,13 +599,32 @@ describe("runScanOnce", () => {
       composeFiles: { [stack]: file },
       listTagsFn: fakeListTags as never,
       runner: runner as never,
+      movingDeltaFn: async () => ({}),
     };
     await runScanOnce(deps);
     digest = "sha256:bbbbbbbbbbbb2222";
     const result = await runScanOnce(deps);
-    expect(result.autoApplied).toBe(0);
-    expect(result.held).toBe(1);
-    expect(calls).toHaveLength(0); // docker compose was never invoked
+    expect(result.autoApplied).toBe(1);
+    expect(result.held).toBe(0);
+    expect(calls.length).toBeGreaterThan(0); // docker compose pull + up ran
+
+    // notify policy → the same digest bump is held instead
+    const db2 = openDb({ path: ":memory:" });
+    let d2 = "sha256:cccccccccccc1111";
+    const deps2 = {
+      db: db2,
+      notifiers: [] as Notifier[],
+      rules: { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: (async () => [{ name: "latest", digest: d2 }]) as never,
+      runner: (async () => ({ exitCode: 0, combinedOutput: "" })) as never,
+      movingDeltaFn: async () => ({}),
+    };
+    await runScanOnce(deps2);
+    d2 = "sha256:dddddddddddd2222";
+    const held = await runScanOnce(deps2);
+    expect(held.autoApplied).toBe(0);
+    expect(held.held).toBe(1);
     rmSync(file, { force: true });
   });
 
