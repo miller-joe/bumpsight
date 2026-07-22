@@ -2,29 +2,36 @@
 
 All notable changes to bumpsight are documented here.
 
-## 0.6.0 — 2026-07-21
+## 0.6.0 — 2026-07-22
 
-GUI-first — a proper web dashboard becomes the primary surface for seeing every app's update history and making per-app decisions, and email is demoted to an optional, quiet channel. With a large number of stacks, per-event approve/deny emails get noisy and easy to ignore; the dashboard (and the SQLite log behind it) is now where updates land, with email reduced by default to a single daily digest that also nudges you about anything awaiting a decision. Bumpsight is now essentially a GUI version of Watchtower — but human-in-the-loop, with history.
+GUI-first — a proper web dashboard becomes the primary surface for seeing every app's update history and making per-app decisions, and email is demoted to an optional, quiet channel. With a large number of stacks, per-event approve/deny emails get noisy and easy to ignore; the dashboard (and the SQLite log behind it) is now where updates land, with email reduced by default to a single daily digest that also nudges you about anything awaiting a decision. Bumpsight is now essentially a GUI version of Watchtower — but human-in-the-loop, with history — and the decision queue is deliberately kept to the calls that are genuinely yours to make: majors and things it can't reason about, while patch/minor auto-apply, moving tags roll, and dependencies are quarantined.
 
-### ⚠️ Breaking default
+### ⚠️ Breaking defaults
 
-- **`notify_mode` defaults to `digest`.** Per-event hold and applied emails are **off** by default; only the daily digest fires (and it now carries a "needs your decision" section so held bumps aren't email-invisible). Set `notify_mode: all` (file) or `BUMPSIGHT_NOTIFY_MODE=all` to restore the pre-0.6.0 per-event email behavior; `off` silences email entirely and makes the dashboard the only surface. The GUI/DB always logs everything regardless of mode. (Precedent: the 0.5.0→0.5.1 policy-default changes.)
+- **`notify_mode` defaults to `digest`.** Per-event hold and applied emails are **off** by default; only the daily digest fires (and it now carries a "needs your decision" section so held bumps aren't email-invisible). Set `notify_mode: all` / `BUMPSIGHT_NOTIFY_MODE=all` to restore per-event email; `off` silences email entirely. The GUI/DB always logs everything regardless.
+- **Moving-tag (`:latest`/`:main`) bumps now AUTO-APPLY** under any auto-apply policy (patch/minor/major). Pinning a moving tag is the operator's opt-in to the author's rolling releases, so bumpsight rolls them forward instead of holding an unclassifiable change. `notify` holds them; `none` skips. (Previously all digest bumps were held.)
 
-### Added
+### Added — dashboard
 
-- **Dashboard (`src/server/http.ts`).** The old read-only `/queue` page grows into an interactive dashboard at `/` (and `/queue`): a "Needs decision" section with per-update **Approve / Deny / Snooze / Ignore** actions, an **update-history-by-app** view (grouped stack → service, newest-first), a recent-activity timeline, client-side filtering, dark mode, and an inline **per-stack policy editor**. Server-rendered, no new dependencies, no frontend build — inline CSS/JS only.
-- **Token-addressed action API.** `POST /api/updates/:token/{approve,deny,apply,snooze,unsnooze}` and `POST /api/stacks/:stack/policy`. Every discovered row now mints an `approval_token` (previously only holds did), so the whole dashboard uses the same unguessable-capability model — no enumerable integer ids. The existing `GET /approve/:token` and `/deny/:token` email links are unchanged. Force-`apply` also retries `failed`/`denied` rows; a conditional claim (`status IN …`) closes the race with a concurrent scan.
-- **Per-stack policy overrides from the UI (`stack_policies` table).** Overrides are stored in state (not by mutating `bumpsight.yaml`) and merged over the file/env rules on every scan tick — DB wins per stack, reversible from the UI, and never fights the git-tracked compose tree.
-- **Snooze / ignore (`updates.snoozed_until`).** Hide a held bump from "needs decision" for a duration, or ignore it indefinitely. Purely a dashboard filter — the scan loop is unaffected.
-- **`notify_mode` (`off | digest | all`, default `digest`) and optional `BUMPSIGHT_UI_TOKEN` / `ui_token`.** The UI token gates the dashboard + POST actions (unset = open, LAN-only posture); email approve/deny links are never gated by it. POST routes also enforce a same-origin JSON CSRF guard regardless.
-- **Daily digest "Needs your decision" section.** So under the new quiet default, held bumps still surface as one daily email nudge with a link to the dashboard. A new `digest_state` marker advances the once-per-day fire even when a digest carries only the nudge (no consumed rows).
+- **Interactive dashboard (`src/server/http.ts`)**, split into **Dashboard / History / Policies** tabs (remembered across reloads). Server-rendered, no new dependencies, no frontend build — inline CSS/JS, dark-mode aware. Needs-decision cards with **Approve / Deny / Apply / Snooze / Mute**; per-app update history (accordions default-closed, open/closed remembered); recent-activity timeline; client-side filter; an **"All clear" sunny-day** state when the queue empties; inline per-stack policy editor.
+- **Token-addressed action API** — `POST /api/updates/:token/{approve,deny,apply,snooze,unsnooze,mute}`, `POST /api/mute`, `POST /api/stacks/:stack/policy`. Every discovered row mints an `approval_token`, so the whole dashboard uses one unguessable-capability model (no enumerable ids); the email `GET /approve|deny/:token` links are unchanged. POST routes enforce a same-origin JSON CSRF guard; optional `BUMPSIGHT_UI_TOKEN` / `ui_token` gates the UI + actions.
+- **Per-stack policy overrides from the UI (`stack_policies`)** — stored in state, merged over file/env rules each scan tick (DB wins), reversible, never mutating `bumpsight.yaml`.
+- **Snooze / ignore (`snoozed_until`)**, **mute apps (`muted_services`)** — hide a bump temporarily, or stop surfacing a whole app until un-muted.
+
+### Added — dependency & rolling-tag handling
+
+- **Dependencies are a documented special case.** Databases/caches/brokers never auto-apply and never email (you wait for the parent app to bump its own dependency), but instead of vanishing silently they collect in a collapsed **"⚠ Dependency updates held back"** section with a `⚠ DEPENDENCY` badge and an "Update anyway" (confirm-gated) path — so there's a way to act on one, without cluttering the real decision queue. Reconcile never touches them; the digest nudge excludes them. Added immich's bundled Postgres (`immich-app/postgres`) to the recognized-dependency set.
+- **Moving-tag digest decode** — a `:latest`/`:main` bump is labelled with a version or build-timestamp delta (via OCI labels) instead of two opaque hashes; older duplicate digest rows are superseded; **same-version phantom rebuilds are suppressed** (e.g. a local build vs the CI push of the same version).
+- **Reconcile pass** — before each scan, queue rows the current policy no longer holds are retired (skips dismissed, auto-applies re-discovered) so the queue self-heals when policy changes; dependencies are exempt.
+- **Daily digest "Needs your decision" section** + a `digest_state` marker so a decision-only digest still fires once per day.
+
+### Notes
+
+- npm publish via GitHub OIDC trusted publishing; multi-arch GHCR image; GitHub Release auto-created from this entry.
 
 ### Tests
 
-- `test/http.test.ts` — dashboard render, `POST apply`, snooze-hides-from-needs-decision, CSRF rejection, UI-token gate, policy-upsert + validation.
-- `test/state.test.ts` — snooze filter + `SNOOZE_FOREVER`, `stack_policies` CRUD, `snoozed_until` migration on a pre-0.6.0 DB, `digest_state` marker.
-- `test/daemon-scan.test.ts` — DB policy override beats file rules; held bump with empty notifiers (digest mode) still reaches `notified` + persists advise.
-- `test/digest.test.ts` — "needs your decision" section render + a decision-only digest that advances the fired marker without consuming rows.
+- 309 tests (was 265). New coverage across `test/http.test.ts` (dashboard, POST actions, CSRF, UI-token, dependency quarantine section), `test/state.test.ts` (snooze, `stack_policies`, mute, migrations, `digest_state`), `test/daemon-scan.test.ts` (policy overrides, digest auto-apply, dependency surfacing, supersede, reconcile), `test/daemon-rules.test.ts` (digest auto-apply semantics, immich Postgres), `test/moving-tag-label.test.ts` (version/timestamp decode, phantom detection), and `test/digest.test.ts`.
 
 ## 0.5.8 — 2026-06-09
 
