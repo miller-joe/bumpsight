@@ -47,6 +47,7 @@ const KNOWN_DEPENDENCY_IMAGES = new Set<string>([
   "tensorchord/pgvecto-rs",
   "ankane/pgvector",
   "supabase/postgres",
+  "immich-app/postgres", // immich's bundled Postgres + VectorChord — follows the immich server
   // MariaDB / MySQL
   "mariadb", "library/mariadb",
   "mysql", "library/mysql",

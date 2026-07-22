@@ -49,6 +49,9 @@ describe("isDependencyImage", () => {
 
   it("matches GHCR-prefixed dependency images via registry strip", () => {
     expect(isDependencyImage("ghcr.io/hashicorp/vault")).toBe(true);
+    // immich's bundled Postgres — a real DB that follows the immich server
+    expect(isDependencyImage("ghcr.io/immich-app/postgres")).toBe(true);
+    expect(isDependencyImage("immich-app/postgres")).toBe(true);
   });
 
   it("does NOT match application-layer images", () => {
