@@ -158,6 +158,40 @@ export interface RulesConfig {
   stacks: Record<string, PolicyAxes>;
 }
 
+const VALID_ACTIONS: readonly string[] = [
+  "patch",
+  "minor",
+  "major",
+  "notify",
+  "none",
+];
+
+/**
+ * v0.6.0: overlay UI-set per-stack policy overrides (from the `stack_policies`
+ * table) on top of the file/env rules. The DB wins per-stack. Invalid stored
+ * values fall back to the underlying file/env value for that axis, so a bad
+ * write can never widen auto-apply beyond what the config already allowed.
+ *
+ * Returns a fresh RulesConfig — the input is never mutated, so the daemon can
+ * recompute this each scan tick and pick up UI edits without a restart.
+ */
+export function applyStackPolicyOverrides(
+  rules: RulesConfig,
+  overrides: Record<string, { app: string; dependencies: string }>,
+): RulesConfig {
+  const stacks: Record<string, PolicyAxes> = { ...rules.stacks };
+  const coerce = (v: string, fallback: BumpAction): BumpAction =>
+    VALID_ACTIONS.includes(v) ? (v as BumpAction) : fallback;
+  for (const [stack, o] of Object.entries(overrides)) {
+    const base = stacks[stack] ?? rules.default;
+    stacks[stack] = {
+      app: coerce(o.app, base.app),
+      dependencies: coerce(o.dependencies, base.dependencies),
+    };
+  }
+  return { default: rules.default, stacks };
+}
+
 export type Decision = "auto-apply" | "hold" | "skip";
 
 /**

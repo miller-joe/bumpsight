@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   openDb,
   recordUpdate,
+  findUpdate,
   setNotified,
   setApplied,
   setDecision,
@@ -341,5 +342,43 @@ describe("db helpers", () => {
     setApplied(db, id, { ok: true });
     markDigested(db, [id]);
     expect(getLastDigestSent(db)).not.toBeNull();
+  });
+});
+
+describe("v0.6.0 needs-your-decision section", () => {
+  it("renders the section and is empty when nothing is pending", () => {
+    const held = fakeRow({ id: 7, status: "notified", stack: "outline", service: "outline" });
+    const withNudge = buildDigestEmail({ rows: [], needsDecision: [held] });
+    expect(withNudge).not.toBeNull();
+    expect(withNudge!.message.subject).toContain("1 awaiting decision");
+    expect(withNudge!.message.body).toContain("Needs your decision (1)");
+    expect(withNudge!.rowIds).toEqual([]); // NOT consumed
+    // nothing at all → null
+    expect(buildDigestEmail({ rows: [], needsDecision: [] })).toBeNull();
+  });
+
+  it("runDigestOnce sends a decision-only digest and advances the fired marker", async () => {
+    const id = recordUpdate(db, {
+      stack: "outline", service: "outline", image: "outlinewiki/outline:0.84.0",
+      currentTag: "0.84.0", targetTag: "0.85.0", bump: "major",
+    });
+    setNotified(db, id);
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = { name: "stub", send: async (m) => void sent.push(m) };
+    const sentOk = await runDigestOnce({
+      db,
+      notifiers: [notifier],
+      hour: 18,
+      log: () => {},
+      now: () => 1_700_000_000_000,
+    });
+    expect(sentOk).toBe(true);
+    expect(sent[0]!.subject).toContain("awaiting decision");
+    // marker advanced so the scheduler won't re-fire the same day
+    expect(getLastDigestSent(db)).toBe(1_700_000_000_000);
+    // the held row is untouched (still notified, not digested)
+    const row = findUpdate(db, id)!;
+    expect(row.status).toBe("notified");
+    expect(row.digested_at).toBeNull();
   });
 });

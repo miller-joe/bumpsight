@@ -1,8 +1,27 @@
 import { describe, it, expect } from "vitest";
 import {
   buildApplyPairedDepsConfig,
+  buildNotifyMode,
   isPairedDepBundlingEnabled,
 } from "../src/daemon/config.js";
+
+describe("buildNotifyMode", () => {
+  it("defaults to digest", () => {
+    expect(buildNotifyMode({}, undefined)).toBe("digest");
+  });
+  it("reads the file value", () => {
+    expect(buildNotifyMode({ notify_mode: "all" }, undefined)).toBe("all");
+    expect(buildNotifyMode({ notify_mode: "off" }, undefined)).toBe("off");
+  });
+  it("env overrides the file value", () => {
+    expect(buildNotifyMode({ notify_mode: "all" }, "off")).toBe("off");
+  });
+  it("ignores an invalid value (keeps prior source)", () => {
+    const warnings: string[] = [];
+    expect(buildNotifyMode({ notify_mode: "all" }, "whatever", (m) => warnings.push(m))).toBe("all");
+    expect(warnings.join(" ")).toContain("invalid notify_mode");
+  });
+});
 
 describe("buildApplyPairedDepsConfig", () => {
   it("defaults to off when nothing is set", () => {

@@ -2,7 +2,7 @@
 
 # bumpsight
 
-Docker image update advisor and applier for self-hosters. Periodically scans your `compose.yaml` files, classifies new tags as patch / minor / major, applies the safe ones automatically, and emails you the rest with one-click approve / deny links — accompanied by an LLM-summarised read of the upstream release notes.
+Docker image update advisor and applier for self-hosters. Periodically scans your `compose.yaml` files, classifies new tags as patch / minor / major, applies the safe ones automatically, and surfaces the rest in a **built-in dashboard** where you review each app's update history and approve / deny / snooze bumps per stack — each accompanied by an LLM-summarised read of the upstream release notes. Essentially a GUI version of Watchtower, but human-in-the-loop and with history. Email is still available (down to a single quiet daily digest, or off) but the dashboard is the primary surface.
 
 [![npm](https://img.shields.io/npm/v/bumpsight.svg)](https://www.npmjs.com/package/bumpsight)
 [![CI](https://github.com/miller-joe/bumpsight/actions/workflows/ci.yml/badge.svg)](https://github.com/miller-joe/bumpsight/actions/workflows/ci.yml)
@@ -17,7 +17,9 @@ Watchtower was archived 2025-12-17. Diun and What's Up Docker tell you a tag mov
 
 - **Daemon mode** — one container, one config block, runs forever. Polls every `interval`. Auto-discovers every `compose.yaml` under `/stacks`.
 - **Semver-aware policy on two axes.** Each stack has an `app` axis (the primary service) and a `dependencies` axis (Postgres / Redis / MariaDB / Vault / etc.). Each axis takes `patch` / `minor` / `major` / `notify` / `none`. Default since v0.5.1: `{ app: minor, dependencies: none }` — auto-apply patches + minors on the app (the bumps semver flags as backwards-compatible), hold majors for approval, silent on deps (they follow the parent app's release cadence, not their own). Set globally and override per stack.
-- **One-click approve / deny.** Emails contain real URLs that, when clicked, pull and recreate the affected service via the host's Docker socket — or mark it denied and never bother you about that bump again.
+- **Dashboard.** A server-rendered web UI (no separate app to deploy) showing every app's update history, a "needs decision" queue with per-bump **approve / deny / apply / snooze / ignore**, a recent-activity timeline, and an inline **per-stack policy editor** whose overrides take effect on the next scan. Dark-mode aware; optionally gated by `BUMPSIGHT_UI_TOKEN`.
+- **GUI-first, quiet email.** `notify_mode` defaults to `digest`: the dashboard/DB logs everything, and email is reduced to one daily digest that also nudges you about anything awaiting a decision. Set `notify_mode: all` for the pre-0.6.0 per-event emails, or `off` for none.
+- **One-click approve / deny.** Both the dashboard buttons and the URLs in emails pull and recreate the affected service via the host's Docker socket — or mark it denied and never bother you about that bump again.
 - **LLM-assisted risk read** for held bumps via any OpenAI-compatible LLM endpoint — LiteLLM (cloud fan-out), Ollama (local), OpenAI, vLLM, anything else that speaks `/v1/chat/completions`.
 - **SMTP and Apprise** notifiers built in. Apprise inherits its 70+ channels (Discord, ntfy, Slack, Gotify, …) without bumpsight having to embed them.
 - **CLI commands** for the audit-style work: `doctor` (lint), `scan` (one-shot tag check), `advise` (LLM summary). Run from your terminal, no daemon needed.
@@ -59,7 +61,7 @@ volumes:
   bumpsight-state:
 ```
 
-That's the whole product. Mount your compose tree at the same path inside the container as on the host (the *aligned-mount* convention since v0.4.2 — keeps relative bind mounts in target stacks resolvable when bumpsight runs `docker compose` against them) and bumpsight auto-discovers every `<stack>/compose.{yaml,yml}` underneath. Set `stacks_dir:` in `bumpsight.yaml` to the same path you mounted, or override via `BUMPSIGHT_STACKS_DIR`. Point `BUMPSIGHT_PUBLIC_URL` at however you expose port 9100 (reverse proxy, Tailscale, LAN-only) — that's the base URL bumpsight uses for the approve/deny links it embeds in your emails.
+That's the whole product. Mount your compose tree at the same path inside the container as on the host (the *aligned-mount* convention since v0.4.2 — keeps relative bind mounts in target stacks resolvable when bumpsight runs `docker compose` against them) and bumpsight auto-discovers every `<stack>/compose.{yaml,yml}` underneath. Set `stacks_dir:` in `bumpsight.yaml` to the same path you mounted, or override via `BUMPSIGHT_STACKS_DIR`. Open port 9100 in a browser for the **dashboard**; point `BUMPSIGHT_PUBLIC_URL` at however you expose it (reverse proxy, Tailscale, LAN-only) — that's also the base URL bumpsight uses for the approve/deny links it embeds in emails. Since 0.6.0 email defaults to a single daily digest (`notify_mode: digest`); the dashboard is where updates land.
 
 To opt a specific stack OUT of scanning, set its policy to `none` in `bumpsight.yaml` (see below). To restrict to a specific allowlist instead of auto-discovery, pass paths after `daemon` or set `compose_files:` in the config.
 
@@ -130,8 +132,10 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 | `BUMPSIGHT_STACKS_DIR` | `/stacks` | Root directory for auto-discovery (one level deep). |
 | `BUMPSIGHT_CONFIG` | `/config/bumpsight.yaml` | Path to the YAML config file. |
 | `BUMPSIGHT_DB` | `/var/lib/bumpsight/state.db` | SQLite state file. |
-| `BUMPSIGHT_HTTP_PORT` | `9100` | Approve/deny server port. |
+| `BUMPSIGHT_HTTP_PORT` | `9100` | Dashboard + approve/deny server port. |
 | `BUMPSIGHT_HTTP_HOST` | `0.0.0.0` | Bind interface. |
+| `BUMPSIGHT_NOTIFY_MODE` | `digest` | Email verbosity: `all` (per-event hold + applied emails **and** the daily digest — pre-0.6.0 behavior), `digest` (only the daily digest, which nudges you about pending decisions), or `off` (no email — the dashboard is the only surface). The dashboard/DB logs everything regardless. |
+| `BUMPSIGHT_UI_TOKEN` | (none) | Optional shared secret gating the dashboard + POST action routes. Unset = open (fine for LAN-only / Tailscale). Email approve/deny links are never gated by this. |
 | `BUMPSIGHT_LLM_URL` | (none) | OpenAI-compatible LLM base URL ending in `/v1`. When unset, advise is skipped. |
 | `BUMPSIGHT_LLM_KEY` | (none) | Bearer token for the LLM endpoint. Required for LiteLLM, OpenAI, etc.; ignored by Ollama. |
 | `BUMPSIGHT_MODEL` | `llama3.2` | Model name. For Ollama: e.g. `qwen2.5:14b-instruct`. For LiteLLM: an alias like `smart`. |
@@ -173,6 +177,12 @@ notify:
   - smtp://user:pass@mail.example.com:587/?to=admin@example.com&from=bumpsight@example.com
   - apprise://apprise.local:8000/notify/bumpsight   # extra channels via apprise-api
 
+# v0.6.0: email verbosity. digest (default) = one daily email that also nudges
+# about pending decisions; all = per-event hold+applied emails too; off = none.
+# The dashboard/DB always logs everything regardless.
+notify_mode: digest
+# ui_token: "change-me"     # optional — gate the dashboard + POST actions
+
 # stacks_dir: /stacks       # override the auto-discovery root if needed
 # compose_files: []         # explicit allowlist; when set, bypasses auto-discovery
 public_url: https://bump.example.com
@@ -198,6 +208,17 @@ By default bumpsight scans every `<stacks_dir>/<name>/compose.{yaml,yml}` it fin
 The scanner only sees Docker images referenced by an `image:` key in a discovered compose file. Versions that live anywhere else are invisible to it — a binary baked into a Dockerfile by a hardcoded version pin (`GIT_LFS_VERSION=3.7.0`), a tool installed into a `build:`-only container, a CLI you drop into `/usr/local/bin`. There's no registry tag for the scanner to compare, so those silently fall behind.
 
 `watched_releases` (v0.5.7, opt-in) covers them. Declare the upstream GitHub repo and the version you currently have installed; bumpsight polls GitHub Releases on `watch_interval` and emails when a newer release appears. It's **notify-only** — bumpsight can't install a host binary, so there are no Approve/Deny links. The email tells you what's new (with the usual LLM release-note summary when an LLM is configured) and reminds you to update the pin yourself, then bump `current:` for that entry. Each newer release fires exactly one email until you update `current` or a newer one lands. Set `policy: none` to silence an entry without removing it; pre-releases are ignored unless `include_prerelease: true`.
+
+## Dashboard
+
+Browse to the HTTP port (default `9100`) for the dashboard — the primary surface since 0.6.0:
+
+- **Needs decision** — every held bump waiting on you, each with **Approve & apply**, **Deny**, **Snooze** (1d / 7d) and **Ignore**, plus the LLM release-note summary inline.
+- **Update history by app** — grouped stack → service, newest first, so you can see how each app has moved over time. Failed/denied rows offer a **re-apply**.
+- **Recent activity** — a timeline of what was applied, failed, or denied.
+- **Per-stack policy** — see each stack's effective `app` / `dependencies` policy and its source (default / config / UI override), and change it inline. Overrides are stored in state (not by editing your `bumpsight.yaml`) and take effect on the next scan.
+
+Actions are token-addressed and POST over a same-origin JSON request (CSRF-guarded). The server is unauthenticated by default — fine behind a LAN/Tailscale boundary. To require a key, set `BUMPSIGHT_UI_TOKEN`; the dashboard then prompts for it (`?key=…`) and POST actions require it. The email `GET /approve/:token` and `/deny/:token` links keep working regardless.
 
 ## Notification channels
 

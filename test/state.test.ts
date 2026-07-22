@@ -9,6 +9,21 @@ import {
   setDecision,
   setApplied,
   setPairedDeps,
+  setSnooze,
+  clearSnooze,
+  listNeedsDecision,
+  getAllStackPolicies,
+  getStackPolicy,
+  setStackPolicy,
+  clearStackPolicy,
+  getLastDigestSent,
+  recordDigestFired,
+  supersedeOlderDigestRows,
+  setDisplayTags,
+  muteService,
+  unmuteService,
+  getMutedServices,
+  SNOOZE_FOREVER,
   digest,
 } from "../src/state/db.js";
 import type { Database as DB } from "better-sqlite3";
@@ -262,6 +277,7 @@ describe("digest tracking helpers", () => {
   });
 
   it("setPairedDeps persists the JSON blob on a row", () => {
+    // (kept here alongside the other row-mutator round-trips)
     const id = recordUpdate(db, {
       stack: "outline",
       service: "outline",
@@ -282,6 +298,41 @@ describe("digest tracking helpers", () => {
     setPairedDeps(db, id, blob);
     const row = findUpdate(db, id)!;
     expect(row.paired_deps_json).toBe(blob);
+  });
+
+  it("fresh :memory: DB has the snoozed_until column", () => {
+    const id = recordUpdate(db, {
+      stack: "s", service: "a", image: "img:1", currentTag: "1", targetTag: "2", bump: "minor",
+    });
+    expect(findUpdate(db, id)!.snoozed_until).toBeNull();
+  });
+
+  it("openDb adds snoozed_until to a pre-v0.6.0 updates table", async () => {
+    const Database = (await import("better-sqlite3")).default;
+    const tmp = `/tmp/bumpsight-snooze-mig-${Date.now()}-${Math.random()}.sqlite`;
+    const raw = new Database(tmp);
+    // pre-v0.6.0 shape: updates without snoozed_until / paired_deps_json etc.
+    raw.exec(`
+      CREATE TABLE updates (
+        id INTEGER PRIMARY KEY,
+        stack TEXT NOT NULL, service TEXT NOT NULL, image TEXT NOT NULL,
+        current_tag TEXT NOT NULL, target_tag TEXT NOT NULL,
+        family TEXT, bump TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending','notified','approved','denied','applied','failed')),
+        approval_token TEXT, discovered_at INTEGER NOT NULL,
+        notified_at INTEGER, decided_at INTEGER, decided_by TEXT,
+        applied_at INTEGER, apply_log TEXT,
+        UNIQUE (stack, service, current_tag, target_tag)
+      );
+      INSERT INTO updates (stack, service, image, current_tag, target_tag, bump, status, discovered_at)
+      VALUES ('s','a','img','1','2','minor','notified',1);
+    `);
+    raw.close();
+    const migrated = openDb({ path: tmp });
+    const row = findUpdate(migrated, 1)!;
+    expect(row.snoozed_until).toBeNull(); // column exists, reads as null
+    migrated.close();
+    (await import("node:fs")).unlinkSync(tmp);
   });
 
   it("openDb migrates an old-schema DB by rebuilding the updates table", async () => {
@@ -311,5 +362,132 @@ describe("digest tracking helpers", () => {
     // on the same path. The migration should detect the old CHECK and
     // rebuild without it.
     // (Real disk path tested implicitly in the live deploy on first restart.)
+  });
+});
+
+describe("v0.6.0 snooze", () => {
+  it("hides a snoozed row from listNeedsDecision until expiry", () => {
+    const id = recordUpdate(db, {
+      stack: "s", service: "a", image: "img:1", currentTag: "1", targetTag: "2", bump: "minor",
+    });
+    setNotified(db, id);
+    const now = 1_000_000;
+    expect(listNeedsDecision(db, now).map((r) => r.id)).toContain(id);
+    setSnooze(db, id, now + 10_000);
+    expect(listNeedsDecision(db, now).map((r) => r.id)).not.toContain(id);
+    // reappears once the snooze expires
+    expect(listNeedsDecision(db, now + 20_000).map((r) => r.id)).toContain(id);
+    // clearSnooze brings it back immediately
+    setSnooze(db, id, now + 10_000);
+    clearSnooze(db, id);
+    expect(listNeedsDecision(db, now).map((r) => r.id)).toContain(id);
+  });
+
+  it("SNOOZE_FOREVER keeps a row out indefinitely (ignore)", () => {
+    const id = recordUpdate(db, {
+      stack: "s", service: "b", image: "img:1", currentTag: "1", targetTag: "2", bump: "minor",
+    });
+    setNotified(db, id);
+    setSnooze(db, id, SNOOZE_FOREVER);
+    expect(listNeedsDecision(db, Date.now()).map((r) => r.id)).not.toContain(id);
+  });
+});
+
+describe("v0.6.0 supersede + display", () => {
+  function digestRow(target: string): number {
+    const id = recordUpdate(db, {
+      stack: "gluetun", service: "gluetun", image: "qmcgaw/gluetun",
+      currentTag: "aaa", targetTag: target, bump: "digest",
+    });
+    setNotified(db, id);
+    return id;
+  }
+
+  it("supersedeOlderDigestRows retires older rows, keeps the newest, and drops them from needsDecision", () => {
+    const a = digestRow("d1");
+    const b = digestRow("d2");
+    const c = digestRow("d3");
+    // a newer bump arrives as `c` → supersede a and b
+    const retired = supersedeOlderDigestRows(db, "gluetun", "gluetun", c);
+    expect(retired).toBe(2);
+    expect(findUpdate(db, a)!.superseded).toBe(1);
+    expect(findUpdate(db, b)!.superseded).toBe(1);
+    expect(findUpdate(db, c)!.superseded).toBeNull();
+    const open = listNeedsDecision(db, Date.now()).map((r) => r.id);
+    expect(open).toContain(c);
+    expect(open).not.toContain(a);
+    expect(open).not.toContain(b);
+  });
+
+  it("does not touch other services or non-digest rows", () => {
+    const g = digestRow("d1");
+    const other = recordUpdate(db, {
+      stack: "gluetun", service: "gluetun", image: "qmcgaw/gluetun",
+      currentTag: "1.0", targetTag: "1.1", bump: "minor", // semver row, not digest
+    });
+    setNotified(db, other);
+    const keep = digestRow("d2");
+    supersedeOlderDigestRows(db, "gluetun", "gluetun", keep);
+    expect(findUpdate(db, g)!.superseded).toBe(1);
+    expect(findUpdate(db, other)!.superseded).toBeNull(); // semver row untouched
+  });
+
+  it("setDisplayTags stores the decoded delta without touching current/target", () => {
+    const id = digestRow("d1");
+    setDisplayTags(db, id, "2.20.14", "2.20.15");
+    const row = findUpdate(db, id)!;
+    expect(row.display_from).toBe("2.20.14");
+    expect(row.display_to).toBe("2.20.15");
+    expect(row.target_tag).toBe("d1"); // source of truth unchanged
+  });
+
+  it("muteService retires open rows for the app and lists/unmutes", () => {
+    const id = digestRow("d1");
+    muteService(db, "gluetun", "gluetun");
+    const row = findUpdate(db, id)!;
+    expect(row.superseded).toBe(1);
+    expect(row.dismiss_reason).toBe("muted");
+    expect(getMutedServices(db).map((m) => `${m.stack}/${m.service}`)).toEqual(["gluetun/gluetun"]);
+    // dropped from needs-decision
+    expect(listNeedsDecision(db, Date.now()).map((r) => r.id)).not.toContain(id);
+    // un-mute removes the mute (existing row stays retired; future scans resurface)
+    unmuteService(db, "gluetun", "gluetun");
+    expect(getMutedServices(db)).toHaveLength(0);
+  });
+});
+
+describe("v0.6.0 stack_policies", () => {
+  it("set / get / clear round-trips and lists all overrides", () => {
+    expect(getAllStackPolicies(db)).toEqual({});
+    setStackPolicy(db, "outline", "notify", "none");
+    setStackPolicy(db, "vault", "patch", "none");
+    expect(getStackPolicy(db, "outline")!.app).toBe("notify");
+    expect(getAllStackPolicies(db)).toEqual({
+      outline: { app: "notify", dependencies: "none" },
+      vault: { app: "patch", dependencies: "none" },
+    });
+    // upsert overwrites
+    setStackPolicy(db, "outline", "minor", "notify");
+    expect(getAllStackPolicies(db).outline).toEqual({ app: "minor", dependencies: "notify" });
+    clearStackPolicy(db, "outline");
+    expect(getStackPolicy(db, "outline")).toBeUndefined();
+  });
+});
+
+describe("v0.6.0 digest fired marker", () => {
+  it("recordDigestFired advances getLastDigestSent even with no consumed rows", () => {
+    expect(getLastDigestSent(db)).toBeNull();
+    recordDigestFired(db, 5_000);
+    expect(getLastDigestSent(db)).toBe(5_000);
+    // a later applied+digested row wins if newer
+    const id = recordUpdate(db, {
+      stack: "s", service: "a", image: "img:1", currentTag: "1", targetTag: "2", bump: "minor",
+    });
+    setApplied(db, id, { ok: true });
+    db.prepare("UPDATE updates SET digested_at=? WHERE id=?").run(9_000, id);
+    expect(getLastDigestSent(db)).toBe(9_000);
+    // marker moving forward again wins
+    recordDigestFired(db, 12_000);
+    expect(getLastDigestSent(db)).toBe(12_000);
   });
 });

@@ -60,7 +60,22 @@ export interface DaemonConfig {
   /** v0.5.7: how often the watched-releases poll runs. Milliseconds. Only used
    *  when watchedReleases is non-empty. */
   watchIntervalMs: number;
+  /** v0.6.0: how loud email is. The GUI/DB is always the primary log; this only
+   *  controls the email channel.
+   *    all    — per-event hold + applied emails AND the daily digest (the
+   *             pre-v0.6.0 behavior).
+   *    digest — no per-event emails; only the daily digest (which now carries a
+   *             "needs your decision" nudge). The new default — GUI-first.
+   *    off    — never email; the dashboard is the only surface. */
+  notifyMode: NotifyMode;
+  /** v0.6.0: optional shared secret gating the dashboard + POST action routes.
+   *  Unset (default) leaves the server open, matching the pre-v0.6.0 LAN-only
+   *  posture. The email approve/deny GET links are never gated by this. */
+  uiToken?: string;
 }
+
+/** v0.6.0: email verbosity. See DaemonConfig.notifyMode. */
+export type NotifyMode = "off" | "digest" | "all";
 
 /**
  * v0.5.7: a resolved watched-release entry. The operator declares the upstream
@@ -142,6 +157,10 @@ export interface FileConfigShape {
   /** v0.5.7: poll cadence for watched_releases (same duration syntax as
    *  `interval`). Defaults to the scan interval when unset. */
   watch_interval?: string;
+  /** v0.6.0: email verbosity — off | digest | all. Default `digest`. */
+  notify_mode?: string;
+  /** v0.6.0: optional shared secret gating the dashboard + POST actions. */
+  ui_token?: string;
 }
 
 export interface WatchedReleaseFileShape {
@@ -337,6 +356,38 @@ export function buildApplyPairedDepsConfig(
     }
   }
   return cfg;
+}
+
+/**
+ * v0.6.0: resolve the email verbosity mode. Precedence (last wins):
+ *   1. Hard default → `digest` (GUI-first; only the daily digest emails).
+ *   2. `notify_mode` in bumpsight.yaml.
+ *   3. `BUMPSIGHT_NOTIFY_MODE` env var.
+ * An unrecognized value is warned and ignored (falls through to the prior
+ * source) rather than throwing — a typo in an opt-in verbosity knob should
+ * never take down the daemon.
+ */
+export function buildNotifyMode(
+  fileShape: FileConfigShape,
+  envValue: string | undefined,
+  log?: (msg: string) => void,
+): NotifyMode {
+  let mode: NotifyMode = "digest";
+  const apply = (raw: string, where: string): void => {
+    const v = raw.trim().toLowerCase();
+    if (v === "off" || v === "digest" || v === "all") {
+      mode = v;
+    } else if (v !== "") {
+      log?.(`${where}: invalid notify_mode "${raw}" (expected off | digest | all), ignoring`);
+    }
+  };
+  if (fileShape.notify_mode !== undefined) {
+    apply(String(fileShape.notify_mode), "config.notify_mode");
+  }
+  if (envValue !== undefined) {
+    apply(envValue, "BUMPSIGHT_NOTIFY_MODE");
+  }
+  return mode;
 }
 
 /**

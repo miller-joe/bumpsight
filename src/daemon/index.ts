@@ -9,7 +9,13 @@ import {
   type RemoteTag,
 } from "../registry/index.js";
 import { findLatestInFamily, parseTag } from "../util/semver.js";
-import { classifyBump, decideAction, isDependencyImage, isMovingTag } from "./rules.js";
+import {
+  applyStackPolicyOverrides,
+  classifyBump,
+  decideAction,
+  isDependencyImage,
+  isMovingTag,
+} from "./rules.js";
 import type { BumpKind, RulesConfig } from "./rules.js";
 import type { DaemonConfig } from "./config.js";
 import {
@@ -18,8 +24,21 @@ import {
   findUpdate,
   getStoredDigest,
   saveDigest,
+  getAllStackPolicies,
+  setDisplayTags,
+  supersedeOlderDigestRows,
+  dismissRow,
+  deleteUpdate,
+  getMutedServices,
   type UpdateRow,
 } from "../state/db.js";
+import { fetchOciLabels } from "../registry/oci-config.js";
+import {
+  movingTagInfo,
+  resolveMovingDelta,
+  type MovingDelta,
+} from "../registry/moving-tag-label.js";
+import { fromDisplay, toDisplay } from "../util/display.js";
 import { notifyAll } from "../notify/index.js";
 import { archiveMessage } from "../notify/outbox.js";
 import type { Notifier, NotifyMessage, NotifyLink } from "../notify/types.js";
@@ -92,6 +111,13 @@ export interface ScanRunDeps {
   adviseFn?: typeof getAdviseSummary;
   /** v0.5.5: test seam — override digest-class enrichment. */
   enrichDigestFn?: typeof enrichDigestBump;
+  /** v0.6.0: test seam — override the OCI version/date decode for digest bumps.
+   *  Defaults to the real safeMovingDelta (two registry fetches). */
+  movingDeltaFn?: (
+    ref: ImageRef,
+    oldDigest: string,
+    newDigest: string,
+  ) => Promise<MovingDelta>;
   /** Test seam — sleep helper for the rate limiter. */
   sleepFn?: (ms: number) => Promise<void>;
 }
@@ -121,6 +147,11 @@ export async function runScanOnce(
   let lastDispatchAt = 0;
   const heldRows: { row: UpdateRow; composePath: string; serviceName: string }[] =
     [];
+  // v0.6.0: muted (stack, service) pairs are skipped entirely — no new bumps
+  // surface for an app the operator muted, until they un-mute it.
+  const mutedSet = new Set(
+    getMutedServices(deps.db).map((m) => `${m.stack}::${m.service}`),
+  );
 
   for (const [stack, composePath] of Object.entries(deps.composeFiles)) {
     let compose: ReturnType<typeof loadComposeFile>;
@@ -135,6 +166,7 @@ export async function runScanOnce(
     );
 
     for (const [serviceName, svc] of services) {
+      if (mutedSet.has(`${stack}::${serviceName}`)) continue; // muted app — skip
       result.scanned += 1;
       const ref = parseImageRef(svc.image!);
       if (!isSupportedRegistry(ref)) continue;
@@ -238,10 +270,11 @@ export async function runScanOnce(
           continue;
         }
 
-        const token =
-          decision === "hold"
-            ? randomBytes(18).toString("base64url")
-            : undefined;
+        // v0.6.0: mint a token for every discovered row (not just holds) so the
+        // dashboard can act on any row through the capability-token routes.
+        // Auto-apply rows getting a token is harmless (no approval link is
+        // embedded in their applied-emails) and lets the GUI re-apply/retry.
+        const token = randomBytes(18).toString("base64url");
         const id = recordUpdate(deps.db, {
           stack,
           service: serviceName,
@@ -256,9 +289,35 @@ export async function runScanOnce(
         if (!row || row.status !== "pending") continue;
         result.discovered += 1;
 
+        // v0.6.0: retire any older still-open digest rows for this service so
+        // the moving-tag app shows one current card, not a pile of stale ones.
+        supersedeOlderDigestRows(deps.db, stack, serviceName, row.id);
+
         // Advance the stored digest now so a re-scan before the user acts
         // doesn't keep refiring the same bump.
         saveDigest(deps.db, ref.raw, ref.tag, newDigest, newResolved ?? null);
+
+        // v0.6.0: for true digest-class bumps (no semver pair resolved), decode
+        // the old + new digests into a version / build-date delta via OCI
+        // labels so the row shows `2.20.14 → 2.20.15` (or a date) instead of two
+        // opaque hashes. Display-only; independent of the LLM enrichment below.
+        if (bump === "digest") {
+          const delta = await (deps.movingDeltaFn ?? safeMovingDelta)(
+            ref,
+            prev.digest,
+            newDigest,
+          );
+          if (delta.sameVersion) {
+            // Phantom: the digest moved but the decoded version is unchanged
+            // (a rebuild of the same version). Not a real update — retire it so
+            // it never reaches the queue. The stored digest is already advanced.
+            dismissRow(deps.db, row.id, "unchanged");
+            continue;
+          }
+          if (delta.from || delta.to) {
+            setDisplayTags(deps.db, row.id, delta.from ?? null, delta.to ?? null);
+          }
+        }
 
         // v0.5.5: for true digest-class bumps (no semver resolved), enrich
         // the row with an OCI-label-driven commit-range summary. Falls back
@@ -344,9 +403,9 @@ export async function runScanOnce(
       const decision = decideAction(deps.rules, stack, bump, isDep);
       if (decision === "skip") continue;
 
-      // Only generate an approval token for `hold` decisions.
-      const token =
-        decision === "hold" ? randomBytes(18).toString("base64url") : undefined;
+      // v0.6.0: every discovered row gets a token (see the digest-path note
+      // above) — the dashboard is now token-addressed for all actions.
+      const token = randomBytes(18).toString("base64url");
       const id = recordUpdate(deps.db, {
         stack,
         service: serviceName,
@@ -789,6 +848,29 @@ async function safeEnrichDigest(
 }
 
 /**
+ * v0.6.0: fetch OCI labels for the old + new digest of a moving-tag bump and
+ * reduce them to a display delta (version or build date). Best-effort — any
+ * fetch failure (unsupported registry, GC'd old blob, network) collapses to an
+ * empty delta and the caller keeps the raw hash display. Two extra registry
+ * round-trips, only on an actual digest change (infrequent).
+ */
+async function safeMovingDelta(
+  ref: ImageRef,
+  oldDigest: string,
+  newDigest: string,
+): Promise<MovingDelta> {
+  try {
+    const [oldOci, newOci] = await Promise.all([
+      fetchOciLabels(ref, oldDigest).catch(() => ({ labels: {} })),
+      fetchOciLabels(ref, newDigest).catch(() => ({ labels: {} })),
+    ]);
+    return resolveMovingDelta(movingTagInfo(oldOci), movingTagInfo(newOci));
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Given a digest from a moving tag (e.g. `:latest`), return the most-precise
  * semver-shaped tag in the registry that shares it. Used to classify
  * digest changes as a normal patch / minor / major bump.
@@ -885,8 +967,8 @@ export async function dispatchAppliedNotification(
   text.push(`Stack:   ${row.stack}`);
   text.push(`Service: ${row.service}`);
   text.push(`Image:   ${row.image}`);
-  text.push(`From:    ${row.current_tag}`);
-  text.push(`To:      ${row.target_tag}`);
+  text.push(`From:    ${fromDisplay(row)}`);
+  text.push(`To:      ${toDisplay(row)}`);
   text.push(`Kind:    ${row.bump} bump`);
   if (row.bump !== "digest" && row.family?.startsWith("moving:")) {
     text.push(`Origin:  digest change on :${row.family.slice("moving:".length)}`);
@@ -1014,8 +1096,8 @@ function buildAppliedHtml(opts: AppliedHtmlOpts): string {
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Stack</td>   <td><strong>${e(row.stack)}</strong></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Service</td> <td>${e(row.service)}</td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Image</td>   <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.image)}</code></td></tr>
-    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code></td></tr>
-    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(fromDisplay(row))}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(toDisplay(row))}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Bump</td>    <td>${e(row.bump)}</td></tr>
     ${
       row.bump !== "digest" && row.family?.startsWith("moving:")
@@ -1080,10 +1162,25 @@ export function startDaemon(
     inFlight = (async () => {
       const started = Date.now();
       try {
+        // v0.6.0: recompute effective rules each tick so UI-set per-stack
+        // policy overrides (stack_policies table) take effect on the next scan
+        // without a daemon restart. DB overrides win over the file/env policy.
+        const effectiveRules = applyStackPolicyOverrides(
+          cfg.rules,
+          getAllStackPolicies(deps.db),
+        );
+        // v0.6.0: retire queue rows the current policy no longer holds before
+        // scanning (self-healing queue). auto-apply-eligible rows are requeued
+        // (deleted here, re-discovered + applied by the scan below).
+        const rec = reconcileOpenRows(deps.db, effectiveRules);
+        if (rec.dismissed + rec.requeued > 0)
+          deps.log(
+            `reconcile: ${rec.dismissed} dismissed, ${rec.requeued} requeued for auto-apply`,
+          );
         const result = await runScanOnce({
           db: deps.db,
           notifiers: deps.notifiers,
-          rules: cfg.rules,
+          rules: effectiveRules,
           composeFiles: deps.composeFiles,
           publicUrl: deps.publicUrl,
           llmUrl: deps.llmUrl,
@@ -1127,6 +1224,52 @@ export function startDaemon(
       await inFlight;
     },
   };
+}
+
+/**
+ * v0.6.0: reconcile the open queue against the current policy. A row created
+ * under an earlier policy (or bumpsight version) can be left in "needs
+ * decision" even though the current policy would auto-apply or skip it — the
+ * decision was effectively already made. This re-runs `decideAction` on every
+ * still-open row and retires the ones the current policy no longer holds:
+ *   - `skip` (e.g. a dep bump under `dependencies: none`) → dismissed (kept in
+ *     history; nothing to apply, policy says don't touch it).
+ *   - `auto-apply` (e.g. an app patch/minor) → the stale record is DELETED so
+ *     the very next scan re-discovers the *current* delta and applies it. This
+ *     never drops a genuinely-pending update (the scan re-derives current
+ *     state), and never applies a stale target.
+ *   - `hold` → left in the queue (majors, unclassifiable digests, notify).
+ * Runs before each scan so the queue self-heals as the policy changes. Returns
+ * {dismissed, requeued} counts.
+ */
+export function reconcileOpenRows(
+  db: DB,
+  rules: RulesConfig,
+): { dismissed: number; requeued: number } {
+  const rows = db
+    .prepare(
+      `SELECT id, stack, service, image, bump FROM updates
+       WHERE status IN ('pending','notified')
+         AND (superseded IS NULL OR superseded = 0)`,
+    )
+    .all() as Pick<UpdateRow, "id" | "stack" | "service" | "image" | "bump">[];
+  let dismissed = 0;
+  let requeued = 0;
+  for (const r of rows) {
+    const ref = parseImageRef(r.image);
+    const isDep = isDependencyImage(
+      ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+    );
+    const decision = decideAction(rules, r.stack, r.bump as BumpKind, isDep);
+    if (decision === "skip") {
+      dismissRow(db, r.id, "skip");
+      dismissed += 1;
+    } else if (decision === "auto-apply") {
+      deleteUpdate(db, r.id); // scan re-discovers + applies the current delta
+      requeued += 1;
+    }
+  }
+  return { dismissed, requeued };
 }
 
 export function buildComposeFileMap(paths: string[]): Record<string, string> {

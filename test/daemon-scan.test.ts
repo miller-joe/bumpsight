@@ -2,8 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runScanOnce, buildComposeFileMap } from "../src/daemon/index.js";
-import { openDb, listByStatus } from "../src/state/db.js";
+import { runScanOnce, buildComposeFileMap, reconcileOpenRows } from "../src/daemon/index.js";
+import { openDb, listByStatus, recordUpdate, findUpdate } from "../src/state/db.js";
 import type { Notifier, NotifyMessage } from "../src/notify/types.js";
 import type { CommandRunner } from "../src/apply/docker.js";
 
@@ -378,6 +378,8 @@ describe("runScanOnce", () => {
       composeFiles: { [stack]: file },
       publicUrl: "https://bump.example.com",
       listTagsFn: fakeListTags as never,
+      // stub the OCI decode so the digest path stays hermetic (no registry hit)
+      movingDeltaFn: async () => ({}),
     };
     // First scan: silent record
     await runScanOnce(deps);
@@ -748,5 +750,124 @@ describe("buildComposeFileMap", () => {
     ]);
     expect(Object.keys(map).sort()).toEqual(["glance", "jellyfin"]);
     expect(map.glance).toMatch(/glance\/compose.yaml$/);
+  });
+});
+
+describe("v0.6.0 reconcile + mute", () => {
+  it("reconcileOpenRows dismisses skips, requeues (deletes) auto-applies, keeps holds", () => {
+    const db = openDb({ path: ":memory:" });
+    const rules = { default: { app: "minor" as const, dependencies: "none" as const }, stacks: {} };
+    // app major → hold (kept)
+    const major = recordUpdate(db, { stack: "outline", service: "outline", image: "outlinewiki/outline:1", currentTag: "1.0.0", targetTag: "2.0.0", bump: "major" });
+    // app minor → auto-apply → deleted so the scan re-applies the current delta
+    const minor = recordUpdate(db, { stack: "grafana", service: "grafana", image: "grafana/grafana:1", currentTag: "10.0.0", targetTag: "10.1.0", bump: "minor" });
+    // dep major → skip under deps:none → dismissed (kept in history)
+    const dep = recordUpdate(db, { stack: "outline", service: "pg", image: "postgres:16", currentTag: "16", targetTag: "17", bump: "major" });
+    for (const id of [major, minor, dep]) db.prepare("UPDATE updates SET status='notified' WHERE id=?").run(id);
+
+    const rec = reconcileOpenRows(db, rules);
+    expect(rec).toEqual({ dismissed: 1, requeued: 1 });
+    expect(findUpdate(db, major)!.superseded).toBeNull();       // held stays
+    expect(findUpdate(db, minor)).toBeUndefined();              // auto-apply → deleted (scan re-applies)
+    expect(findUpdate(db, dep)!.superseded).toBe(1);
+    expect(findUpdate(db, dep)!.dismiss_reason).toBe("skip");
+  });
+
+  it("a muted service is skipped by the scan (no new rows surface)", async () => {
+    const { stack, file } = makeStack("dozzle", "amir20/dozzle:1.0.0");
+    const db = openDb({ path: ":memory:" });
+    const { muteService, listByStatus: list } = await import("../src/state/db.js");
+    muteService(db, stack, "dozzle");
+    const result = await runScanOnce({
+      db,
+      notifiers: [],
+      rules: { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: (async () => [{ name: "1.0.0" }, { name: "1.1.0" }]) as never,
+    });
+    expect(result.discovered).toBe(0); // muted → not scanned
+    expect(list(db, "notified")).toHaveLength(0);
+    rmSync(file, { force: true });
+  });
+});
+
+describe("v0.6.0 policy overrides + GUI-first notify", () => {
+  it("a DB stack-policy override beats the file/env rules", async () => {
+    const { stack, file } = makeStack("outline", "outlinewiki/outline:0.84.0");
+    const db = openDb({ path: ":memory:" });
+    const { setStackPolicy, getAllStackPolicies, listByStatus } = await import(
+      "../src/state/db.js"
+    );
+    const { applyStackPolicyOverrides } = await import("../src/daemon/rules.js");
+    // File policy would auto-apply a minor; the UI override forces hold.
+    setStackPolicy(db, stack, "notify", "none");
+    const fileRules = { default: { app: "minor" as const, dependencies: "none" as const }, stacks: {} };
+    const effective = applyStackPolicyOverrides(fileRules, getAllStackPolicies(db));
+
+    const result = await runScanOnce({
+      db,
+      notifiers: [],
+      rules: effective,
+      composeFiles: { [stack]: file },
+      listTagsFn: (async () => [{ name: "0.84.0" }, { name: "0.84.1" }]) as never,
+      runner: okRunner,
+    });
+    expect(result.held).toBe(1);
+    expect(result.autoApplied).toBe(0);
+    expect(listByStatus(db, "notified")).toHaveLength(1);
+    rmSync(file, { force: true });
+  });
+
+  it("a newer :latest digest supersedes the older still-open one and decodes the version", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-sup-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:latest\n`, "utf-8");
+    const stack = dir.split("/").pop()!;
+    const db = openDb({ path: ":memory:" });
+    const { listNeedsDecision, listAllUpdates } = await import("../src/state/db.js");
+    let digest = "sha256:aaaaaaaaaaaa1111";
+    const deps = {
+      db,
+      notifiers: [] as never[],
+      rules: { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: (async () => [{ name: "latest", digest }]) as never,
+      movingDeltaFn: async () => ({ from: "1.0.0", to: "1.1.0" }),
+    };
+    await runScanOnce(deps); // seed
+    digest = "sha256:bbbbbbbbbbbb2222";
+    await runScanOnce(deps); // first digest bump → row X
+    digest = "sha256:cccccccccccc3333";
+    await runScanOnce(deps); // second digest bump → row Y, supersedes X
+
+    const all = listAllUpdates(db).filter((r) => r.bump === "digest");
+    expect(all).toHaveLength(2);
+    const superseded = all.filter((r) => r.superseded === 1);
+    const open = listNeedsDecision(db, Date.now());
+    expect(superseded).toHaveLength(1); // the older one retired
+    expect(open.filter((r) => r.bump === "digest")).toHaveLength(1); // one clean card
+    expect(open[0]!.display_to).toBe("1.1.0"); // decoded, not a hash
+    rmSync(file, { force: true });
+  });
+
+  it("held bump with empty notifiers (notify_mode=digest) still advances to notified + persists advise", async () => {
+    const { stack, file } = makeStack("app", "nginx:1.27");
+    const db = openDb({ path: ":memory:" });
+    const { listByStatus } = await import("../src/state/db.js");
+    const result = await runScanOnce({
+      db,
+      notifiers: [], // <- per-event channel is silenced under notify_mode=digest
+      rules: { default: { app: "notify", dependencies: "notify" }, stacks: {} },
+      composeFiles: { [stack]: file },
+      llmUrl: "http://llm.local/v1",
+      adviseFn: (async () => ({ ok: true, summary: "no breaking changes", source: "release-notes", repo: "nginx/nginx", releaseCount: 1 })) as never,
+      listTagsFn: (async () => [{ name: "1.27" }, { name: "1.28" }]) as never,
+      runner: okRunner,
+    });
+    expect(result.held).toBe(1);
+    const notified = listByStatus(db, "notified");
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.advise_text).toBe("no breaking changes");
+    rmSync(file, { force: true });
   });
 });

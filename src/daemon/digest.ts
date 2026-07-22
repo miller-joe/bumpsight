@@ -3,7 +3,9 @@ import {
   findUndigestedApplied,
   findUndigestedSuppressed,
   getLastDigestSent,
+  listNeedsDecision,
   markDigested,
+  recordDigestFired,
 } from "../state/db.js";
 import { buildDigestEmail } from "../notify/digest.js";
 import { archiveMessage } from "../notify/outbox.js";
@@ -87,23 +89,34 @@ export async function runDigestOnce(
   deps: DigestSchedulerDeps,
 ): Promise<boolean> {
   const windowMs = deps.windowMs ?? 25 * 60 * 60 * 1000;
+  const nowMs = deps.now ? deps.now() : Date.now();
   const applied = findUndigestedApplied(deps.db, windowMs);
   const suppressed = findUndigestedSuppressed(deps.db, windowMs);
   const rows = [...applied, ...suppressed];
-  if (rows.length === 0) {
+  // v0.6.0: the "needs your decision" nudge. Under the GUI-first default
+  // (notify_mode=digest) held bumps get no per-event email; without this
+  // section they'd be email-invisible. Non-digest held rows only — digest-class
+  // held rows are already covered by `suppressed`. These are NOT marked
+  // digested (they persist as `notified` until the operator acts).
+  const needsDecision = listNeedsDecision(deps.db, nowMs).filter(
+    (r) => r.bump !== "digest",
+  );
+  if (rows.length === 0 && needsDecision.length === 0) {
     deps.log("digest: nothing to report — skipping send");
     return false;
   }
   const built = buildDigestEmail({
     rows,
-    date: new Date(deps.now ? deps.now() : Date.now()),
+    needsDecision,
+    date: new Date(nowMs),
     publicUrl: deps.publicUrl,
   });
   if (!built) return false;
   if (deps.notifiers.length === 0) {
-    // No notifiers configured — mark digested so we don't accumulate forever
-    // and log so the operator knows we suppressed an empty-channel send.
+    // No notifiers configured — mark digested so we don't accumulate forever,
+    // advance the fired marker so a decision-only digest doesn't spin, and log.
     markDigested(deps.db, built.rowIds);
+    recordDigestFired(deps.db, nowMs);
     deps.log(
       `digest: ${built.rowIds.length} row(s) marked digested (no notifiers configured)`,
     );
@@ -124,12 +137,16 @@ export async function runDigestOnce(
   }
   if (result.delivered > 0) {
     markDigested(deps.db, built.rowIds);
+    // Advance the fired marker unconditionally so a digest that only carried
+    // the needs-decision nudge (empty rowIds) still counts as "fired today".
+    recordDigestFired(deps.db, nowMs);
     deps.log(
       `digest: sent (${built.rowIds.length} rows: ` +
         `${built.sections.appliedAuto.length} auto, ` +
         `${built.sections.appliedApproved.length} approved, ` +
         `${built.sections.failures.length} failed, ` +
-        `${built.sections.suppressedDigests.length} digest-class)`,
+        `${built.sections.suppressedDigests.length} digest-class, ` +
+        `${needsDecision.length} awaiting)`,
     );
     return true;
   }

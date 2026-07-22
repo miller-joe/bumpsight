@@ -1,5 +1,6 @@
 import type { UpdateRow } from "../state/db.js";
 import type { NotifyMessage } from "./types.js";
+import { fromDisplay, toDisplay } from "../util/display.js";
 
 const BRAND_LOGO_INLINE = `<svg viewBox="0 0 96 96" width="36" height="36" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;flex:0 0 auto;" role="img" aria-label="bumpsight"><ellipse cx="20" cy="48" rx="6" ry="14" fill="#2563eb" fill-opacity="0.08"/><ellipse cx="20" cy="48" rx="6" ry="14"/><ellipse cx="48" cy="48" rx="5" ry="11"/><ellipse cx="76" cy="48" rx="4" ry="8"/><path d="M20 34 L48 37 L76 40"/><path d="M20 62 L48 59 L76 56"/><circle cx="20" cy="48" r="2.5" fill="#2563eb" stroke="none"/></svg>`;
 
@@ -61,10 +62,12 @@ function dateLabel(d: Date): string {
 }
 
 function rowDelta(row: UpdateRow): string {
-  if (row.bump === "digest") {
+  // Un-decoded digest bump: show the truncated-hash style. Once decoded to a
+  // version/date via OCI labels (display_from/display_to), show that instead.
+  if (!row.display_from && !row.display_to && row.bump === "digest") {
     return `digest sha256:${row.current_tag}… → sha256:${row.target_tag}…`;
   }
-  return `${row.current_tag} → ${row.target_tag}`;
+  return `${fromDisplay(row)} → ${toDisplay(row)}`;
 }
 
 function escapeHtml(s: string): string {
@@ -86,6 +89,10 @@ function escapeHtml(s: string): string {
 
 export interface BuildDigestOptions {
   rows: UpdateRow[];
+  /** v0.6.0: held bumps awaiting a human decision. Rendered as a "needs your
+   *  decision" nudge at the top so, under the GUI-first default, held items
+   *  aren't email-invisible. These are NOT consumed (no ids in rowIds). */
+  needsDecision?: UpdateRow[];
   /** The date this digest is being sent for. Used for the subject line. */
   date?: Date;
   /** Optional public URL — adds a "/queue" link to the email footer. */
@@ -103,12 +110,15 @@ export interface DigestEmail {
 export function buildDigestEmail(opts: BuildDigestOptions): DigestEmail | null {
   const sections = categorize(opts.rows);
   const total = totalCount(sections);
-  if (total === 0) return null;
+  const needsDecision = opts.needsDecision ?? [];
+  if (total === 0 && needsDecision.length === 0) return null;
 
   const date = opts.date ?? new Date();
   const label = dateLabel(date);
 
   const summary: string[] = [];
+  if (needsDecision.length > 0)
+    summary.push(`${needsDecision.length} awaiting decision`);
   if (sections.appliedAuto.length > 0)
     summary.push(`${sections.appliedAuto.length} auto-applied`);
   if (sections.appliedApproved.length > 0)
@@ -120,8 +130,8 @@ export function buildDigestEmail(opts: BuildDigestOptions): DigestEmail | null {
 
   const subject = `bumpsight daily digest — ${label} — ${summary.join(", ")}`;
 
-  const body = renderText(sections, label, opts.publicUrl);
-  const htmlBody = renderHtml(sections, label, opts.publicUrl);
+  const body = renderText(sections, label, opts.publicUrl, needsDecision);
+  const htmlBody = renderHtml(sections, label, opts.publicUrl, needsDecision);
 
   const rowIds: number[] = [
     ...sections.appliedAuto,
@@ -141,6 +151,7 @@ function renderText(
   sections: DigestSections,
   label: string,
   publicUrl?: string,
+  needsDecision: UpdateRow[] = [],
 ): string {
   const lines: string[] = [];
   lines.push(`Bumpsight daily digest — ${label}`);
@@ -162,6 +173,15 @@ function renderText(
     }
     lines.push("");
   };
+  if (needsDecision.length > 0) {
+    lines.push(`───── Needs your decision (${needsDecision.length}) ─────`);
+    lines.push(`Review + approve/deny in the dashboard${publicUrl ? `: ${publicUrl.replace(/\/+$/, "")}/queue` : ""}`);
+    for (const row of needsDecision) {
+      lines.push(`  • ${row.stack}/${row.service}: ${row.image}`);
+      lines.push(`    ${rowDelta(row)}  (${row.bump})`);
+    }
+    lines.push("");
+  }
   renderSection("Apply failures", sections.failures);
   renderSection("Auto-applied", sections.appliedAuto);
   renderSection("Approved & applied", sections.appliedApproved);
@@ -184,6 +204,7 @@ function renderHtml(
   sections: DigestSections,
   label: string,
   publicUrl?: string,
+  needsDecision: UpdateRow[] = [],
 ): string {
   const e = escapeHtml;
   const cfgs: SectionCfg[] = [
@@ -263,6 +284,21 @@ function renderHtml(
       </div>`;
   };
 
+  const needsHtml =
+    needsDecision.length > 0
+      ? `
+      <div style="margin-top:18px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:14px 16px;">
+        <div style="font-size:13px;font-weight:600;color:#92400e;margin-bottom:8px;">⏳ Needs your decision · ${needsDecision.length}</div>
+        <div style="font-size:12px;color:#92400e;margin-bottom:8px;">Review + approve/deny in the dashboard${publicUrl ? ` — <a href="${e(publicUrl.replace(/\/+$/, "") + "/queue")}" style="color:#b45309;">${e(publicUrl.replace(/\/+$/, "") + "/queue")}</a>` : ""}.</div>
+        ${needsDecision
+          .map(
+            (row) =>
+              `<div style="font-size:13px;color:#0f172a;padding:3px 0;">${e(row.stack)}/${e(row.service)} <span style="color:#94a3b8;">·</span> <code style="background:#f1f5f9;padding:1px 5px;border-radius:3px;font-size:12px;">${e(row.image)}</code> <span style="color:#94a3b8;">·</span> ${e(rowDelta(row))} <span style="color:#94a3b8;">(${e(row.bump)})</span></div>`,
+          )
+          .join("")}
+      </div>`
+      : "";
+
   const queueFooter = publicUrl
     ? `<p style="margin:24px 0 0 0;font-size:12px;color:#64748b;">Full queue: <a href="${e(publicUrl.replace(/\/+$/, "") + "/queue")}" style="color:#1d4ed8;">${e(publicUrl.replace(/\/+$/, "") + "/queue")}</a></p>`
     : "";
@@ -280,6 +316,7 @@ function renderHtml(
     </tr>
   </table>
   <div style="font-size:12px;color:#64748b;">${e(label)}</div>
+  ${needsHtml}
   ${cfgs.map(sectionHtml).join("")}
   ${queueFooter}
 </td></tr>

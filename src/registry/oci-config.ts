@@ -47,6 +47,12 @@ const INDEX_MEDIA_TYPES = new Set([
 export interface OciImageLabels {
   /** Labels merged from the config blob. May be empty. */
   labels: Record<string, string>;
+  /** v0.6.0: the image config's build timestamp (RFC3339). Taken from the
+   *  `org.opencontainers.image.created` label when present, else the config
+   *  blob's top-level `created` field (set by virtually every builder). Used
+   *  as a human-readable fallback delta for moving-tag digest bumps that carry
+   *  no version label. Undefined only when the blob couldn't be read. */
+  created?: string;
 }
 
 export interface FetchOciLabelsOptions {
@@ -69,6 +75,8 @@ interface ImageConfigBlob {
   config?: { Labels?: Record<string, string> | null };
   /** OCI sometimes nests labels at the root too. */
   Labels?: Record<string, string> | null;
+  /** Top-level image build timestamp (RFC3339). Present on nearly all images. */
+  created?: string;
 }
 
 /**
@@ -196,8 +204,13 @@ async function fetchLabelsWithToken(
   );
   if (!blobRes) return { labels: {} };
   const labels = blobRes.body.config?.Labels ?? blobRes.body.Labels ?? null;
-  if (!labels || typeof labels !== "object") return { labels: {} };
-  return { labels };
+  const created =
+    (labels && typeof labels === "object"
+      ? labels["org.opencontainers.image.created"]
+      : undefined) ??
+    (typeof blobRes.body.created === "string" ? blobRes.body.created : undefined);
+  if (!labels || typeof labels !== "object") return { labels: {}, created };
+  return { labels, created };
 }
 
 function repoPathFor(ref: ImageRef): string {
@@ -270,6 +283,21 @@ export function extractRevision(labels: Record<string, string>): string | undefi
   const rev = labels["org.opencontainers.image.revision"];
   if (typeof rev === "string" && rev.length > 0) return rev;
   const legacy = labels["org.label-schema.vcs-ref"];
+  if (typeof legacy === "string" && legacy.length > 0) return legacy;
+  return undefined;
+}
+
+/**
+ * v0.6.0: extract the image's self-reported version from
+ * `org.opencontainers.image.version` (legacy `org.label-schema.version`
+ * fallback). Returned verbatim — the caller decides whether it "looks like a
+ * version" (many images set this to a branch name like `main`/`master` or a
+ * base-image tag, which is useless as a version delta).
+ */
+export function extractVersion(labels: Record<string, string>): string | undefined {
+  const v = labels["org.opencontainers.image.version"];
+  if (typeof v === "string" && v.length > 0) return v;
+  const legacy = labels["org.label-schema.version"];
   if (typeof legacy === "string" && legacy.length > 0) return legacy;
   return undefined;
 }

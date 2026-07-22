@@ -1,6 +1,11 @@
 import { resolve, join } from "node:path";
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { startDaemon, runScanOnce, buildComposeFileMap } from "../daemon/index.js";
+import {
+  startDaemon,
+  runScanOnce,
+  buildComposeFileMap,
+  reconcileOpenRows,
+} from "../daemon/index.js";
 import { startDigestScheduler } from "../daemon/digest.js";
 import { startDeepPruneScheduler } from "../daemon/deep-prune.js";
 import {
@@ -9,13 +14,15 @@ import {
 } from "../daemon/watched-releases.js";
 import {
   buildApplyPairedDepsConfig,
+  buildNotifyMode,
   buildRulesConfig,
   buildWatchedReleases,
   loadConfigFile,
   type DaemonConfig,
 } from "../daemon/config.js";
+import { applyStackPolicyOverrides } from "../daemon/rules.js";
 import { parseDuration } from "../util/duration.js";
-import { openDb } from "../state/db.js";
+import { openDb, getAllStackPolicies } from "../state/db.js";
 import { buildNotifiers, parseNotifyEnv } from "../notify/index.js";
 import { startHttpServer } from "../server/http.js";
 
@@ -167,6 +174,15 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     }
   }
 
+  // v0.6.0: email verbosity (off | digest | all). Default `digest` — GUI-first.
+  const notifyMode = buildNotifyMode(
+    fileShape,
+    process.env.BUMPSIGHT_NOTIFY_MODE,
+    (msg) => process.stderr.write(`bumpsight daemon: ${msg}\n`),
+  );
+  // v0.6.0: optional shared secret gating the dashboard + POST action routes.
+  const uiToken = process.env.BUMPSIGHT_UI_TOKEN ?? fileShape.ui_token ?? undefined;
+
   const cfg: DaemonConfig = {
     dbPath,
     composeFiles: composeFiles.map((p) => resolve(p)),
@@ -188,10 +204,19 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     applyPairedDeps,
     watchedReleases,
     watchIntervalMs,
+    notifyMode,
+    uiToken,
   };
 
   const db = openDb({ path: cfg.dbPath });
   const notifiers = buildNotifiers(cfg.notifyUris);
+  // v0.6.0: the per-event email channels (hold + applied) only fire under
+  // `notify_mode: all`. In `digest`/`off` we hand those channels an empty
+  // notifier list — dispatch treats "no notifiers" as a successful no-op, so
+  // rows still advance to `notified` and advise_text still persists for the
+  // GUI; there's just no email. The daily digest keeps the real notifiers (and
+  // is only started at all when mode !== "off").
+  const perEvent = cfg.notifyMode === "all" ? notifiers : [];
   const log = (msg: string) =>
     process.stdout.write(`[${new Date().toISOString()}] ${msg}\n`);
   const composeMap = buildComposeFileMap(cfg.composeFiles);
@@ -212,14 +237,19 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       `digest=${cfg.digestHour < 0 ? "off" : `${String(cfg.digestHour).padStart(2, "0")}:00 local`}, ` +
       `prune=${cfg.pruneIntervalMs > 0 ? `every ${pruneScheduleRaw}` : "off"}, ` +
       `bundle_paired_deps=${describeBundling(cfg.applyPairedDeps)}, ` +
-      `watched_releases=${cfg.watchedReleases.length > 0 ? `${cfg.watchedReleases.length} repo(s) every ${watchIntervalRaw}` : "off"}`,
+      `watched_releases=${cfg.watchedReleases.length > 0 ? `${cfg.watchedReleases.length} repo(s) every ${watchIntervalRaw}` : "off"}, ` +
+      `notify_mode=${cfg.notifyMode}, ui_auth=${cfg.uiToken ? "on" : "off"}`,
   );
 
   if (opts.once) {
+    const onceRules = applyStackPolicyOverrides(cfg.rules, getAllStackPolicies(db));
+    const rec = reconcileOpenRows(db, onceRules);
+    if (rec.dismissed + rec.requeued > 0)
+      log(`reconcile: ${rec.dismissed} dismissed, ${rec.requeued} requeued for auto-apply`);
     const result = await runScanOnce({
       db,
-      notifiers,
-      rules: cfg.rules,
+      notifiers: perEvent,
+      rules: onceRules,
       composeFiles: composeMap,
       publicUrl: cfg.publicUrl,
       llmUrl: cfg.llmUrl,
@@ -268,7 +298,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     port: cfg.httpPort,
     host: cfg.httpHost,
     log,
-    notifiers,
+    notifiers: perEvent,
     llmUrl: cfg.llmUrl,
     llmKey: cfg.llmKey,
     llmModel: cfg.llmModel,
@@ -276,11 +306,14 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     outboxDir: cfg.outboxDir,
     outboxKeepCount: cfg.outboxKeepCount,
     applyPairedDeps: cfg.applyPairedDeps,
+    rules: cfg.rules,
+    publicUrl: cfg.publicUrl,
+    uiToken: cfg.uiToken,
   });
 
   const runtime = startDaemon(cfg, {
     db,
-    notifiers,
+    notifiers: perEvent,
     composeFiles: composeMap,
     publicUrl: cfg.publicUrl,
     llmUrl: cfg.llmUrl,
@@ -293,8 +326,11 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     applyPairedDeps: cfg.applyPairedDeps,
   });
 
+  // v0.6.0: the daily digest is the one email channel that survives the
+  // GUI-first default. It keeps the real notifiers (not the per-event `[]`),
+  // but is only started when digest is enabled AND email isn't fully off.
   const digestRuntime =
-    cfg.digestHour >= 0
+    cfg.digestHour >= 0 && cfg.notifyMode !== "off"
       ? startDigestScheduler({
           db,
           notifiers,

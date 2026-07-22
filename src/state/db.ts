@@ -30,6 +30,28 @@ export interface UpdateRow {
   digested_at: number | null;
   advise_text: string | null;
   paired_deps_json: string | null;
+  /** v0.6.0: when set and in the future, the row is snoozed — hidden from the
+   *  dashboard's "needs decision" section (and the daily-digest nudge) until
+   *  this timestamp passes. "Ignore" is modelled as a far-future value so it
+   *  stays reversible without adding a new status (a new status would force an
+   *  expensive CHECK-constraint table rebuild). Null = not snoozed. */
+  snoozed_until: number | null;
+  /** v0.6.0: human-readable display override for a moving-tag digest bump whose
+   *  digests were decoded to a version or build date via OCI labels (so the row
+   *  shows `2.20.14 → 2.20.15` instead of `sha256:abc… → sha256:def…`).
+   *  current_tag/target_tag remain the source of truth; these are display-only.
+   *  Either side may be null (fall back to the hash for that side). */
+  display_from: string | null;
+  display_to: string | null;
+  /** v0.6.0: 1 when this row has been retired from "needs decision" but kept in
+   *  history. Set for three cases (see dismiss_reason): a moving-tag digest
+   *  replaced by a newer one, a row the current policy would auto-apply/skip
+   *  (reconciled), or an app the operator muted. Modelled as a flag, not a
+   *  status, to stay on the cheap ADD COLUMN migration path. */
+  superseded: number | null;
+  /** v0.6.0: why the row was retired — 'superseded' | 'auto-apply' | 'skip' |
+   *  'muted'. Drives the history badge. Null on non-retired rows. */
+  dismiss_reason: string | null;
 }
 
 const SCHEMA = `
@@ -53,6 +75,11 @@ CREATE TABLE IF NOT EXISTS updates (
   digested_at     INTEGER,
   advise_text     TEXT,
   paired_deps_json TEXT,
+  snoozed_until   INTEGER,
+  display_from    TEXT,
+  display_to      TEXT,
+  superseded      INTEGER,
+  dismiss_reason  TEXT,
   UNIQUE (stack, service, current_tag, target_tag)
 );
 CREATE INDEX IF NOT EXISTS idx_updates_status ON updates(status);
@@ -89,6 +116,42 @@ CREATE TABLE IF NOT EXISTS watched_releases (
   notified_at   INTEGER,
   checked_at    INTEGER,
   advise_text   TEXT
+);
+
+-- v0.6.0: per-stack policy overrides set from the dashboard UI. These take
+-- precedence over the file/env default + stacks policy at scan time (the daemon
+-- merges this table into RulesConfig.stacks each tick). Kept in state rather
+-- than mutating the operator bumpsight.yaml so the change is reversible,
+-- survives config reloads, and never fights the git-tracked compose tree /
+-- commit-on-apply flow. Created via CREATE TABLE IF NOT EXISTS — no migrate()
+-- entry needed (same pattern as watched_releases).
+CREATE TABLE IF NOT EXISTS stack_policies (
+  stack         TEXT PRIMARY KEY,
+  app           TEXT NOT NULL,
+  dependencies  TEXT NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+-- v0.6.0: single-row marker of when the daily digest last fired. Before v0.6.0
+-- the "did we send today" check relied solely on MAX(updates.digested_at),
+-- which only advances when applied/suppressed rows are consumed. The new
+-- "needs your decision" digest section can be the sole reason a digest sends
+-- (no rows consumed), so we need a marker that advances on every send — else a
+-- decision-only digest would re-fire every scheduler tick all day.
+CREATE TABLE IF NOT EXISTS digest_state (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  last_fired_at INTEGER NOT NULL
+);
+
+-- v0.6.0: muted apps. "Ignore" mutes a (stack, service): existing open rows are
+-- retired and the scan skips it, so no future bumps for it surface either. The
+-- row is the reversible mute state — un-muting removes it and the scan resumes
+-- surfacing updates for that app.
+CREATE TABLE IF NOT EXISTS muted_services (
+  stack     TEXT NOT NULL,
+  service   TEXT NOT NULL,
+  muted_at  INTEGER NOT NULL,
+  PRIMARY KEY (stack, service)
 );
 `;
 
@@ -158,6 +221,53 @@ function migrate(db: DB): void {
     .get() as { sql: string } | undefined;
   if (u3 && !/\bpaired_deps_json\b/.test(u3.sql)) {
     db.exec("ALTER TABLE updates ADD COLUMN paired_deps_json TEXT");
+  }
+
+  // v0.6.0: snoozed_until powers the dashboard's snooze/ignore filter. Fresh
+  // installs get it from SCHEMA above; existing DBs get the ALTER here. The
+  // regex guard makes this a no-op once the column exists, and it's skipped on
+  // a brand-new DB (table absent → row undefined) where SCHEMA supplies it.
+  const u4 = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u4 && !/\bsnoozed_until\b/.test(u4.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN snoozed_until INTEGER");
+  }
+
+  // v0.6.0: display_from / display_to — human-readable delta for moving-tag
+  // digest bumps decoded via OCI labels. Same dual-add pattern (SCHEMA for
+  // fresh installs, guarded ALTER here for upgrades).
+  const u5 = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u5 && !/\bdisplay_from\b/.test(u5.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN display_from TEXT");
+    db.exec("ALTER TABLE updates ADD COLUMN display_to TEXT");
+  }
+
+  // v0.6.0: superseded flag — retires older moving-tag digest rows once a newer
+  // digest lands for the same (stack, service). Same dual-add pattern.
+  const u6 = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u6 && !/\bsuperseded\b/.test(u6.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN superseded INTEGER");
+  }
+
+  // v0.6.0: dismiss_reason — labels why a retired row left the queue.
+  const u7 = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u7 && !/\bdismiss_reason\b/.test(u7.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN dismiss_reason TEXT");
   }
 }
 
@@ -368,6 +478,215 @@ export function setPairedDeps(db: DB, id: number, json: string): void {
 }
 
 /**
+ * v0.6.0: set the human-readable display override for a moving-tag digest bump.
+ * Either side may be null (falls back to the hash for that side). current_tag /
+ * target_tag are left untouched — these are display-only.
+ */
+export function setDisplayTags(
+  db: DB,
+  id: number,
+  from: string | null,
+  to: string | null,
+): void {
+  db.prepare(
+    `UPDATE updates SET display_from = ?, display_to = ? WHERE id = ?`,
+  ).run(from, to, id);
+}
+
+// ─── v0.6.0: snooze / ignore (dashboard filter, no scan wiring) ──────────────
+
+/** Far-future timestamp used to model an indefinite "ignore" as a snooze. */
+export const SNOOZE_FOREVER = 4102444800000; // 2100-01-01T00:00:00Z
+
+/**
+ * Snooze a row until `untilMs`. Hidden from the dashboard "needs decision"
+ * section and the daily-digest nudge until then. Pass {@link SNOOZE_FOREVER}
+ * to "ignore" indefinitely. Purely a presentation filter — the scan loop is
+ * unaffected (a snoozed `notified` row is already left untouched by re-scans
+ * via the recordUpdate dedup + status guard).
+ */
+export function setSnooze(db: DB, id: number, untilMs: number): void {
+  db.prepare(`UPDATE updates SET snoozed_until = ? WHERE id = ?`).run(
+    untilMs,
+    id,
+  );
+}
+
+/** Clear a snooze so the row reappears in "needs decision". */
+export function clearSnooze(db: DB, id: number): void {
+  db.prepare(`UPDATE updates SET snoozed_until = NULL WHERE id = ?`).run(id);
+}
+
+/**
+ * Rows awaiting a human decision (`pending` or `notified`) that are not
+ * currently snoozed. Powers the dashboard's "Needs decision" section and the
+ * daily-digest nudge. `nowMs` is passed in so tests can control the clock.
+ */
+export function listNeedsDecision(db: DB, nowMs: number): UpdateRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM updates
+       WHERE status IN ('pending','notified')
+         AND (snoozed_until IS NULL OR snoozed_until <= ?)
+         AND (superseded IS NULL OR superseded = 0)
+       ORDER BY discovered_at DESC`,
+    )
+    .all(nowMs) as UpdateRow[];
+}
+
+/**
+ * v0.6.0: retire older still-open moving-tag digest rows for a (stack, service)
+ * once a newer digest bump lands for it. Marks every other pending/notified
+ * digest-class row for the same service (excluding `keepId`) as superseded, so
+ * the dashboard shows exactly one open card per moving-tag app — the current
+ * one — instead of a pile of undecodable old-build cards. Returns the count
+ * retired. Rows stay in history; only their "needs decision" visibility drops.
+ */
+export function supersedeOlderDigestRows(
+  db: DB,
+  stack: string,
+  service: string,
+  keepId: number,
+): number {
+  const r = db
+    .prepare(
+      `UPDATE updates SET superseded = 1, dismiss_reason = 'superseded'
+       WHERE stack = ? AND service = ? AND bump = 'digest'
+         AND id != ?
+         AND status IN ('pending','notified')
+         AND (superseded IS NULL OR superseded = 0)`,
+    )
+    .run(stack, service, keepId);
+  return r.changes;
+}
+
+/**
+ * v0.6.0: retire a single open row from the queue with a reason, keeping it in
+ * history. Used by the reconcile pass (for `skip`), by mute ('muted'), and by
+ * phantom suppression ('unchanged'). Only affects still-open rows.
+ */
+export function dismissRow(db: DB, id: number, reason: string): void {
+  db.prepare(
+    `UPDATE updates SET superseded = 1, dismiss_reason = ?
+     WHERE id = ? AND status IN ('pending','notified')`,
+  ).run(reason, id);
+}
+
+/**
+ * v0.6.0: delete a row outright. Used by reconcile for auto-apply-eligible rows
+ * so the next scan re-discovers the CURRENT delta and applies it (rather than
+ * dismissing a possibly-stale row, which the scan's dedup would then skip —
+ * silently dropping a genuinely-pending update). The update itself is never
+ * lost: the scan always re-derives current state; only the stale record goes.
+ */
+export function deleteUpdate(db: DB, id: number): void {
+  db.prepare(`DELETE FROM updates WHERE id = ?`).run(id);
+}
+
+// ─── v0.6.0: muted apps ──────────────────────────────────────────────────────
+
+/** Mute a (stack, service): retire its open rows and stop the scan surfacing it. */
+export function muteService(db: DB, stack: string, service: string): void {
+  db.prepare(
+    `INSERT INTO muted_services (stack, service, muted_at) VALUES (?, ?, ?)
+     ON CONFLICT(stack, service) DO NOTHING`,
+  ).run(stack, service, Date.now());
+  db.prepare(
+    `UPDATE updates SET superseded = 1, dismiss_reason = 'muted'
+     WHERE stack = ? AND service = ? AND status IN ('pending','notified')
+       AND (superseded IS NULL OR superseded = 0)`,
+  ).run(stack, service);
+}
+
+/** Un-mute a (stack, service) so the scan surfaces its updates again. */
+export function unmuteService(db: DB, stack: string, service: string): void {
+  db.prepare(`DELETE FROM muted_services WHERE stack = ? AND service = ?`).run(
+    stack,
+    service,
+  );
+}
+
+export interface MutedServiceRow {
+  stack: string;
+  service: string;
+  muted_at: number;
+}
+
+/** All muted (stack, service) pairs, for the scan skip-set and the UI list. */
+export function getMutedServices(db: DB): MutedServiceRow[] {
+  return db
+    .prepare(`SELECT stack, service, muted_at FROM muted_services ORDER BY stack, service`)
+    .all() as MutedServiceRow[];
+}
+
+/**
+ * Every update row, newest first. The dashboard groups these by stack/service
+ * for the per-app history view and slices the head for the activity timeline.
+ * Homelab-scale — a bounded number of rows — so no LIMIT; group/slice in the
+ * render layer.
+ */
+export function listAllUpdates(db: DB): UpdateRow[] {
+  return db
+    .prepare(`SELECT * FROM updates ORDER BY discovered_at DESC`)
+    .all() as UpdateRow[];
+}
+
+// ─── v0.6.0: per-stack policy overrides (set from the dashboard UI) ───────────
+
+export interface StackPolicyRow {
+  stack: string;
+  app: string;
+  dependencies: string;
+  updated_at: number;
+}
+
+/**
+ * All UI-set per-stack policy overrides, keyed by stack name. The daemon merges
+ * these into RulesConfig.stacks each scan tick (DB wins over the file/env
+ * policy). Values are stored as raw BumpAction strings and validated by the
+ * caller before write.
+ */
+export function getAllStackPolicies(
+  db: DB,
+): Record<string, { app: string; dependencies: string }> {
+  const rows = db
+    .prepare(`SELECT stack, app, dependencies FROM stack_policies`)
+    .all() as { stack: string; app: string; dependencies: string }[];
+  const out: Record<string, { app: string; dependencies: string }> = {};
+  for (const r of rows) out[r.stack] = { app: r.app, dependencies: r.dependencies };
+  return out;
+}
+
+/** One stack's override, or undefined if none is set. */
+export function getStackPolicy(db: DB, stack: string): StackPolicyRow | undefined {
+  return db
+    .prepare(`SELECT * FROM stack_policies WHERE stack = ?`)
+    .get(stack) as StackPolicyRow | undefined;
+}
+
+/** Upsert a per-stack policy override. */
+export function setStackPolicy(
+  db: DB,
+  stack: string,
+  app: string,
+  dependencies: string,
+): void {
+  db.prepare(
+    `INSERT INTO stack_policies (stack, app, dependencies, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(stack) DO UPDATE SET
+       app = excluded.app,
+       dependencies = excluded.dependencies,
+       updated_at = excluded.updated_at`,
+  ).run(stack, app, dependencies, Date.now());
+}
+
+/** Remove a stack's override so it falls back to the file/env default. */
+export function clearStackPolicy(db: DB, stack: string): void {
+  db.prepare(`DELETE FROM stack_policies WHERE stack = ?`).run(stack);
+}
+
+/**
  * Daily-digest support (v0.4.0). Returns rows that were applied (or failed
  * apply) in the given window AND haven't been included in a digest yet.
  * Caller marks them digested via `markDigested` once the daily report email
@@ -423,7 +742,26 @@ export function getLastDigestSent(db: DB): number | null {
   const row = db
     .prepare(`SELECT MAX(digested_at) AS t FROM updates`)
     .get() as { t: number | null } | undefined;
-  return row?.t ?? null;
+  const marker = db
+    .prepare(`SELECT last_fired_at AS t FROM digest_state WHERE id = 1`)
+    .get() as { t: number | null } | undefined;
+  const a = row?.t ?? null;
+  const b = marker?.t ?? null;
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.max(a, b);
+}
+
+/**
+ * v0.6.0: record that the daily digest fired at `ts`. Advances the marker used
+ * by the scheduler's once-per-day check even when no rows were consumed (e.g. a
+ * digest that only carried the "needs your decision" nudge).
+ */
+export function recordDigestFired(db: DB, ts: number): void {
+  db.prepare(
+    `INSERT INTO digest_state (id, last_fired_at) VALUES (1, ?)
+     ON CONFLICT(id) DO UPDATE SET last_fired_at = excluded.last_fired_at`,
+  ).run(ts);
 }
 
 export function markDigested(db: DB, ids: number[]): void {

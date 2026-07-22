@@ -2,6 +2,30 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.6.0 — 2026-07-21
+
+GUI-first — a proper web dashboard becomes the primary surface for seeing every app's update history and making per-app decisions, and email is demoted to an optional, quiet channel. With a large number of stacks, per-event approve/deny emails get noisy and easy to ignore; the dashboard (and the SQLite log behind it) is now where updates land, with email reduced by default to a single daily digest that also nudges you about anything awaiting a decision. Bumpsight is now essentially a GUI version of Watchtower — but human-in-the-loop, with history.
+
+### ⚠️ Breaking default
+
+- **`notify_mode` defaults to `digest`.** Per-event hold and applied emails are **off** by default; only the daily digest fires (and it now carries a "needs your decision" section so held bumps aren't email-invisible). Set `notify_mode: all` (file) or `BUMPSIGHT_NOTIFY_MODE=all` to restore the pre-0.6.0 per-event email behavior; `off` silences email entirely and makes the dashboard the only surface. The GUI/DB always logs everything regardless of mode. (Precedent: the 0.5.0→0.5.1 policy-default changes.)
+
+### Added
+
+- **Dashboard (`src/server/http.ts`).** The old read-only `/queue` page grows into an interactive dashboard at `/` (and `/queue`): a "Needs decision" section with per-update **Approve / Deny / Snooze / Ignore** actions, an **update-history-by-app** view (grouped stack → service, newest-first), a recent-activity timeline, client-side filtering, dark mode, and an inline **per-stack policy editor**. Server-rendered, no new dependencies, no frontend build — inline CSS/JS only.
+- **Token-addressed action API.** `POST /api/updates/:token/{approve,deny,apply,snooze,unsnooze}` and `POST /api/stacks/:stack/policy`. Every discovered row now mints an `approval_token` (previously only holds did), so the whole dashboard uses the same unguessable-capability model — no enumerable integer ids. The existing `GET /approve/:token` and `/deny/:token` email links are unchanged. Force-`apply` also retries `failed`/`denied` rows; a conditional claim (`status IN …`) closes the race with a concurrent scan.
+- **Per-stack policy overrides from the UI (`stack_policies` table).** Overrides are stored in state (not by mutating `bumpsight.yaml`) and merged over the file/env rules on every scan tick — DB wins per stack, reversible from the UI, and never fights the git-tracked compose tree.
+- **Snooze / ignore (`updates.snoozed_until`).** Hide a held bump from "needs decision" for a duration, or ignore it indefinitely. Purely a dashboard filter — the scan loop is unaffected.
+- **`notify_mode` (`off | digest | all`, default `digest`) and optional `BUMPSIGHT_UI_TOKEN` / `ui_token`.** The UI token gates the dashboard + POST actions (unset = open, LAN-only posture); email approve/deny links are never gated by it. POST routes also enforce a same-origin JSON CSRF guard regardless.
+- **Daily digest "Needs your decision" section.** So under the new quiet default, held bumps still surface as one daily email nudge with a link to the dashboard. A new `digest_state` marker advances the once-per-day fire even when a digest carries only the nudge (no consumed rows).
+
+### Tests
+
+- `test/http.test.ts` — dashboard render, `POST apply`, snooze-hides-from-needs-decision, CSRF rejection, UI-token gate, policy-upsert + validation.
+- `test/state.test.ts` — snooze filter + `SNOOZE_FOREVER`, `stack_policies` CRUD, `snoozed_until` migration on a pre-0.6.0 DB, `digest_state` marker.
+- `test/daemon-scan.test.ts` — DB policy override beats file rules; held bump with empty notifiers (digest mode) still reaches `notified` + persists advise.
+- `test/digest.test.ts` — "needs your decision" section render + a decision-only digest that advances the fired marker without consuming rows.
+
 ## 0.5.8 — 2026-06-09
 
 Commit-on-apply — when a target stack directory is a git working copy, an auto- or approved bump commits the rewritten compose file so the change lands as a tracked commit instead of leaving the tree dirty. Opt-in (`BUMPSIGHT_GIT_COMMIT`, default off) so it never touches git in deployments that don't keep their stacks under version control. (Pairs with the homelab move to check out each `infra/<stack>` repo directly at its live deploy dir.)
