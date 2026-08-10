@@ -262,8 +262,15 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       applyPairedDeps: cfg.applyPairedDeps,
     });
     log(
-      `scan: ${result.scanned} services, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held)`,
+      `scan: ${result.scanned} services` +
+        (result.skipped > 0 ? ` (${result.skipped} skipped)` : "") +
+        `, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held)`,
     );
+    for (const [reg, refs] of Object.entries(result.skippedByRegistry)) {
+      log(
+        `scan-skip: registry ${reg} has no client — ${refs.length} image(s) NOT checked: ${refs.join(", ")}`,
+      );
+    }
     for (const [k, v] of Object.entries(result.errors)) {
       log(`scan-error: ${k}: ${v}`);
     }

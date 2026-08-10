@@ -121,3 +121,92 @@ describe("compareTags directly", () => {
     expect(compareTags(parseTag("2.0.0"), parseTag("1.9.9"))).toBeGreaterThan(0);
   });
 });
+
+describe("findLatestInFamily — LinuxServer dual tag shapes", () => {
+  // LinuxServer publishes each build twice: `X-lsN` and `version-X`. Both
+  // parse to the same family with identical numerics, so the tiebreak has to
+  // keep the operator's pinning convention.
+  const candidates = [
+    "4.0.19",
+    "version-4.0.19.2979",
+    "4.0.19.2979-ls321",
+    "latest",
+    "arm64v8-4.0.19.2979-ls321",
+    "develop-4.0.19.2997-ls183",
+  ];
+
+  it("keeps the -ls shape when the current pin uses it", () => {
+    expect(findLatestInFamily("4.0.17.2952-ls309", candidates)).toBe("4.0.19.2979-ls321");
+  });
+
+  it("keeps the -ls shape regardless of registry ordering", () => {
+    const reordered = [...candidates].reverse();
+    expect(findLatestInFamily("4.0.17.2952-ls309", reordered)).toBe("4.0.19.2979-ls321");
+  });
+
+  it("keeps the version- shape when the current pin uses it", () => {
+    expect(findLatestInFamily("version-4.0.17.2952", candidates)).toBe("version-4.0.19.2979");
+    expect(findLatestInFamily("version-4.0.17.2952", [...candidates].reverse())).toBe(
+      "version-4.0.19.2979",
+    );
+  });
+
+  it("does not treat a shape swap at the same version as an upgrade", () => {
+    // Same build, other shape — must not be offered as a bump.
+    expect(findLatestInFamily("4.0.19.2979-ls321", ["version-4.0.19.2979"])).toBeNull();
+    expect(findLatestInFamily("version-4.0.19.2979", ["4.0.19.2979-ls321"])).toBeNull();
+  });
+
+  it("ignores arch-prefixed and channel-prefixed variants", () => {
+    expect(findLatestInFamily("4.0.17.2952-ls309", candidates)).not.toContain("arm64v8");
+    expect(findLatestInFamily("4.0.17.2952-ls309", candidates)).not.toContain("develop");
+  });
+
+  it("will not cross the one-time ls tag-scheme change on its own", () => {
+    // LinuxServer moved qbittorrent from `5.1.4-r3-ls452` (no bundled-library
+    // marker) to `5.2.3_v2.0.13-ls470`. There is no way to know from the old
+    // tag whether the operator wants the libtorrent v1 or v2 line, so this
+    // stays a deliberate hold rather than a guess. Once pinned to a `_vN`
+    // tag, subsequent bumps track normally (see the suite below).
+    expect(
+      findLatestInFamily("5.1.4-r3-ls452", ["5.2.3_v2.0.13-ls470", "latest"]),
+    ).toBeNull();
+  });
+});
+
+describe("findLatestInFamily — bundled-library variants", () => {
+  it("keeps the library major line as a hard variant boundary", () => {
+    expect(parseTag("5.2.3_v2.0.13-ls470").family).toBe("semver_v2:3");
+    expect(parseTag("5.2.3_v1.2.20-ls127").family).toBe("semver_v1:3");
+  });
+
+  it("never auto-crosses from the v1 line to the v2 line", () => {
+    expect(
+      findLatestInFamily("5.2.3_v1.2.20-ls127", ["5.2.4_v2.0.14-ls472", "latest"]),
+    ).toBeNull();
+  });
+
+  it("tracks the app version across a library patch", () => {
+    // The regression this guards: before the family collapse, a libtorrent
+    // patch minted a brand-new family and the app silently stopped tracking.
+    expect(
+      findLatestInFamily("5.2.3_v2.0.13-ls470", ["5.2.4_v2.0.14-ls472", "latest"]),
+    ).toBe("5.2.4_v2.0.14-ls472");
+  });
+
+  it("stays on the v1 line when a v1 upgrade exists", () => {
+    expect(
+      findLatestInFamily("5.2.3_v1.2.20-ls127", ["5.2.4_v1.2.20-ls128", "5.2.4_v2.0.14-ls472"]),
+    ).toBe("5.2.4_v1.2.20-ls128");
+  });
+
+  it("prefers the higher library version at the same app version", () => {
+    expect(
+      findLatestInFamily("5.2.3_v2.0.13-ls470", ["5.2.4_v2.0.13-ls471", "5.2.4_v2.0.14-ls472"]),
+    ).toBe("5.2.4_v2.0.14-ls472");
+    // ...and independently of registry ordering.
+    expect(
+      findLatestInFamily("5.2.3_v2.0.13-ls470", ["5.2.4_v2.0.14-ls472", "5.2.4_v2.0.13-ls471"]),
+    ).toBe("5.2.4_v2.0.14-ls472");
+  });
+});

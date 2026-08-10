@@ -896,3 +896,70 @@ describe("v0.6.0 policy overrides + GUI-first notify", () => {
     rmSync(file, { force: true });
   });
 });
+
+describe("runScanOnce — unsupported-registry accounting", () => {
+  it("counts and reports a skipped registry instead of dropping it silently", async () => {
+    const { stack, file } = makeStack("exporter", "quay.io/prometheus/node-exporter:v1.8.1");
+    const db = openDb({ path: ":memory:" });
+
+    const result = await runScanOnce({
+      db,
+      notifiers: [],
+      rules: { default: { app: "minor", dependencies: "none" }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: (async () => {
+        throw new Error("must not be called for an unsupported registry");
+      }) as never,
+    });
+
+    expect(result.skipped).toBe(1);
+    expect(result.skippedByRegistry["quay.io"]).toEqual([
+      "quay.io/prometheus/node-exporter:v1.8.1",
+    ]);
+    expect(result.discovered).toBe(0);
+    rmSync(file, { force: true });
+  });
+
+  it("reports zero skips when every registry is supported", async () => {
+    const { stack, file } = makeStack("app", "nginx:1.27");
+    const db = openDb({ path: ":memory:" });
+
+    const result = await runScanOnce({
+      db,
+      notifiers: [],
+      rules: { default: { app: "none", dependencies: "none" }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: (async () => [{ name: "1.27" }]) as never,
+    });
+
+    expect(result.skipped).toBe(0);
+    expect(result.skippedByRegistry).toEqual({});
+    rmSync(file, { force: true });
+  });
+
+  it("scans lscr.io images instead of skipping them", async () => {
+    const { stack, file } = makeStack(
+      "qbittorrent",
+      "lscr.io/linuxserver/qbittorrent:5.1.4-r3-ls452",
+    );
+    const db = openDb({ path: ":memory:" });
+    const seen: string[] = [];
+
+    const result = await runScanOnce({
+      db,
+      notifiers: [],
+      rules: { default: { app: "notify", dependencies: "none" }, stacks: {} },
+      composeFiles: { [stack]: file },
+      listTagsFn: (async (ref: { raw: string }) => {
+        seen.push(ref.raw);
+        return [{ name: "5.1.4-r3-ls452" }, { name: "5.2.3-r0-ls470" }];
+      }) as never,
+    });
+
+    // The regression: this used to be 1 skipped / 0 discovered.
+    expect(result.skipped).toBe(0);
+    expect(seen).toEqual(["lscr.io/linuxserver/qbittorrent:5.1.4-r3-ls452"]);
+    expect(result.discovered).toBe(1);
+    rmSync(file, { force: true });
+  });
+});

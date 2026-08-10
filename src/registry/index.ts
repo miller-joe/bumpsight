@@ -1,18 +1,23 @@
 import type { ImageRef } from "../compose/parse.js";
 import { listDockerHubTags, type RemoteTag, type FetchTagsOptions } from "./dockerhub.js";
 import { listGhcrTags } from "./ghcr.js";
+import { isDockerHubRegistry, toDockerHubRef } from "./mirrors.js";
 
 export type { RemoteTag, FetchTagsOptions } from "./dockerhub.js";
 export { fetchManifestDigest } from "./manifest.js";
+export { isDockerHubRegistry, isDockerHubMirror, toDockerHubRef } from "./mirrors.js";
 
 /**
  * Dispatch to the correct registry client for an image. Unsupported
  * registries throw with a clear message so the CLI can skip them.
+ *
+ * Docker Hub mirrors (see `mirrors.ts`) are normalized onto docker.io first,
+ * so `lscr.io/linuxserver/sonarr` resolves against `linuxserver/sonarr`.
  */
 export async function listTags(ref: ImageRef, opts: FetchTagsOptions = {}): Promise<RemoteTag[]> {
   const reg = ref.registry;
-  if (!reg || reg === "docker.io" || reg === "index.docker.io") {
-    return listDockerHubTags(ref, opts);
+  if (isDockerHubRegistry(reg)) {
+    return listDockerHubTags(toDockerHubRef(ref), opts);
   }
   if (reg === "ghcr.io") {
     return listGhcrTags(ref, opts);
@@ -21,7 +26,5 @@ export async function listTags(ref: ImageRef, opts: FetchTagsOptions = {}): Prom
 }
 
 export function isSupportedRegistry(ref: ImageRef): boolean {
-  const reg = ref.registry;
-  if (!reg) return true;
-  return reg === "docker.io" || reg === "index.docker.io" || reg === "ghcr.io";
+  return isDockerHubRegistry(ref.registry) || ref.registry === "ghcr.io";
 }

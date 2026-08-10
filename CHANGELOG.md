@@ -2,6 +2,48 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.6.1 — 2026-08-09
+
+A coverage bug, and the reason it went unnoticed. `lscr.io` was never in the
+supported-registry list, so every LinuxServer.io image was dropped by the scan
+loop's `isSupportedRegistry` guard — and the drop was a bare `continue`, with no
+error, no log line and no state row. Eight images across the media stack
+(qbittorrent ×2, sonarr, radarr, prowlarr, plex, lidarr, beets) were never once
+evaluated, while the scan line reported them as part of the covered total.
+qbittorrent sat on 5.1.4 for two months; 5.2.2 had shipped a fix for a WebUI
+login loop that made the client unusable through a browser.
+
+### Fixed
+
+- **`lscr.io` is now resolved as a Docker Hub mirror** (`src/registry/mirrors.ts`).
+  `lscr.io/linuxserver/<name>` is the same repository as Docker Hub's
+  `linuxserver/<name>`, so tag listing, manifest digests and OCI labels all
+  route through the existing Docker Hub client. The ref's `raw` is preserved, so
+  state rows and the compose rewrite keep the original `lscr.io/...` registry.
+- **Unsupported registries are never a silent skip.** `ScanRunResult` gains
+  `skipped` and `skippedByRegistry`; the scan line appends `(N skipped)` and each
+  affected registry gets its own `scan-skip:` line naming the images that were
+  **not** checked. An image bumpsight cannot see is strictly worse than one it
+  errors on, and it should never be able to read as coverage.
+- **LinuxServer's dual tag shapes no longer flip the pin.** Every build ships as
+  both `4.0.19.2979-ls321` and `version-4.0.19.2979`; both parse into the same
+  family with identical numerics, so the winner was decided by registry listing
+  order — an auto-apply could rewrite a `-ls`-pinned image to the `version-`
+  form with no version change at all. Ties now prefer the shape already pinned.
+- **A bundled-library patch no longer hides the app.** `5.2.3_v2.0.13-ls470`
+  encodes qBittorrent 5.2.3 built against libtorrent 2.0.13. The full library
+  version was part of the family discriminator, so every library patch minted a
+  new family and silently stopped tracking the app. The family now keeps only
+  the library **major** line — v1 and v2 builds still never auto-cross — and the
+  full version breaks ties, preferring the higher library build.
+
+### Tests
+
+- 335 tests (was 309). New `test/registry-mirrors.test.ts` (mirror resolution,
+  ref preservation, Docker Hub URL routing); `test/daemon-scan.test.ts` gains
+  skip accounting and an lscr.io scan case; `test/semver.test.ts` covers the
+  dual-shape tiebreak and the bundled-library variant boundary.
+
 ## 0.6.0 — 2026-07-22
 
 GUI-first — a proper web dashboard becomes the primary surface for seeing every app's update history and making per-app decisions, and email is demoted to an optional, quiet channel. With a large number of stacks, per-event approve/deny emails get noisy and easy to ignore; the dashboard (and the SQLite log behind it) is now where updates land, with email reduced by default to a single daily digest that also nudges you about anything awaiting a decision. Bumpsight is now essentially a GUI version of Watchtower — but human-in-the-loop, with history — and the decision queue is deliberately kept to the calls that are genuinely yours to make: majors and things it can't reason about, while patch/minor auto-apply, moving tags roll, and dependencies are quarantined.

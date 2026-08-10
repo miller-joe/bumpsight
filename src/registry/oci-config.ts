@@ -20,6 +20,7 @@
  */
 
 import type { ImageRef } from "../compose/parse.js";
+import { isDockerHubRegistry } from "./mirrors.js";
 
 const MANIFEST_ACCEPT = [
   "application/vnd.docker.distribution.manifest.v2+json",
@@ -80,8 +81,9 @@ interface ImageConfigBlob {
 }
 
 /**
- * Resolve OCI labels for `image` at `digest`. Supports docker.io and ghcr.io.
- * Anything else returns `{ labels: {} }`.
+ * Resolve OCI labels for `image` at `digest`. Supports docker.io (including
+ * its mirrors, see `mirrors.ts`) and ghcr.io. Anything else returns
+ * `{ labels: {} }`.
  */
 export async function fetchOciLabels(
   ref: ImageRef,
@@ -104,7 +106,7 @@ async function acquireToken(
   signal?: AbortSignal,
 ): Promise<RegistryAuth | null> {
   const reg = ref.registry;
-  if (!reg || reg === "docker.io" || reg === "index.docker.io") {
+  if (isDockerHubRegistry(reg)) {
     const namespace = ref.namespace ?? "library";
     const repoPath = `${namespace}/${ref.name}`;
     const tokenUrl = `https://auth.docker.io/token?service=registry.docker.io&scope=repository:${encodeURIComponent(repoPath)}:pull`;

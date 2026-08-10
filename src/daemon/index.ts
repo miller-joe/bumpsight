@@ -68,6 +68,15 @@ export interface ScanRunResult {
   held: number;
   /** Errors encountered, keyed by image ref. */
   errors: Record<string, string>;
+  /**
+   * v0.6.1: services dropped because their registry has no client. Counted
+   * separately from `scanned` and always logged — an unsupported registry
+   * used to be a bare `continue`, so a whole registry could go unevaluated
+   * while the scan line still reported it as covered.
+   */
+  skipped: number;
+  /** Image refs skipped, grouped by registry. */
+  skippedByRegistry: Record<string, string[]>;
 }
 
 export interface ScanRunDeps {
@@ -138,6 +147,8 @@ export async function runScanOnce(
     autoAppliedOk: 0,
     held: 0,
     errors: {},
+    skipped: 0,
+    skippedByRegistry: {},
   };
   const lister = deps.listTagsFn ?? listTags;
   const manifestFetcher = deps.fetchManifestDigestFn ?? fetchManifestDigest;
@@ -169,7 +180,14 @@ export async function runScanOnce(
       if (mutedSet.has(`${stack}::${serviceName}`)) continue; // muted app — skip
       result.scanned += 1;
       const ref = parseImageRef(svc.image!);
-      if (!isSupportedRegistry(ref)) continue;
+      if (!isSupportedRegistry(ref)) {
+        // Never a silent drop: an unsupported registry means this image is
+        // not being watched at all, which is strictly worse than an error.
+        const reg = ref.registry ?? "(none)";
+        result.skipped += 1;
+        (result.skippedByRegistry[reg] ??= []).push(ref.raw);
+        continue;
+      }
 
       let tags: Awaited<ReturnType<typeof lister>>;
       try {
@@ -1214,9 +1232,16 @@ export function startDaemon(
         });
         const ms = Date.now() - started;
         deps.log(
-          `scan: ${result.scanned} services, ${result.discovered} new ` +
+          `scan: ${result.scanned} services` +
+            (result.skipped > 0 ? ` (${result.skipped} skipped)` : "") +
+            `, ${result.discovered} new ` +
             `(${result.autoApplied} auto, ${result.autoAppliedOk} applied ok, ${result.held} held), ${ms}ms`,
         );
+        for (const [reg, refs] of Object.entries(result.skippedByRegistry)) {
+          deps.log(
+            `scan-skip: registry ${reg} has no client — ${refs.length} image(s) NOT checked: ${refs.join(", ")}`,
+          );
+        }
         for (const [k, v] of Object.entries(result.errors)) {
           deps.log(`scan-error: ${k}: ${v}`);
         }

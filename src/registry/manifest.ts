@@ -1,4 +1,5 @@
 import type { ImageRef } from "../compose/parse.js";
+import { isDockerHubRegistry, toDockerHubRef } from "./mirrors.js";
 
 const MANIFEST_ACCEPT = [
   "application/vnd.docker.distribution.manifest.v2+json",
@@ -16,8 +17,9 @@ export interface FetchManifestOptions {
  * via the Docker Registry v2 protocol. Returns undefined when the manifest
  * is missing or the registry doesn't expose a digest header.
  *
- * Supports docker.io and ghcr.io. Both require a per-request anonymous
- * pull token; the auth realm differs between them.
+ * Supports docker.io (including its mirrors, see `mirrors.ts`) and ghcr.io.
+ * Both require a per-request anonymous pull token; the auth realm differs
+ * between them.
  */
 export async function fetchManifestDigest(
   ref: ImageRef,
@@ -25,8 +27,8 @@ export async function fetchManifestDigest(
   opts: FetchManifestOptions = {},
 ): Promise<string | undefined> {
   const reg = ref.registry;
-  if (!reg || reg === "docker.io" || reg === "index.docker.io") {
-    return fetchDockerHubManifestDigest(ref, tag, opts);
+  if (isDockerHubRegistry(reg)) {
+    return fetchDockerHubManifestDigest(toDockerHubRef(ref), tag, opts);
   }
   if (reg === "ghcr.io") {
     return fetchGhcrManifestDigest(ref, tag, opts);
