@@ -2,6 +2,47 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.6.2 — 2026-08-13
+
+A misclassification that made the most security-sensitive service in the fleet
+the least likely to get updated. `hashicorp/vault` is in
+`KNOWN_DEPENDENCY_IMAGES` for a good reason — in ~30 stacks it runs as a
+`vault-agent` sidecar, and sidecars should follow their parent app's cadence
+rather than being bumped independently. But `isDependencyImage()` only ever saw
+an image name, and an image name alone cannot distinguish a sidecar from the
+Vault *server*. So the stack running Vault itself was routed to the
+`dependencies` policy axis, which defaults to `none`: its updates were recorded
+and shown in the GUI, but never auto-applied and never emailed. Vault sat on
+2.0.0 while 2.0.1 through 2.0.4 shipped, with two dormant rows in the queue and
+no notification about either.
+
+The general shape of the bug is "a dependency-listed image can also be an app,"
+so the fix is positional rather than a carve-out for Vault.
+
+### Fixed
+
+- **Dependency classification is now context-aware** (`src/daemon/rules.ts`).
+  New `isPrimaryService(stack, service, siblingServices?)` decides whether a
+  service is the stack's app using two signals: the service is named after its
+  stack, or it is the only service in the stack. `isDependencyImage()` takes an
+  optional `ctx` and returns `false` when a dependency-listed image is the app.
+  Without `ctx` the behaviour is the old image-name-only lookup, so no caller
+  changes semantics implicitly.
+- **Wired through all three classification sites** (`src/daemon/index.ts`): both
+  scan paths pass the parsed compose service list; the reconcile pass has no
+  compose file in scope and passes stack + service only, which is sufficient for
+  the case it guards.
+
+### Notes
+
+- A stack whose app is a dependency-listed image now follows the `app` axis.
+  Review any per-stack policy that was compensating for the old behaviour —
+  under the default `{ app: minor, dependencies: none }` such a stack moves from
+  never-applied to auto-applying patch and minor bumps. That is the right
+  default for most apps, but **not** for a Vault server without auto-unseal,
+  where any restart seals the vault and blocks every dependent stack until it is
+  manually unsealed. Pin those to `notify`.
+
 ## 0.6.1 — 2026-08-09
 
 A coverage bug, and the reason it went unnoticed. `lscr.io` was never in the

@@ -85,21 +85,67 @@ const KNOWN_DEPENDENCY_IMAGES = new Set<string>([
   "zookeeper", "library/zookeeper",
 ]);
 
+/** Case/separator-insensitive name compare (`vault-agent` vs `vault_agent`). */
+function normalizeName(name: string): string {
+  return name.toLowerCase().replace(/[-_\s]/g, "");
+}
+
+/**
+ * Return true when this service is the stack's *primary* service — the app —
+ * rather than a supporting layer.
+ *
+ * This exists because {@link isDependencyImage} can only see an image name, and
+ * an image name alone is ambiguous: `hashicorp/vault` is a dependency in the
+ * ~30 stacks where it runs as a `vault-agent` sidecar, but it is the *app* in
+ * the stack that runs the Vault server itself. Same image, opposite role.
+ *
+ * Two signals, either of which is decisive:
+ *   1. The service is named after its stack (`vault` in stack `vault`).
+ *   2. It is the only service in the stack, so there is nothing else it could
+ *      be a dependency *of*.
+ *
+ * When `siblingServices` is omitted only signal 1 is available — that is the
+ * correct degraded behaviour for callers working from a stored row rather than
+ * a parsed compose file (e.g. the reconcile pass).
+ */
+export function isPrimaryService(
+  stackName: string,
+  serviceName: string,
+  siblingServices?: string[],
+): boolean {
+  if (normalizeName(stackName) === normalizeName(serviceName)) return true;
+  if (siblingServices && siblingServices.length <= 1) return true;
+  return false;
+}
+
 /**
  * Return true if the image ref is a well-known dependency layer (DB, cache,
  * broker, secret store, vector DB, etc.). Pass the full image ref like
  * `library/postgres` or `valkey/valkey`. Implicit `library/` is stripped
  * before lookup so callers can pass the bare repo name too (`postgres`).
+ *
+ * Pass `ctx` to disambiguate the case where a dependency-listed image is
+ * actually the stack's app (see {@link isPrimaryService}). Without `ctx` the
+ * behaviour is the pre-0.6.2 image-name-only lookup, so existing callers are
+ * unaffected.
  */
-export function isDependencyImage(repoRef: string): boolean {
+export function isDependencyImage(
+  repoRef: string,
+  ctx?: { stack: string; service: string; siblingServices?: string[] },
+): boolean {
   const normalized = repoRef.toLowerCase();
   // Strip a registry host if present (`docker.io/library/postgres`,
   // `ghcr.io/foo/bar` — we only check namespace/name).
   const noRegistry = normalized.replace(/^[a-z0-9.-]+\.[a-z]+\//, "");
-  return (
+  const known =
     KNOWN_DEPENDENCY_IMAGES.has(noRegistry) ||
-    KNOWN_DEPENDENCY_IMAGES.has(`library/${noRegistry}`)
-  );
+    KNOWN_DEPENDENCY_IMAGES.has(`library/${noRegistry}`);
+  if (!known) return false;
+  // A dependency-listed image serving as the stack's app is an app.
+  if (ctx && isPrimaryService(ctx.stack, ctx.service, ctx.siblingServices)) {
+    return false;
+  }
+  return true;
 }
 
 /**

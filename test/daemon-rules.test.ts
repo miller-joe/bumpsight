@@ -1,5 +1,78 @@
 import { describe, it, expect } from "vitest";
-import { classifyBump, decideAction, isDependencyImage } from "../src/daemon/rules.js";
+import {
+  classifyBump,
+  decideAction,
+  isDependencyImage,
+  isPrimaryService,
+} from "../src/daemon/rules.js";
+
+describe("isPrimaryService", () => {
+  it("treats a service named after its stack as the app", () => {
+    expect(isPrimaryService("vault", "vault")).toBe(true);
+    expect(isPrimaryService("vault", "vault-agent")).toBe(false);
+  });
+
+  it("ignores case and separators when comparing names", () => {
+    expect(isPrimaryService("open-webui", "open_webui")).toBe(true);
+    expect(isPrimaryService("Vault", "vault")).toBe(true);
+  });
+
+  it("treats a sole service as the app even if the name differs", () => {
+    expect(isPrimaryService("secrets", "server", ["server"])).toBe(true);
+  });
+
+  it("does not treat one of several differently-named services as the app", () => {
+    expect(isPrimaryService("myapp", "redis", ["web", "redis", "db"])).toBe(false);
+  });
+});
+
+describe("isDependencyImage — primary-service disambiguation", () => {
+  // Regression: the Vault *server* stack was classified as a dependency purely
+  // because `hashicorp/vault` is dependency-listed for the vault-agent sidecar.
+  // It routed to the `dependencies` policy axis (`none` by default), so its
+  // updates were never auto-applied and never emailed.
+  it("does not call a dependency-listed image a dependency when it is the app", () => {
+    expect(
+      isDependencyImage("hashicorp/vault", {
+        stack: "vault",
+        service: "vault",
+        siblingServices: ["vault"],
+      }),
+    ).toBe(false);
+  });
+
+  it("still calls the same image a dependency when it is a sidecar", () => {
+    expect(
+      isDependencyImage("hashicorp/vault", {
+        stack: "paperless-ngx",
+        service: "vault-agent",
+        siblingServices: ["vault-agent", "broker", "db", "webserver"],
+      }),
+    ).toBe(true);
+  });
+
+  it("works from a stored row with no sibling list (reconcile pass)", () => {
+    expect(isDependencyImage("hashicorp/vault", { stack: "vault", service: "vault" })).toBe(false);
+    expect(
+      isDependencyImage("hashicorp/vault", { stack: "n8n", service: "vault-agent" }),
+    ).toBe(true);
+  });
+
+  it("never promotes a non-dependency image", () => {
+    expect(
+      isDependencyImage("ghcr.io/paperless-ngx/paperless-ngx", {
+        stack: "paperless-ngx",
+        service: "webserver",
+        siblingServices: ["webserver"],
+      }),
+    ).toBe(false);
+  });
+
+  it("is unchanged when no context is supplied", () => {
+    expect(isDependencyImage("hashicorp/vault")).toBe(true);
+    expect(isDependencyImage("postgres")).toBe(true);
+  });
+});
 
 describe("classifyBump", () => {
   it("classifies a major version change", () => {

@@ -274,6 +274,11 @@ export async function runScanOnce(
 
         const isDep = isDependencyImage(
           ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+          {
+            stack,
+            service: serviceName,
+            siblingServices: services.map(([n]) => n),
+          },
         );
         const decision = decideAction(deps.rules, stack, bump, isDep);
         // v0.6.0: dependency bumps are always surfaced in the GUI (see the
@@ -423,6 +428,11 @@ export async function runScanOnce(
       const bump: BumpKind = classifyBump(ref.tag, latest);
       const isDep = isDependencyImage(
         ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+        {
+          stack,
+          service: serviceName,
+          siblingServices: services.map(([n]) => n),
+        },
       );
       const decision = decideAction(deps.rules, stack, bump, isDep);
       // v0.6.0 dependency special case: dependency bumps are ALWAYS surfaced in
@@ -1297,8 +1307,12 @@ export function reconcileOpenRows(
   let requeued = 0;
   for (const r of rows) {
     const ref = parseImageRef(r.image);
+    // No compose file in scope here (we reconcile from stored rows), so only
+    // the service-named-after-its-stack signal is available. That is enough for
+    // the case this guards: the stack whose app IS a dependency-listed image.
     const isDep = isDependencyImage(
       ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+      { stack: r.stack, service: r.service },
     );
     // v0.6.0: dependencies are always kept in the GUI for individual review —
     // never reconciled away (that's the documented dependency special case).

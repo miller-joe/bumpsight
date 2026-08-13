@@ -1,6 +1,6 @@
 {
   "name": "bumpsight",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Docker image update advisor for self-hosters, with a built-in dashboard for reviewing every app's update history and approving/denying bumps per stack. Lints docker-compose files for anti-patterns, checks registries for newer tags in the same family, and uses an LLM to summarize breaking changes from upstream release notes.",
   "license": "MIT",
   "author": "Joe Miller <joe@indivision.net> (https://github.com/miller-joe)",
