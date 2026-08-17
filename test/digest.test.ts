@@ -251,6 +251,47 @@ describe("runDigestOnce", () => {
     expect(getLastDigestSent(db)).not.toBeNull();
   });
 
+  it("nudges on a held row whose app is a dependency-listed image, but not on a sidecar", async () => {
+    // Vault SERVER stack — hashicorp/vault is the app here, so it belongs in
+    // the "needs your decision" nudge despite being in KNOWN_DEPENDENCY_IMAGES.
+    const app = recordUpdate(db, {
+      stack: "vault",
+      service: "vault",
+      image: "hashicorp/vault:2.0.0",
+      currentTag: "2.0.0",
+      targetTag: "2.0.4",
+      bump: "patch",
+    });
+    setNotified(db, app);
+    // Same image as a sidecar elsewhere — a real dependency, stays email-quiet.
+    const sidecar = recordUpdate(db, {
+      stack: "outline",
+      service: "vault-agent",
+      image: "hashicorp/vault:2.0.0",
+      currentTag: "2.0.0",
+      targetTag: "2.0.4",
+      bump: "patch",
+    });
+    setNotified(db, sidecar);
+
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = {
+      name: "stub",
+      send: async (m) => void sent.push(m),
+    };
+    const ok = await runDigestOnce({
+      db,
+      notifiers: [notifier],
+      hour: 18,
+      log: () => {},
+    });
+    expect(ok).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.body).toContain("Needs your decision (1)");
+    expect(sent[0]!.body).toContain("vault/vault");
+    expect(sent[0]!.body).not.toContain("outline/vault-agent");
+  });
+
   it("retries on next call when delivery fails on every notifier", async () => {
     const id = recordUpdate(db, {
       stack: "n8n",

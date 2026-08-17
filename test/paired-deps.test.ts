@@ -70,6 +70,35 @@ describe("findPairedDepBumps", () => {
     expect(result.sourceUrl).toContain("raw.githubusercontent.com");
   });
 
+  it("does not report the upstream project's own app as a paired dep", async () => {
+    // Vault's own compose: the `vault` service IS the app, even though
+    // hashicorp/vault is in KNOWN_DEPENDENCY_IMAGES for sidecar use elsewhere.
+    const vaultCoords: RepoCoords = { owner: "hashicorp", repo: "vault", source: "dockerhub" };
+    writeFileSync(
+      composePath,
+      [
+        "services:",
+        "  vault:",
+        "    image: hashicorp/vault:2.0.0",
+        "  cache:",
+        "    image: redis:7",
+      ].join("\n"),
+    );
+    mockUpstreamCompose(
+      [
+        "services:",
+        "  vault:",
+        "    image: hashicorp/vault:2.1.0",
+        "  cache:",
+        "    image: redis:8",
+      ].join("\n"),
+    );
+
+    const result = await findPairedDepBumps(vaultCoords, "2.1.0", composePath);
+    // redis is a genuine paired dep; the vault service itself is not.
+    expect(result.recommendations.map((r) => r.upstreamService)).toEqual(["cache"]);
+  });
+
   it("flags an image-change when redis becomes valkey", async () => {
     writeFileSync(
       composePath,

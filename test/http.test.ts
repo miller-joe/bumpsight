@@ -312,6 +312,28 @@ describe("HTTP server", () => {
     );
   });
 
+  it("does not quarantine a stack's own app, even on a dependency-listed image", async () => {
+    const db = openDb({ path: ":memory:" });
+    // The Vault SERVER stack: hashicorp/vault is in KNOWN_DEPENDENCY_IMAGES
+    // because it's a sidecar in ~30 other stacks — but here it is the app.
+    recordUpdate(db, { stack: "vault", service: "vault", image: "hashicorp/vault:2.0.0", currentTag: "2.0.0", targetTag: "2.0.4", bump: "patch", approvalToken: "tok-vault-app" });
+    // Same image as a sidecar in another stack — still a dependency there.
+    recordUpdate(db, { stack: "outline", service: "vault-agent", image: "hashicorp/vault:2.0.0", currentTag: "2.0.0", targetTag: "2.0.4", bump: "patch", approvalToken: "tok-vault-dep" });
+    db.prepare("UPDATE updates SET status='notified', notified_at=?").run(Date.now());
+    await withServer(
+      () => startHttpServer({ db, composeFiles: {}, port: 0 }),
+      async (port) => {
+        const body = await (await fetch(`http://127.0.0.1:${port}/`)).text();
+        const main = body.split('<details class="deps-section"')[0];
+        expect(main).toContain("bsAct('tok-vault-app','approve')"); // app in main queue
+        expect(main).not.toContain("bsAct('tok-vault-dep','approve')"); // sidecar quarantined
+        // the app card carries no dependency badge and no "Update anyway" wording
+        const appCard = body.split('data-stack="vault"')[1]?.split("</div></div>")[0] ?? "";
+        expect(appCard).not.toContain("⚠ DEPENDENCY");
+      },
+    );
+  });
+
   it("POST /api/stacks/:stack/policy persists an override", async () => {
     const db = openDb({ path: ":memory:" });
     await withServer(

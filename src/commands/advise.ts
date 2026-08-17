@@ -21,6 +21,10 @@ export interface AdviseOptions {
   repo?: string;
   composeFile?: string;
   serviceName?: string;
+  /** v0.6.3: stack the service belongs to. Only used to disambiguate the
+   *  dependency check — a dependency-listed image that IS its stack's app
+   *  (the Vault server) must not get the "wait for the parent app" framing. */
+  stackName?: string;
   /** Legacy: Ollama base URL. Prefer llmUrl for OpenAI-compat endpoints. */
   ollamaHost?: string;
   /** OpenAI-compatible base URL (ends in /v1). Used by Ollama, LiteLLM, etc. */
@@ -73,7 +77,12 @@ export async function getAdviseSummary(
   const repoForDepCheck = ref.namespace
     ? `${ref.namespace}/${ref.name}`
     : ref.name;
-  const isDepImage = isDependencyImage(repoForDepCheck);
+  const isDepImage = isDependencyImage(
+    repoForDepCheck,
+    opts.stackName && opts.serviceName
+      ? { stack: opts.stackName, service: opts.serviceName }
+      : undefined,
+  );
   const bumpKind = classifyBump(from, opts.to);
   const isDependencyMajor = isDepImage && bumpKind === "major";
 

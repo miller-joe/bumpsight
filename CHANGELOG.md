@@ -2,6 +2,35 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.6.3 — 2026-08-16
+
+0.6.2 made dependency classification context-aware but only wired the new `ctx`
+through the daemon's three *policy* sites. Everywhere else still called
+`isDependencyImage()` with an image name alone, so the Vault server kept being
+treated as a dependency by the parts of the system the operator actually looks
+at: the dashboard badged `vault / vault` with ⚠ DEPENDENCY, filed it under
+"Dependency updates held back", replaced Approve with a data-corruption warning
+dialog, and the daily digest silently dropped it from the "needs your decision"
+nudge. Policy said app, presentation said dependency.
+
+### Fixed
+
+- **Dashboard no longer quarantines a stack's own app** (`src/server/http.ts`).
+  `isDepRow()` passes the row's stack and service. No compose file is in scope
+  on the render path, so only the service-named-after-its-stack signal applies —
+  which is the signal this case needs.
+- **Daily digest nudges on it too** (`src/daemon/digest.ts`). The
+  "needs your decision" filter passes the row's stack and service, so an app on
+  a dependency-listed image is no longer email-invisible.
+- **Advise prompt framing** (`src/commands/advise.ts`). New optional
+  `stackName`, threaded from all four call sites in `src/daemon/index.ts` and
+  `src/server/http.ts`. Without it, a major bump of the Vault server was framed
+  as "wait for the parent app to bump its dependency" — there is no parent app.
+- **Paired-dep lookup skips the upstream project's own app**
+  (`src/advise/paired-deps.ts`). `collectDepServices()` takes the upstream repo
+  name and uses it as the primary-service signal, so Vault's own compose no
+  longer reports its `vault` service as a paired dep of itself.
+
 ## 0.6.2 — 2026-08-13
 
 A misclassification that made the most security-sensitive service in the fleet

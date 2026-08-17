@@ -444,6 +444,7 @@ async function applyRowsAndNotify(
                   to: fresh.target_tag,
                   composeFile: deps.composeFiles[fresh.stack],
                   serviceName: fresh.service,
+                  stackName: fresh.stack,
                   llmUrl: deps.llmUrl,
                   llmKey: deps.llmKey,
                   model: deps.llmModel,
@@ -645,11 +646,21 @@ function adviseBlock(row: UpdateRow): string {
   return `<details class="advise"><summary>release-note summary</summary><pre>${escapeHtml(row.advise_text)}</pre></details>`;
 }
 
-/** v0.6.0: is this row a known dependency image (DB / cache / broker / …)? */
+/**
+ * v0.6.0: is this row a known dependency image (DB / cache / broker / …)?
+ *
+ * v0.6.3: context-aware. The row carries its stack and service, so a stack whose
+ * *app* happens to be a dependency-listed image (the Vault server running
+ * `hashicorp/vault`) is no longer badged and quarantined as a dependency here.
+ * No compose file is in scope on the render path, so only the
+ * service-named-after-its-stack signal is available — which is exactly the
+ * signal this case needs.
+ */
 function isDepRow(row: UpdateRow): boolean {
   const ref = parseImageRef(row.image);
   return isDependencyImage(
     ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+    { stack: row.stack, service: row.service },
   );
 }
 

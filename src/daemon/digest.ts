@@ -104,8 +104,13 @@ export async function runDigestOnce(
     if (r.bump === "digest") return false;
     // v0.6.0: dependencies stay quiet in email (the dependency special case) —
     // they're surfaced in the GUI for individual review, not the digest nudge.
+    // v0.6.3: pass the row's stack/service so a stack whose app IS a
+    // dependency-listed image (the Vault server) isn't silenced in email too.
     const ref = parseImageRef(r.image);
-    return !isDependencyImage(ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name);
+    return !isDependencyImage(
+      ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+      { stack: r.stack, service: r.service },
+    );
   });
   if (rows.length === 0 && needsDecision.length === 0) {
     deps.log("digest: nothing to report — skipping send");

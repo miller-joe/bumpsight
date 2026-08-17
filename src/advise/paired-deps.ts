@@ -96,7 +96,7 @@ export async function findPairedDepBumps(
     return empty;
   }
 
-  const upstreamDeps = collectDepServices(upstream.services);
+  const upstreamDeps = collectDepServices(upstream.services, coords.repo);
   if (upstreamDeps.length === 0) return empty;
   const localServices = local.services ?? {};
 
@@ -142,17 +142,28 @@ interface DepServiceEntry {
   imageNamespace: string | null;
 }
 
+/**
+ * v0.6.3: `projectName` is the upstream repo name (e.g. `vault` from
+ * `hashicorp/vault`). It disambiguates the case where the upstream project's
+ * own app is a dependency-listed image — without it, an upstream compose for
+ * Vault reports its `vault` service as a paired dep of itself.
+ */
 function collectDepServices(
   services: Record<string, { image?: string }> | undefined,
+  projectName?: string,
 ): DepServiceEntry[] {
   if (!services) return [];
   const out: DepServiceEntry[] = [];
+  const siblingServices = Object.keys(services);
   for (const [name, def] of Object.entries(services)) {
     const image = def?.image;
     if (typeof image !== "string" || image.length === 0) continue;
     const ref = parseImageRef(image);
     const repoForCheck = ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name;
-    if (!isDependencyImage(repoForCheck)) continue;
+    const ctx = projectName
+      ? { stack: projectName, service: name, siblingServices }
+      : undefined;
+    if (!isDependencyImage(repoForCheck, ctx)) continue;
     out.push({
       serviceName: name,
       image,
