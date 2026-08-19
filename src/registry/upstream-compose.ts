@@ -15,11 +15,30 @@
  */
 import type { RepoCoords } from "../releases/github.js";
 
+// Ordered by preference — the first path that fetches wins, so the canonical
+// production compose must come before any variant.
+//
+// v0.6.4 added the `docker/` families. Their absence was why paired-dep
+// lookup never produced a single recommendation: the two biggest
+// bundled-service apps in the fleet both publish under `docker/`, so every
+// lookup fell through all ten paths and returned null.
+//   - immich          → docker/docker-compose.yml
+//   - paperless-ngx   → docker/compose/docker-compose.postgres.yml
+//
+// Deliberately NOT included: `*.dev.yml`, `*.ci-test.yml`, `e2e/*` and
+// `.devcontainer/*`. Those pin dep versions for test rigs, not for
+// production, and reading one would recommend the wrong thing.
 const COMPOSE_PATHS = [
   "docker-compose.yml",
   "compose.yaml",
   "compose.yml",
   "docker-compose.yaml",
+  "docker/docker-compose.yml",
+  "docker/docker-compose.yaml",
+  "docker/compose.yaml",
+  "docker/compose.yml",
+  "docker/compose/docker-compose.postgres.yml",
+  "docker/compose/docker-compose.yml",
   "examples/docker-compose.yml",
   "examples/docker-compose.yaml",
   "examples/compose.yaml",

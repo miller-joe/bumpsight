@@ -792,10 +792,54 @@ describe("v0.6.0 reconcile + mute", () => {
     for (const id of [major, minor, dep]) db.prepare("UPDATE updates SET status='notified' WHERE id=?").run(id);
 
     const rec = reconcileOpenRows(db, rules);
-    expect(rec).toEqual({ dismissed: 0, requeued: 1 });
+    expect(rec).toEqual({ dismissed: 0, requeued: 1, stale: 0 });
     expect(findUpdate(db, major)!.superseded).toBeNull();       // held stays
     expect(findUpdate(db, minor)).toBeUndefined();              // auto-apply → deleted (scan re-applies)
     expect(findUpdate(db, dep)!.superseded).toBeNull();         // dep left alone, still visible
+  });
+
+  it("reconcileOpenRows retires rows whose compose pin moved out-of-band", () => {
+    // Reproduces the vault case: the stack was upgraded 2.0.0 -> 2.0.4 by hand,
+    // leaving two open rows describing a bump from a tag the compose no longer
+    // carries. Policy alone can never retire them — vault is a notify stack AND
+    // hashicorp/vault is a dependency-listed image, so both guards keep it open.
+    const { stack, file } = makeStack("vault", "hashicorp/vault:2.0.4");
+    const db = openDb({ path: ":memory:" });
+    const rules = { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} };
+
+    const to3 = recordUpdate(db, { stack, service: "vault", image: "hashicorp/vault:2.0.0", currentTag: "2.0.0", targetTag: "2.0.3", bump: "patch" });
+    const to4 = recordUpdate(db, { stack, service: "vault", image: "hashicorp/vault:2.0.0", currentTag: "2.0.0", targetTag: "2.0.4", bump: "patch" });
+    for (const id of [to3, to4]) db.prepare("UPDATE updates SET status='notified' WHERE id=?").run(id);
+
+    const rec = reconcileOpenRows(db, rules, { [stack]: file });
+    expect(rec.stale).toBe(2);
+    expect(findUpdate(db, to3)!.dismiss_reason).toBe("out-of-band");
+    expect(findUpdate(db, to4)!.dismiss_reason).toBe("out-of-band");
+    expect(findUpdate(db, to3)!.superseded).toBe(1);
+  });
+
+  it("reconcileOpenRows leaves a row alone when the compose pin still matches", () => {
+    const { stack, file } = makeStack("gitea", "gitea/gitea:1.24.0");
+    const db = openDb({ path: ":memory:" });
+    const rules = { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} };
+    const id = recordUpdate(db, { stack, service: "gitea", image: "gitea/gitea:1.24.0", currentTag: "1.24.0", targetTag: "1.25.0", bump: "minor" });
+    db.prepare("UPDATE updates SET status='notified' WHERE id=?").run(id);
+
+    const rec = reconcileOpenRows(db, rules, { [stack]: file });
+    expect(rec.stale).toBe(0);
+    expect(findUpdate(db, id)!.superseded).toBeNull();
+  });
+
+  it("reconcileOpenRows treats an unreadable or serviceless compose as no signal", () => {
+    const db = openDb({ path: ":memory:" });
+    const rules = { default: { app: "notify" as const, dependencies: "notify" as const }, stacks: {} };
+    const id = recordUpdate(db, { stack: "ghost", service: "ghost", image: "ghost:5.0.0", currentTag: "5.0.0", targetTag: "6.0.0", bump: "major" });
+    db.prepare("UPDATE updates SET status='notified' WHERE id=?").run(id);
+
+    // path does not exist → load throws → cached as null → row untouched
+    const rec = reconcileOpenRows(db, rules, { ghost: "/nonexistent/compose.yaml" });
+    expect(rec.stale).toBe(0);
+    expect(findUpdate(db, id)!.superseded).toBeNull();
   });
 
   it("a muted service is skipped by the scan (no new rows surface)", async () => {

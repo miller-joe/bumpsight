@@ -2,6 +2,48 @@
 
 All notable changes to bumpsight are documented here.
 
+## 0.6.4 — 2026-08-19
+
+Three defects that all shared a shape: bumpsight trusted its own stored record
+of the world instead of re-reading the world.
+
+### Fixed
+
+- **Reconcile now retires rows whose compose pin moved out-of-band**
+  (`src/daemon/index.ts`). `reconcileOpenRows` re-ran policy against stored
+  rows and explicitly noted "No compose file in scope here", so a row created
+  under an older pin stayed open forever once the pin changed underneath it.
+  It now takes the compose-file map, compares each open row's `current_tag`
+  against the live pin, and dismisses mismatches as `out-of-band`.
+
+  The check runs *before* the dependency guard, because that guard
+  (`if (isDep) continue`) was the second reason these rows were immortal. The
+  vault server stack demonstrated both: it sat on `2.0.0 -> 2.0.3` and
+  `2.0.0 -> 2.0.4` for a month after being upgraded to 2.0.4 by hand, holding
+  two "needs decision" cards describing a bump from a tag no longer present
+  anywhere. An unreadable compose, or a service missing from it, is treated as
+  no signal rather than as drift.
+
+- **Paired-dep lookup can now actually find an upstream compose**
+  (`src/registry/upstream-compose.ts`). `COMPOSE_PATHS` covered the repo root,
+  `examples/` and `deploy/` — but not `docker/`, which is where the two
+  biggest bundled-service apps in the reference fleet publish theirs. Every
+  lookup fell through all ten candidates and returned null, which is why
+  `paired_deps_json` was NULL on all 371 rows in a production database despite
+  56 major bumps passing through advise. Added the `docker/` families, ordered
+  so the canonical production file wins; test-rig variants (`*.dev.yml`,
+  `*.ci-test.yml`, `e2e/`, `.devcontainer/`) stay excluded so we never
+  recommend a dep version that only ever applied to CI.
+
+### Changed
+
+- **Paired-dep lookup runs on app minors, not just majors**
+  (`src/commands/advise.ts`). The original gate reasoned that "minor/patch
+  bumps rarely move dep pins." That does not hold for bundled-service apps,
+  which re-pin their own Postgres/Redis sidecar in ordinary minor releases —
+  and under an `app: minor` policy those auto-apply without ever being held,
+  so the common case was never examined. Patch bumps remain excluded.
+
 ## 0.6.3 — 2026-08-16
 
 0.6.2 made dependency classification context-aware but only wired the new `ctx`

@@ -214,12 +214,18 @@ interface PairedDepLookupArgs {
 async function maybeLookupPairedDeps(
   args: PairedDepLookupArgs,
 ): Promise<Awaited<ReturnType<typeof findPairedDepBumps>> | null> {
-  // Only run on app-major bumps where we have both an upstream coords and a
-  // local compose file to diff against. This is intentionally narrow:
-  // dep-images themselves don't get a paired-dep lookup (they ARE the dep),
-  // and minor/patch bumps rarely move dep pins, so the network cost isn't
-  // worth it on every advise call.
-  if (args.bumpKind !== "major") return null;
+  // Run on app major AND minor bumps where we have both an upstream coords
+  // and a local compose file to diff against. Dep-images themselves don't get
+  // a paired-dep lookup (they ARE the dep), and patch bumps genuinely don't
+  // move dep pins, so those stay excluded.
+  //
+  // v0.6.4 widened this from major-only. The original reasoning — "minor
+  // bumps rarely move dep pins" — does not hold for the bundled-service apps
+  // that make up most of this fleet: an app minor routinely re-pins its own
+  // Postgres/Redis/valkey sidecar in the upstream compose. Under an
+  // `app: minor` policy those bumps auto-apply without ever being held, so
+  // major-only meant the common case was never examined at all.
+  if (args.bumpKind !== "major" && args.bumpKind !== "minor") return null;
   if (args.isDepImage) return null;
   if (!args.coords) return null;
   if (!args.composeFile) return null;

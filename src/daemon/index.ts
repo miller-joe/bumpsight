@@ -1218,10 +1218,15 @@ export function startDaemon(
         // v0.6.0: retire queue rows the current policy no longer holds before
         // scanning (self-healing queue). auto-apply-eligible rows are requeued
         // (deleted here, re-discovered + applied by the scan below).
-        const rec = reconcileOpenRows(deps.db, effectiveRules);
-        if (rec.dismissed + rec.requeued > 0)
+        const rec = reconcileOpenRows(
+          deps.db,
+          effectiveRules,
+          deps.composeFiles,
+        );
+        if (rec.dismissed + rec.requeued + rec.stale > 0)
           deps.log(
-            `reconcile: ${rec.dismissed} dismissed, ${rec.requeued} requeued for auto-apply`,
+            `reconcile: ${rec.dismissed} dismissed, ${rec.requeued} requeued for auto-apply, ` +
+              `${rec.stale} retired as out-of-band`,
           );
         const result = await runScanOnce({
           db: deps.db,
@@ -1292,23 +1297,73 @@ export function startDaemon(
  *     never drops a genuinely-pending update (the scan re-derives current
  *     state), and never applies a stale target.
  *   - `hold` → left in the queue (majors, unclassifiable digests, notify).
- * Runs before each scan so the queue self-heals as the policy changes. Returns
- * {dismissed, requeued} counts.
+ *
+ * v0.6.4 adds a second axis, checked first: a row whose stack's compose no
+ * longer pins the row's `current_tag` is retired as `out-of-band`, because the
+ * delta it describes no longer exists. This is what reconciles updates applied
+ * outside bumpsight (a hand-edited pin, another operator, a manual upgrade).
+ *
+ * Runs before each scan so the queue self-heals as policy and compose change.
+ * Returns {dismissed, requeued, stale} counts.
  */
 export function reconcileOpenRows(
   db: DB,
   rules: RulesConfig,
-): { dismissed: number; requeued: number } {
+  composeFiles?: Record<string, string>,
+): { dismissed: number; requeued: number; stale: number } {
   const rows = db
     .prepare(
-      `SELECT id, stack, service, image, bump FROM updates
+      `SELECT id, stack, service, image, bump, current_tag FROM updates
        WHERE status IN ('pending','notified')
          AND (superseded IS NULL OR superseded = 0)`,
     )
-    .all() as Pick<UpdateRow, "id" | "stack" | "service" | "image" | "bump">[];
+    .all() as Pick<
+    UpdateRow,
+    "id" | "stack" | "service" | "image" | "bump" | "current_tag"
+  >[];
   let dismissed = 0;
   let requeued = 0;
+  let stale = 0;
+
+  // v0.6.4: one compose parse per stack, shared across that stack's rows.
+  // `null` means "could not read it" — treated as no signal, never as drift.
+  const composeCache = new Map<string, ReturnType<typeof loadComposeFile> | null>();
+  const livePinnedTag = (stack: string, service: string): string | null => {
+    const path = composeFiles?.[stack];
+    if (!path) return null;
+    if (!composeCache.has(stack)) {
+      try {
+        composeCache.set(stack, loadComposeFile(path));
+      } catch {
+        composeCache.set(stack, null);
+      }
+    }
+    const image = composeCache.get(stack)?.services?.[service]?.image;
+    if (typeof image !== "string") return null;
+    return parseImageRef(image).tag ?? null;
+  };
+
   for (const r of rows) {
+    // v0.6.4: retire rows whose compose pin moved out from under us — an
+    // operator edit, or an apply this daemon did not perform. A row's
+    // `current_tag` is the "from" side of its bump; once the compose no
+    // longer carries that tag, the row describes a delta that no longer
+    // exists and can never be honestly approved or denied.
+    //
+    // Deliberately checked BEFORE the dependency guard below: a stale dep
+    // row is exactly as undecidable as a stale app row, and dependency rows
+    // are the ones that sit open longest. The vault server stack held two
+    // (2.0.0 -> 2.0.3 and 2.0.0 -> 2.0.4) for a month after it had already
+    // been upgraded to 2.0.4 by hand.
+    //
+    // A missing service (renamed/removed) is NOT treated as drift — the tag
+    // lookup returns null and the row is left for policy to decide.
+    const livePin = livePinnedTag(r.stack, r.service);
+    if (livePin !== null && r.current_tag !== null && livePin !== r.current_tag) {
+      dismissRow(db, r.id, "out-of-band");
+      stale += 1;
+      continue;
+    }
     const ref = parseImageRef(r.image);
     // No compose file in scope here (we reconcile from stored rows), so only
     // the service-named-after-its-stack signal is available. That is enough for
@@ -1329,7 +1384,7 @@ export function reconcileOpenRows(
       requeued += 1;
     }
   }
-  return { dismissed, requeued };
+  return { dismissed, requeued, stale };
 }
 
 export function buildComposeFileMap(paths: string[]): Record<string, string> {
