@@ -1280,7 +1280,7 @@ export function startDaemon(
         ) {
           lastDepDriftAt = Date.now();
           try {
-            const findings = await scanDepDrift({
+            const { findings } = await scanDepDrift({
               composeFiles: deps.composeFiles,
               githubToken: deps.githubToken,
               log: deps.log,

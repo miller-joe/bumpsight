@@ -32,9 +32,14 @@ re-reading the world, and only ever asked the registry's question.
   `off` to disable).
 
   Only `kind: "bump"` recommendations become rows. `add` (upstream grew a new
-  dep) and `image-change` (redis → valkey) are excluded on purpose: neither can
-  be expressed as a tag rewrite, so emitting them would create rows that can
-  only ever fail to apply. They still surface in advise text.
+  dep) and `image-change` (redis → valkey) cannot be expressed as a tag rewrite
+  — approving an `image-change` as one would turn `redis:8` into `redis:9-alpine`
+  when the recommendation was `valkey:9-alpine`, which is worse than doing
+  nothing. They are therefore reported as **advisories** (`dep-drift-advisory:`
+  log lines, and a separate count) rather than apply-able rows. Excluding them
+  silently would have reproduced the original bug in a new place: on the
+  reference fleet the single genuine finding is an `image-change`, so a
+  bump-only pass reports "0 differ" while real drift sits unmentioned.
 
 - **`paired` policy axis** (`src/daemon/rules.ts`). Upstream-recommended dep
   pins and registry-discovered dep tags are different questions and deserve
