@@ -196,6 +196,19 @@ export type BumpAction = "patch" | "minor" | "major" | "notify" | "none";
 export interface PolicyAxes {
   app: BumpAction;
   dependencies: BumpAction;
+  /** v0.6.4: policy for dep pins the PARENT APP's own upstream compose
+   *  recommends at the version we already run — as opposed to `dependencies`,
+   *  which governs new dep tags seen in the registry.
+   *
+   *  These are different questions and deserve different answers. The comment
+   *  above says the canonical response to an independent dep bump is "wait for
+   *  the parent app to bump it" — this axis is what finally watches for that.
+   *  A fleet can therefore run `dependencies: none` (don't chase Postgres
+   *  releases on our own) alongside `paired: notify` (do tell me when the app
+   *  maintainer changes what they ship against).
+   *
+   *  Defaults to `notify` when unset: surfacing is safe, silence is not. */
+  paired?: BumpAction;
 }
 
 export interface RulesConfig {
@@ -268,9 +281,18 @@ export function decideAction(
   stack: string,
   bump: BumpKind,
   isDependency: boolean,
+  origin?: string | null,
 ): Decision {
   const axes = config.stacks[stack] ?? config.default;
-  const action = isDependency ? axes.dependencies : axes.app;
+  // v0.6.4: a paired row is an upstream recommendation, not a registry find.
+  // It routes to its own axis regardless of whether the image is dep-listed —
+  // being a dependency is precisely what makes it a paired row.
+  const action =
+    origin === "paired"
+      ? (axes.paired ?? "notify")
+      : isDependency
+        ? axes.dependencies
+        : axes.app;
   if (action === "none") return "skip";
   if (action === "notify") return "hold";
   if (bump === "digest") return "auto-apply";

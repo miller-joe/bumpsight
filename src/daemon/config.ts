@@ -60,6 +60,10 @@ export interface DaemonConfig {
   /** v0.5.7: how often the watched-releases poll runs. Milliseconds. Only used
    *  when watchedReleases is non-empty. */
   watchIntervalMs: number;
+  /** v0.6.4: cadence of the dependency-drift pass (upstream compose vs local
+   *  dep pins). Costs one upstream fetch per stack, so it defaults to daily
+   *  rather than riding the scan interval. 0 disables the pass entirely. */
+  depDriftIntervalMs: number;
   /** v0.6.0: how loud email is. The GUI/DB is always the primary log; this only
    *  controls the email channel.
    *    all    — per-event hold + applied emails AND the daily digest (the
@@ -157,6 +161,9 @@ export interface FileConfigShape {
   /** v0.5.7: poll cadence for watched_releases (same duration syntax as
    *  `interval`). Defaults to the scan interval when unset. */
   watch_interval?: string;
+  /** v0.6.4: cadence of the dependency-drift pass (same duration syntax as
+   *  `interval`). Defaults to 24h. Set `off` / `0` to disable. */
+  dep_drift_interval?: string;
   /** v0.6.0: email verbosity — off | digest | all. Default `digest`. */
   notify_mode?: string;
   /** v0.6.0: optional shared secret gating the dashboard + POST actions. */

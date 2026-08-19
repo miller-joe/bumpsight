@@ -4,10 +4,69 @@ All notable changes to bumpsight are documented here.
 
 ## 0.6.4 — 2026-08-19
 
+The theme: bumpsight trusted its own stored record of the world instead of
+re-reading the world, and only ever asked the registry's question.
+
+### Added
+
+- **Dependency-drift scan** (`src/daemon/dep-drift.ts`). An independent pass,
+  on its own daily cadence, over every stack. It asks the question the registry
+  scan structurally cannot:
+
+  | pass | question |
+  |---|---|
+  | registry scan | is there a newer tag of this image? |
+  | drift scan | at the app version we **already run**, what deps does the maintainer's own compose pin? |
+
+  The policy docblock has always said the canonical answer to an independent
+  dep bump is *"wait for the parent app to bump it."* Nothing ever watched for
+  the parent app bumping it. The v0.5.0 paired-dep lookup came closest, but it
+  lives inside `advise`, which runs only for rows **held** for approval and only
+  when an LLM is configured — so under an `app: minor` policy, where most bumps
+  auto-apply without being held, it effectively never ran. A stack sitting on a
+  stable version with no new tag was never examined at all.
+
+  Findings become ordinary `updates` rows with `origin='paired'`, inheriting
+  dedup, notify, approve/deny links, apply and reconcile unchanged. Configure
+  with `dep_drift_interval` / `BUMPSIGHT_DEP_DRIFT_INTERVAL` (default `24h`,
+  `off` to disable).
+
+  Only `kind: "bump"` recommendations become rows. `add` (upstream grew a new
+  dep) and `image-change` (redis → valkey) are excluded on purpose: neither can
+  be expressed as a tag rewrite, so emitting them would create rows that can
+  only ever fail to apply. They still surface in advise text.
+
+- **`paired` policy axis** (`src/daemon/rules.ts`). Upstream-recommended dep
+  pins and registry-discovered dep tags are different questions and deserve
+  different answers, so conflating them under `dependencies` meant a fleet had
+  to choose between silence and noise. A fleet can now run `dependencies: none`
+  (don't chase Postgres releases on our own) alongside `paired: notify` (do tell
+  me when the maintainer changes what they ship against). Defaults to `notify`
+  when unset — surfacing is safe, silence is not.
+
+- **`origin` column on `updates`** (`src/state/db.ts`), with the usual additive
+  migration, plus `findUpdateByDelta` so a caller can tell a genuinely new
+  record from a re-observation without racing the insert.
+
 Three defects that all shared a shape: bumpsight trusted its own stored record
 of the world instead of re-reading the world.
 
 ### Fixed
+
+- **Paired rows are no longer silenced in email** (`src/daemon/digest.ts`). The
+  digest filters dependency images out of its "needs decision" nudge. A paired
+  row *is* a dependency by construction, so that filter hid exactly the rows the
+  drift pass exists to surface — the same failure shape 0.6.3 fixed for the
+  Vault server: policy said surface, presentation said hide.
+
+- **Reconcile no longer deletes paired rows it would auto-apply**
+  (`src/daemon/index.ts`). `deleteUpdate` is only safe for rows the registry
+  scan re-derives on its next pass. A paired row comes from the daily drift
+  pass, so deleting it would drop the finding until the next drift scan
+  re-created it — which reconcile would delete again, looping indefinitely
+  without ever applying. Paired rows are also exempted from the
+  `if (isDep) continue` guard, which would otherwise make them permanently
+  unreconcilable.
 
 - **Reconcile now retires rows whose compose pin moved out-of-band**
   (`src/daemon/index.ts`). `reconcileOpenRows` re-ran policy against stored

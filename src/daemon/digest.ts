@@ -106,6 +106,11 @@ export async function runDigestOnce(
     // they're surfaced in the GUI for individual review, not the digest nudge.
     // v0.6.3: pass the row's stack/service so a stack whose app IS a
     // dependency-listed image (the Vault server) isn't silenced in email too.
+    // v0.6.4: a paired row IS a dependency by construction — that is the whole
+    // point of it — so the dependency filter would silence exactly the rows the
+    // drift pass exists to surface. Same failure shape v0.6.3 fixed for the
+    // Vault server: policy said surface, presentation said hide.
+    if (r.origin === "paired") return true;
     const ref = parseImageRef(r.image);
     return !isDependencyImage(
       ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,

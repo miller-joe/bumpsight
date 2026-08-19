@@ -1007,3 +1007,54 @@ describe("runScanOnce — unsupported-registry accounting", () => {
     rmSync(file, { force: true });
   });
 });
+
+describe("v0.6.4 paired-dep drift rows", () => {
+  it("routes paired rows to the paired axis, not dependencies", async () => {
+    const { decideAction } = await import("../src/daemon/rules.js");
+    // The fleet posture that hid this: never chase dep tags from the registry,
+    // but DO follow what the app maintainer pins.
+    const rules = {
+      default: { app: "minor" as const, dependencies: "none" as const, paired: "notify" as const },
+      stacks: {},
+    };
+    // registry-origin dep bump → silenced by `dependencies: none`
+    expect(decideAction(rules, "immich", "major", true, null)).toBe("skip");
+    // same image, but recommended by upstream → surfaced via `paired`
+    expect(decideAction(rules, "immich", "major", true, "paired")).toBe("hold");
+  });
+
+  it("defaults the paired axis to notify when unset", async () => {
+    const { decideAction } = await import("../src/daemon/rules.js");
+    const rules = { default: { app: "minor" as const, dependencies: "none" as const }, stacks: {} };
+    expect(decideAction(rules, "immich", "patch", true, "paired")).toBe("hold");
+  });
+
+  it("reconcile never deletes a paired row it would auto-apply", async () => {
+    const { recordUpdate: rec } = await import("../src/state/db.js");
+    const db = openDb({ path: ":memory:" });
+    // paired: minor would classify this as auto-apply. Deleting it would drop
+    // the finding until the next daily drift scan, which would re-create it,
+    // which reconcile would delete again — a loop that never applies.
+    const rules = {
+      default: { app: "minor" as const, dependencies: "none" as const, paired: "minor" as const },
+      stacks: {},
+    };
+    const id = rec(db, {
+      stack: "immich", service: "database", image: "postgres:16",
+      currentTag: "16", targetTag: "16.2", bump: "minor", origin: "paired",
+    });
+    db.prepare("UPDATE updates SET status='notified' WHERE id=?").run(id);
+    const r = reconcileOpenRows(db, rules);
+    expect(r.requeued).toBe(0);
+    expect(findUpdate(db, id)).toBeDefined();
+    expect(findUpdate(db, id)!.superseded).toBeNull();
+  });
+
+  it("records origin so a drift row is distinguishable from a registry find", () => {
+    const db = openDb({ path: ":memory:" });
+    const paired = recordUpdate(db, { stack: "immich", service: "redis", image: "valkey/valkey:9", currentTag: "9", targetTag: "9.1", bump: "minor", origin: "paired" });
+    const registry = recordUpdate(db, { stack: "immich", service: "redis", image: "valkey/valkey:9", currentTag: "9", targetTag: "9.2", bump: "minor" });
+    expect(findUpdate(db, paired)!.origin).toBe("paired");
+    expect(findUpdate(db, registry)!.origin).toBeNull();
+  });
+});

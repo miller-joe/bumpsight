@@ -43,9 +43,10 @@ import { notifyAll } from "../notify/index.js";
 import { archiveMessage } from "../notify/outbox.js";
 import type { Notifier, NotifyMessage, NotifyLink } from "../notify/types.js";
 import { applyOne } from "../apply/index.js";
+import { scanDepDrift } from "./dep-drift.js";
 import type { CommandRunner } from "../apply/docker.js";
 import { getAdviseSummary, type AdviseSummary } from "../commands/advise.js";
-import { setAdviseText, setPairedDeps } from "../state/db.js";
+import { setAdviseText, setPairedDeps, findUpdateByDelta } from "../state/db.js";
 import type { ApplyPairedDepsConfig } from "./config.js";
 import { isPairedDepBundlingEnabled } from "./config.js";
 import {
@@ -1202,6 +1203,10 @@ export function startDaemon(
   let stopping = false;
   let inFlight: Promise<void> = Promise.resolve();
   let timer: NodeJS.Timeout | null = null;
+  // v0.6.4: the drift pass runs on its own (much slower) cadence than the
+  // registry scan — it costs one upstream compose fetch per stack, and
+  // maintainers do not re-pin their deps every six hours.
+  let lastDepDriftAt = 0;
 
   const tick = async () => {
     if (stopping) return;
@@ -1263,6 +1268,58 @@ export function startDaemon(
         for (const [k, v] of Object.entries(result.errors)) {
           deps.log(`scan-error: ${k}: ${v}`);
         }
+
+        // v0.6.4: dependency-drift pass. Asks what the parent app's own
+        // upstream compose pins at the version we ALREADY run — the question
+        // the registry scan structurally cannot answer. Findings become
+        // ordinary rows with origin='paired', so notify/approve/apply and
+        // reconcile all work on them unchanged.
+        if (
+          cfg.depDriftIntervalMs > 0 &&
+          Date.now() - lastDepDriftAt >= cfg.depDriftIntervalMs
+        ) {
+          lastDepDriftAt = Date.now();
+          try {
+            const findings = await scanDepDrift({
+              composeFiles: deps.composeFiles,
+              githubToken: deps.githubToken,
+              log: deps.log,
+            });
+            let recorded = 0;
+            for (const f of findings) {
+              const before = findUpdateByDelta(
+                deps.db,
+                f.stack,
+                f.service,
+                f.localTag,
+                f.upstreamTag,
+              );
+              const id = recordUpdate(deps.db, {
+                stack: f.stack,
+                service: f.service,
+                image: f.localImage,
+                currentTag: f.localTag,
+                targetTag: f.upstreamTag,
+                bump: f.bump,
+                approvalToken: randomBytes(16).toString("hex"),
+                origin: "paired",
+              });
+              if (!before) {
+                recorded += 1;
+                deps.log(
+                  `dep-drift: ${f.stack}/${f.service} ${f.localTag} -> ${f.upstreamTag} ` +
+                    `(recommended by ${f.viaService} upstream, row ${id})`,
+                );
+              }
+            }
+            if (findings.length > 0)
+              deps.log(
+                `dep-drift: ${recorded} new row(s) from ${findings.length} finding(s)`,
+              );
+          } catch (err) {
+            deps.log(`dep-drift-failed: ${(err as Error).message}`);
+          }
+        }
       } catch (err) {
         deps.log(`scan-failed: ${(err as Error).message}`);
       }
@@ -1313,13 +1370,19 @@ export function reconcileOpenRows(
 ): { dismissed: number; requeued: number; stale: number } {
   const rows = db
     .prepare(
-      `SELECT id, stack, service, image, bump, current_tag FROM updates
+      `SELECT id, stack, service, image, bump, current_tag, origin FROM updates
        WHERE status IN ('pending','notified')
          AND (superseded IS NULL OR superseded = 0)`,
     )
     .all() as Pick<
     UpdateRow,
-    "id" | "stack" | "service" | "image" | "bump" | "current_tag"
+    | "id"
+    | "stack"
+    | "service"
+    | "image"
+    | "bump"
+    | "current_tag"
+    | "origin"
   >[];
   let dismissed = 0;
   let requeued = 0;
@@ -1374,12 +1437,26 @@ export function reconcileOpenRows(
     );
     // v0.6.0: dependencies are always kept in the GUI for individual review —
     // never reconciled away (that's the documented dependency special case).
-    if (isDep) continue;
-    const decision = decideAction(rules, r.stack, r.bump as BumpKind, isDep);
+    // v0.6.4: paired rows are exempt from that exemption. They are dep images
+    // by construction, so the guard would make them permanently unreconcilable.
+    if (isDep && r.origin !== "paired") continue;
+    const decision = decideAction(
+      rules,
+      r.stack,
+      r.bump as BumpKind,
+      isDep,
+      r.origin,
+    );
     if (decision === "skip") {
       dismissRow(db, r.id, "skip");
       dismissed += 1;
     } else if (decision === "auto-apply") {
+      // v0.6.4: `deleteUpdate` is only safe for rows the registry scan will
+      // re-derive on its next pass. A paired row comes from the drift pass,
+      // which runs daily — deleting it here would drop it until the next drift
+      // scan re-created it, and reconcile would delete it again, so it could
+      // loop indefinitely without ever applying. Hold it instead.
+      if (r.origin === "paired") continue;
       deleteUpdate(db, r.id); // scan re-discovers + applies the current delta
       requeued += 1;
     }

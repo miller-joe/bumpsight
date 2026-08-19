@@ -49,6 +49,11 @@ export interface UpdateRow {
    *  (reconciled), or an app the operator muted. Modelled as a flag, not a
    *  status, to stay on the cheap ADD COLUMN migration path. */
   superseded: number | null;
+  /** v0.6.4: where the row came from. NULL/'registry' = a new tag seen in the
+   *  registry. 'paired' = upstream's own compose recommends this dep pin at the
+   *  app version we already run. The two are governed by different policy axes
+   *  because they answer different questions. */
+  origin: string | null;
   /** v0.6.0: why the row was retired — 'superseded' | 'auto-apply' | 'skip' |
    *  'muted'. Drives the history badge. Null on non-retired rows. */
   dismiss_reason: string | null;
@@ -80,6 +85,7 @@ CREATE TABLE IF NOT EXISTS updates (
   display_to      TEXT,
   superseded      INTEGER,
   dismiss_reason  TEXT,
+  origin          TEXT,
   UNIQUE (stack, service, current_tag, target_tag)
 );
 CREATE INDEX IF NOT EXISTS idx_updates_status ON updates(status);
@@ -269,6 +275,17 @@ function migrate(db: DB): void {
   if (u7 && !/\bdismiss_reason\b/.test(u7.sql)) {
     db.exec("ALTER TABLE updates ADD COLUMN dismiss_reason TEXT");
   }
+
+  // v0.6.4: origin — distinguishes a registry-tag discovery from an
+  // upstream-recommended (paired) dep pin. Same dual-add pattern.
+  const u8 = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u8 && !/\borigin\b/.test(u8.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN origin TEXT");
+  }
 }
 
 export interface OpenOptions {
@@ -345,6 +362,9 @@ export interface NewUpdate {
   family?: string;
   bump: BumpKind;
   approvalToken?: string;
+  /** v0.6.4: 'paired' for upstream-recommended dep pins; omitted/'registry'
+   *  for tags discovered in the registry. Governs which policy axis applies. */
+  origin?: string;
 }
 
 /**
@@ -368,8 +388,8 @@ export function recordUpdate(db: DB, u: NewUpdate): number {
     .prepare(
       `INSERT INTO updates
        (stack, service, image, current_tag, target_tag, family, bump,
-        status, approval_token, discovered_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        status, approval_token, discovered_at, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
     )
     .run(
       u.stack,
@@ -381,8 +401,29 @@ export function recordUpdate(db: DB, u: NewUpdate): number {
       u.bump,
       u.approvalToken ?? null,
       Date.now(),
+      u.origin ?? null,
     );
   return Number(result.lastInsertRowid);
+}
+
+/**
+ * v0.6.4: look up a row by its exact delta. Mirrors the dedup query inside
+ * `recordUpdate`, so a caller can tell whether a record it is about to write
+ * is genuinely new (and therefore worth logging) without racing the insert.
+ */
+export function findUpdateByDelta(
+  db: DB,
+  stack: string,
+  service: string,
+  currentTag: string,
+  targetTag: string,
+): UpdateRow | undefined {
+  return db
+    .prepare(
+      `SELECT * FROM updates
+       WHERE stack = ? AND service = ? AND current_tag = ? AND target_tag = ?`,
+    )
+    .get(stack, service, currentTag, targetTag) as UpdateRow | undefined;
 }
 
 export function findUpdate(db: DB, id: number): UpdateRow | undefined {

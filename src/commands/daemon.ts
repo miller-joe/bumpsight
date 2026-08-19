@@ -160,6 +160,25 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
   const watchedReleases = buildWatchedReleases(fileShape, (msg) =>
     process.stderr.write(`bumpsight daemon: ${msg}\n`),
   );
+  // v0.6.4: dependency-drift cadence. Daily by default — one upstream compose
+  // fetch per stack, and maintainers do not re-pin deps hourly. `off` or `0`
+  // disables the pass.
+  const depDriftRaw =
+    process.env.BUMPSIGHT_DEP_DRIFT_INTERVAL ?? fileShape.dep_drift_interval ?? "24h";
+  let depDriftIntervalMs = 24 * 60 * 60 * 1000;
+  if (/^(off|none|0)$/i.test(depDriftRaw.trim())) {
+    depDriftIntervalMs = 0;
+  } else {
+    try {
+      depDriftIntervalMs = parseDuration(depDriftRaw);
+    } catch (err) {
+      process.stderr.write(
+        `bumpsight daemon: invalid dep_drift_interval "${depDriftRaw}": ${(err as Error).message}\n`,
+      );
+      return 2;
+    }
+  }
+
   const watchIntervalRaw =
     process.env.BUMPSIGHT_WATCH_INTERVAL ?? fileShape.watch_interval ?? intervalRaw;
   let watchIntervalMs = intervalMs;
@@ -204,6 +223,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     applyPairedDeps,
     watchedReleases,
     watchIntervalMs,
+    depDriftIntervalMs,
     notifyMode,
     uiToken,
   };
