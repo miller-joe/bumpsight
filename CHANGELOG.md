@@ -35,6 +35,16 @@ of the world instead of re-reading the world.
   `*.ci-test.yml`, `e2e/`, `.devcontainer/`) stay excluded so we never
   recommend a dep version that only ever applied to CI.
 
+- **Commits no longer leave `.git` root-owned** (`src/apply/git.ts`). The
+  container runs as root, so every object and ref git wrote landed root-owned
+  inside repos belonging to an unprivileged uid. `safe.directory=*` kept our
+  own runs working, which is why this went unnoticed — but the stack owner's
+  next commit failed with `insufficient permission for adding an object to
+  repository database`, and only when their change hashed into a root-owned
+  shard, so it looked intermittent and unrelated. After a successful commit
+  `.git` is handed back to whoever owns the compose file. Best-effort and
+  silent: no-ops when not root, when ownership already matches, or on error.
+
 ### Changed
 
 - **Paired-dep lookup runs on app minors, not just majors**

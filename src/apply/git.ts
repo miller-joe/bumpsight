@@ -1,4 +1,5 @@
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { chownSync, readdirSync, statSync, type Dirent } from "node:fs";
 import { realRunner, type CommandRunner } from "./docker.js";
 
 export interface CommitOptions {
@@ -95,5 +96,62 @@ export async function commitComposeChange(
         ? " + pushed"
         : ` (push failed: ${push.combinedOutput.trim()})`;
   }
+  const reowned = restoreGitOwnership(dir, opts.composePath);
+  if (reowned) log += ` (.git re-owned to uid ${reowned})`;
   return { committed: true, log };
+}
+
+/**
+ * v0.6.4: hand `.git` back to whoever owns the working tree.
+ *
+ * The container runs as root, so every object, ref and index git writes here
+ * lands root-owned inside a repo whose files belong to an unprivileged uid.
+ * Nothing breaks immediately — `safe.directory=*` covers our own later runs —
+ * but the next commit made by the *human* who owns the stack fails with
+ * `insufficient permission for adding an object to repository database`, and
+ * only when their change happens to hash into a root-owned object shard. That
+ * makes it look intermittent and unrelated to us. A production fleet
+ * accumulated this across 28 repos before anyone connected the two.
+ *
+ * Best-effort and silent: no-ops when we aren't root, when ownership already
+ * matches, or on any error. Returns the uid we restored to, or null.
+ */
+function restoreGitOwnership(dir: string, composePath: string): number | null {
+  try {
+    if (process.getuid?.() !== 0) return null;
+    const target = statSync(composePath);
+    const gitDir = join(dir, ".git");
+    if (statSync(gitDir).uid === target.uid) return null;
+    chownRecursive(gitDir, target.uid, target.gid);
+    return target.uid;
+  } catch {
+    return null;
+  }
+}
+
+/** Depth-first chown. Swallows per-entry failures so one unreadable path
+ *  cannot abort the walk and leave ownership half-restored. */
+function chownRecursive(path: string, uid: number, gid: number): void {
+  try {
+    chownSync(path, uid, gid);
+  } catch {
+    /* keep going — a single failure must not strand the rest */
+  }
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(path, { withFileTypes: true }) as unknown as Dirent[];
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    const child = join(path, e.name);
+    if (e.isDirectory() && !e.isSymbolicLink()) chownRecursive(child, uid, gid);
+    else {
+      try {
+        chownSync(child, uid, gid);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
