@@ -11,6 +11,12 @@ export interface CommitOptions {
   /** Also `git push` after committing. Default false — local commit only.
    *  A push failure (offline, auth, protected branch) never fails the apply. */
   push?: boolean;
+  /** When true, chown `.git` back to the owner of the compose file after a
+   *  successful commit. Opt-in and default false: it is only meaningful when
+   *  bumpsight runs as root against repos owned by someone else, and forcing
+   *  it on would rewrite ownership for setups that split it deliberately
+   *  (a deploy user owning the tree, a shared/group-owned repo, and so on). */
+  restoreOwnership?: boolean;
   /** Test seam. Defaults to the real spawn-based runner. */
   runner?: CommandRunner;
   /** Per-git-step timeout. Default 30s. */
@@ -96,22 +102,28 @@ export async function commitComposeChange(
         ? " + pushed"
         : ` (push failed: ${push.combinedOutput.trim()})`;
   }
-  const reowned = restoreGitOwnership(dir, opts.composePath);
-  if (reowned) log += ` (.git re-owned to uid ${reowned})`;
+  if (opts.restoreOwnership) {
+    const reowned = restoreGitOwnership(dir, opts.composePath);
+    if (reowned !== null) log += ` (.git re-owned to uid ${reowned})`;
+  }
   return { committed: true, log };
 }
 
 /**
- * v0.6.4: hand `.git` back to whoever owns the working tree.
+ * v0.6.4: hand `.git` back to whoever owns the working tree. OPT-IN — see
+ * `CommitOptions.restoreOwnership`.
  *
- * The container runs as root, so every object, ref and index git writes here
- * lands root-owned inside a repo whose files belong to an unprivileged uid.
- * Nothing breaks immediately — `safe.directory=*` covers our own later runs —
- * but the next commit made by the *human* who owns the stack fails with
- * `insufficient permission for adding an object to repository database`, and
- * only when their change happens to hash into a root-owned object shard. That
- * makes it look intermittent and unrelated to us. A production fleet
- * accumulated this across 28 repos before anyone connected the two.
+ * When bumpsight runs as root (the usual container case) every object, ref and
+ * index git writes lands root-owned inside a repo whose files belong to an
+ * unprivileged uid. Nothing breaks immediately — `safe.directory=*` covers our
+ * own later runs — but the next commit made by the *human* who owns the stack
+ * fails with `insufficient permission for adding an object to repository
+ * database`, and only when their change happens to hash into a root-owned
+ * object shard, which makes it look intermittent and unrelated to us.
+ *
+ * This is deliberately not the default. Plenty of setups own `.git`
+ * differently from the working tree on purpose, and silently rewriting that
+ * would be a worse bug than the one it fixes. Operators who want it enable it.
  *
  * Best-effort and silent: no-ops when we aren't root, when ownership already
  * matches, or on any error. Returns the uid we restored to, or null.

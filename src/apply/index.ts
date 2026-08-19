@@ -32,6 +32,11 @@ export interface ApplyDeps {
   /** When true (and gitCommit is on), also `git push` after committing.
    *  Falls back to BUMPSIGHT_GIT_PUSH. Default false. */
   gitPush?: boolean;
+  /** When true (and gitCommit is on), chown `.git` back to the compose file's
+   *  owner after committing — for operators running bumpsight as root against
+   *  repos owned by an unprivileged uid. Falls back to
+   *  BUMPSIGHT_GIT_RESTORE_OWNERSHIP. Default false. */
+  gitRestoreOwnership?: boolean;
 }
 
 /**
@@ -195,10 +200,15 @@ export async function applyOne(
         deps.gitPush ??
         (process.env.BUMPSIGHT_GIT_PUSH === "true" ||
           process.env.BUMPSIGHT_GIT_PUSH === "1");
+      const gitRestoreOwnership =
+        deps.gitRestoreOwnership ??
+        (process.env.BUMPSIGHT_GIT_RESTORE_OWNERSHIP === "true" ||
+          process.env.BUMPSIGHT_GIT_RESTORE_OWNERSHIP === "1");
       const c = await commitComposeChange({
         composePath,
         message,
         push: gitPush,
+        restoreOwnership: gitRestoreOwnership,
         runner: deps.runner,
       });
       if (c.log) log += `\n==== ${c.log} ====`;

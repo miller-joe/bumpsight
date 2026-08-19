@@ -33,6 +33,44 @@ function makeGitRunner(script: Record<string, DockerCommandResult>) {
 }
 
 describe("commitComposeChange", () => {
+  it("does not touch repo ownership unless explicitly opted in", async () => {
+    // The chown is gated on restoreOwnership. Left off (the default), the
+    // commit path must behave exactly as before and never mention re-owning —
+    // a public tool must not rewrite ownership of a repo it did not create.
+    const { runner } = makeGitRunner({
+      "rev-parse": OK("true\n"),
+      add: OK(),
+      diff: FAIL(),
+      commit: OK(),
+    });
+    const res = await commitComposeChange({
+      composePath: "/nonexistent/stack/compose.yaml",
+      message: "bump",
+      runner,
+    });
+    expect(res.committed).toBe(true);
+    expect(res.log).not.toContain("re-owned");
+  });
+
+  it("opting in never fails the commit, even when the chown cannot run", async () => {
+    // Non-root test process + a path that does not exist: restoreGitOwnership
+    // must swallow both and leave the commit result intact.
+    const { runner } = makeGitRunner({
+      "rev-parse": OK("true\n"),
+      add: OK(),
+      diff: FAIL(),
+      commit: OK(),
+    });
+    const res = await commitComposeChange({
+      composePath: "/nonexistent/stack/compose.yaml",
+      message: "bump",
+      restoreOwnership: true,
+      runner,
+    });
+    expect(res.committed).toBe(true);
+    expect(res.log).toContain("committed compose bump");
+  });
+
   it("commits a staged compose change inside a working copy", async () => {
     const { runner, calls } = makeGitRunner({
       "rev-parse": OK("true\n"),
