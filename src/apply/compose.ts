@@ -32,6 +32,44 @@ export function rewriteImageTag(opts: RewriteOptions): void {
 }
 
 /**
+ * v0.6.4: replace a service's image reference wholesale, not just its tag.
+ *
+ * Needed for upstream `image-change` recommendations — paperless-ngx moving its
+ * broker from `redis:8` to `valkey/valkey:9-alpine`, say. Routing that through
+ * `rewriteImageTag` would keep the image NAME and swap only the tag, producing
+ * `redis:9-alpine`: a real image, the wrong one, and a silent wrong answer is
+ * worse than a refusal.
+ *
+ * Guarded the same way as the tag rewrite — the compose file must still hold
+ * `expectedCurrentRef`, so a file edited between the decision and the apply
+ * fails loudly instead of clobbering someone else's change.
+ */
+export function rewriteImageRef(opts: {
+  composePath: string;
+  serviceName: string;
+  expectedCurrentRef: string;
+  newRef: string;
+}): void {
+  const raw = readFileSync(opts.composePath, "utf-8");
+  const doc = parseDocument(raw);
+  const node = doc.getIn(["services", opts.serviceName, "image"], true);
+  if (!node || !isScalar(node) || typeof node.value !== "string") {
+    throw new Error(
+      `${opts.composePath}: services.${opts.serviceName}.image not found or not a string`,
+    );
+  }
+  const current = node.value.trim();
+  if (current !== opts.expectedCurrentRef.trim()) {
+    throw new Error(
+      `${opts.composePath}: services.${opts.serviceName}.image is "${current}", ` +
+        `expected "${opts.expectedCurrentRef}" — refusing to rewrite a ref that moved`,
+    );
+  }
+  node.value = opts.newRef;
+  writeFileSync(opts.composePath, doc.toString(), "utf-8");
+}
+
+/**
  * Swap the tag portion of a Docker image reference. Returns the new string.
  * Throws if the existing tag doesn't match `expectedCurrentTag` — that
  * guard is what makes the rewrite race-safe.

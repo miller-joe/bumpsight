@@ -265,3 +265,60 @@ describe("applyOne", () => {
     rmSync(file, { force: true });
   });
 });
+
+describe("v0.6.4 image-change apply", () => {
+  it("rewriteImageRef swaps the whole ref, not just the tag", async () => {
+    const { rewriteImageRef } = await import("../src/apply/compose.js");
+    const { mkdtempSync, writeFileSync, readFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-ref-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(
+      file,
+      "services:\n  broker:\n    image: docker.io/library/redis:8\n    restart: unless-stopped\n",
+      "utf-8",
+    );
+    rewriteImageRef({
+      composePath: file,
+      serviceName: "broker",
+      expectedCurrentRef: "docker.io/library/redis:8",
+      newRef: "docker.io/valkey/valkey:9-alpine",
+    });
+    const out = readFileSync(file, "utf-8");
+    // The bug this exists to prevent: tag-only rewrite yields redis:9-alpine.
+    expect(out).toContain("docker.io/valkey/valkey:9-alpine");
+    expect(out).not.toContain("redis");
+    expect(out).toContain("restart: unless-stopped"); // rest of the doc intact
+  });
+
+  it("rewriteImageRef refuses when the ref moved under it", async () => {
+    const { rewriteImageRef } = await import("../src/apply/compose.js");
+    const { mkdtempSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-ref2-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, "services:\n  broker:\n    image: redis:9\n", "utf-8");
+    expect(() =>
+      rewriteImageRef({
+        composePath: file,
+        serviceName: "broker",
+        expectedCurrentRef: "redis:8",
+        newRef: "valkey/valkey:9-alpine",
+      }),
+    ).toThrow(/refusing to rewrite a ref that moved/);
+  });
+
+  it("an image-change row is held under every policy, including permissive ones", async () => {
+    const { decideAction } = await import("../src/daemon/rules.js");
+    // Recorded with bump "unknown" precisely so no policy can auto-apply it.
+    for (const paired of ["patch", "minor", "major"] as const) {
+      const rules = {
+        default: { app: "minor" as const, dependencies: "none" as const, paired },
+        stacks: {},
+      };
+      expect(decideAction(rules, "paperless-ngx", "unknown", true, "paired")).toBe("hold");
+    }
+  });
+});

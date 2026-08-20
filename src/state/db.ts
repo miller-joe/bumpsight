@@ -54,6 +54,10 @@ export interface UpdateRow {
    *  app version we already run. The two are governed by different policy axes
    *  because they answer different questions. */
   origin: string | null;
+  /** v0.6.4: for an upstream `image-change` recommendation, the full image ref
+   *  to write (e.g. `docker.io/valkey/valkey:9-alpine`). When set, apply swaps
+   *  the whole ref rather than just the tag. NULL for ordinary tag bumps. */
+  target_image: string | null;
   /** v0.6.0: why the row was retired — 'superseded' | 'auto-apply' | 'skip' |
    *  'muted'. Drives the history badge. Null on non-retired rows. */
   dismiss_reason: string | null;
@@ -86,6 +90,7 @@ CREATE TABLE IF NOT EXISTS updates (
   superseded      INTEGER,
   dismiss_reason  TEXT,
   origin          TEXT,
+  target_image    TEXT,
   UNIQUE (stack, service, current_tag, target_tag)
 );
 CREATE INDEX IF NOT EXISTS idx_updates_status ON updates(status);
@@ -286,6 +291,16 @@ function migrate(db: DB): void {
   if (u8 && !/\borigin\b/.test(u8.sql)) {
     db.exec("ALTER TABLE updates ADD COLUMN origin TEXT");
   }
+
+  // v0.6.4: target_image — the full ref for an image-change recommendation.
+  const u9 = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='updates'",
+    )
+    .get() as { sql: string } | undefined;
+  if (u9 && !/\btarget_image\b/.test(u9.sql)) {
+    db.exec("ALTER TABLE updates ADD COLUMN target_image TEXT");
+  }
 }
 
 export interface OpenOptions {
@@ -365,6 +380,8 @@ export interface NewUpdate {
   /** v0.6.4: 'paired' for upstream-recommended dep pins; omitted/'registry'
    *  for tags discovered in the registry. Governs which policy axis applies. */
   origin?: string;
+  /** v0.6.4: full image ref to write for an `image-change` recommendation. */
+  targetImage?: string;
 }
 
 /**
@@ -388,8 +405,8 @@ export function recordUpdate(db: DB, u: NewUpdate): number {
     .prepare(
       `INSERT INTO updates
        (stack, service, image, current_tag, target_tag, family, bump,
-        status, approval_token, discovered_at, origin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+        status, approval_token, discovered_at, origin, target_image)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
     )
     .run(
       u.stack,
@@ -402,6 +419,7 @@ export function recordUpdate(db: DB, u: NewUpdate): number {
       u.approvalToken ?? null,
       Date.now(),
       u.origin ?? null,
+      u.targetImage ?? null,
     );
   return Number(result.lastInsertRowid);
 }

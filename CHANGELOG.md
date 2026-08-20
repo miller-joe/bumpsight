@@ -31,15 +31,20 @@ re-reading the world, and only ever asked the registry's question.
   with `dep_drift_interval` / `BUMPSIGHT_DEP_DRIFT_INTERVAL` (default `24h`,
   `off` to disable).
 
-  Only `kind: "bump"` recommendations become rows. `add` (upstream grew a new
-  dep) and `image-change` (redis → valkey) cannot be expressed as a tag rewrite
-  — approving an `image-change` as one would turn `redis:8` into `redis:9-alpine`
-  when the recommendation was `valkey:9-alpine`, which is worse than doing
-  nothing. They are therefore reported as **advisories** (`dep-drift-advisory:`
-  log lines, and a separate count) rather than apply-able rows. Excluding them
-  silently would have reproduced the original bug in a new place: on the
-  reference fleet the single genuine finding is an `image-change`, so a
-  bump-only pass reports "0 differ" while real drift sits unmentioned.
+  `kind: "image-change"` (redis → valkey) also becomes a row, but classified
+  `unknown`, which `decideAction` holds under **every** policy — an image swap
+  is never auto-applied, only ever brought up as an ask. Approving one rewrites
+  the full image ref via the new `rewriteImageRef` + `target_image` column,
+  because routing it through the tag rewrite would keep the image name and
+  write `redis:9-alpine`: a real image, the wrong one. The row displays full
+  refs rather than `8 -> 9-alpine`, which would hide that the image moved.
+
+  `kind: "add"` (upstream grew a new dep) cannot be expressed as a rewrite
+  at all, so it stays an **advisory** (`dep-drift-advisory:` log line and its
+  own count). Excluding these from the OUTPUT as well as from rows would have
+  reproduced the original bug in a new place: on the reference fleet the single
+  genuine finding is an `image-change`, so a bump-only pass reported "0 differ"
+  while real drift sat unmentioned.
 
 - **`paired` policy axis** (`src/daemon/rules.ts`). Upstream-recommended dep
   pins and registry-discovered dep tags are different questions and deserve

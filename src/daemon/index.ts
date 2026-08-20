@@ -46,7 +46,11 @@ import { applyOne } from "../apply/index.js";
 import { scanDepDrift } from "./dep-drift.js";
 import type { CommandRunner } from "../apply/docker.js";
 import { getAdviseSummary, type AdviseSummary } from "../commands/advise.js";
-import { setAdviseText, setPairedDeps, findUpdateByDelta } from "../state/db.js";
+import {
+  setAdviseText,
+  setPairedDeps,
+  findUpdateByDelta,
+} from "../state/db.js";
 import type { ApplyPairedDepsConfig } from "./config.js";
 import { isPairedDepBundlingEnabled } from "./config.js";
 import {
@@ -1280,11 +1284,45 @@ export function startDaemon(
         ) {
           lastDepDriftAt = Date.now();
           try {
-            const { findings } = await scanDepDrift({
+            const { findings, imageChanges } = await scanDepDrift({
               composeFiles: deps.composeFiles,
               githubToken: deps.githubToken,
               log: deps.log,
             });
+
+            // v0.6.4: image changes get a row so they are ASKED about rather
+            // than only logged, but they are classified `unknown`, which
+            // `decideAction` holds under every policy. An image swap is never
+            // auto-applied — the operator decides, and Approve then rewrites
+            // the full ref (not just the tag) via `target_image`.
+            for (const ic of imageChanges) {
+              const existed = findUpdateByDelta(
+                deps.db,
+                ic.stack,
+                ic.service,
+                ic.localTag,
+                ic.upstreamTag,
+              );
+              const id = recordUpdate(deps.db, {
+                stack: ic.stack,
+                service: ic.service,
+                image: ic.localImage,
+                currentTag: ic.localTag,
+                targetTag: ic.upstreamTag,
+                bump: "unknown",
+                approvalToken: randomBytes(16).toString("hex"),
+                origin: "paired",
+                targetImage: ic.upstreamImage,
+              });
+              // The tags alone read as "8 -> 9-alpine", which hides the fact
+              // that the IMAGE moved. Show the full refs instead.
+              setDisplayTags(deps.db, id, ic.localImage, ic.upstreamImage);
+              if (!existed)
+                deps.log(
+                  `dep-drift: ${ic.stack}/${ic.service} needs a decision — ` +
+                    `${ic.localImage} -> ${ic.upstreamImage} (row ${id})`,
+                );
+            }
             let recorded = 0;
             for (const f of findings) {
               const before = findUpdateByDelta(

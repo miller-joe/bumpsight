@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import type { Database as DB } from "better-sqlite3";
 import { findUpdate, setApplied, type UpdateRow } from "../state/db.js";
-import { rewriteImageTag } from "./compose.js";
+import { rewriteImageTag, rewriteImageRef } from "./compose.js";
 import { pullAndUp, type CommandRunner } from "./docker.js";
 import { pruneOldImage, stripTagFromRef } from "./prune.js";
 import { commitComposeChange } from "./git.js";
@@ -92,12 +92,24 @@ export async function applyOne(
 
   if (!isMovingApply) {
     try {
-      rewriteImageTag({
-        composePath,
-        serviceName: row.service,
-        expectedCurrentTag: row.current_tag,
-        newTag: row.target_tag,
-      });
+      // v0.6.4: an upstream `image-change` recommendation carries a full target
+      // ref, because the image NAME moves (redis -> valkey). Swapping only the
+      // tag there would write a real-but-wrong image.
+      if (row.target_image) {
+        rewriteImageRef({
+          composePath,
+          serviceName: row.service,
+          expectedCurrentRef: row.image,
+          newRef: row.target_image,
+        });
+      } else {
+        rewriteImageTag({
+          composePath,
+          serviceName: row.service,
+          expectedCurrentTag: row.current_tag,
+          newTag: row.target_tag,
+        });
+      }
     } catch (err) {
       restoreSnapshot();
       setApplied(deps.db, row.id, {
