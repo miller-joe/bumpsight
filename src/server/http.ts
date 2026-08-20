@@ -847,13 +847,28 @@ function dashboardPage(deps: HttpServerDeps): string {
   // don't upgrade a DB/cache independently of its parent app) but remain
   // reachable in a collapsed, warning-labelled section so there's a path to
   // update one when you decide to.
-  const appNeeds = needs.filter((r) => !isDepRow(r));
-  const depNeeds = needs.filter((r) => isDepRow(r));
+  // v0.6.4: a paired row IS the parent app bumping its own dependency, which is
+  // the exact thing the "held back" copy below tells you to wait for. Filing it
+  // there would show the operator advice that contradicts the row — the same
+  // policy-says-one-thing / presentation-says-another failure 0.6.3 fixed for
+  // the Vault server. Paired rows get their own section and their own wording.
+  const pairedNeeds = needs.filter((r) => r.origin === "paired");
+  const appNeeds = needs.filter((r) => r.origin !== "paired" && !isDepRow(r));
+  const depNeeds = needs.filter((r) => r.origin !== "paired" && isDepRow(r));
 
   const needsHtml =
     appNeeds.length > 0
       ? `<div class="cards">${appNeeds.map((r) => decisionCard(r, false)).join("")}</div>`
       : SUNNY_DAY;
+
+  const pairedHtml =
+    pairedNeeds.length > 0
+      ? `<details class="deps-section" open>
+          <summary>Your app's maintainer changed a dependency <span class="count count-amber">${pairedNeeds.length}</span></summary>
+          <p class="muted small" style="margin:8px 0 12px;">This is the parent app bumping its own dependency — the thing the section below tells you to wait for. These come from the maintainer's published compose at the version you already run, not from a new tag appearing in a registry. An image change (e.g. redis&nbsp;→&nbsp;valkey) is never auto-applied: approving rewrites the full image reference, and anything holding data still deserves a look at its upgrade notes first.</p>
+          <div class="cards">${pairedNeeds.map((r) => decisionCard(r, false)).join("")}</div>
+        </details>`
+      : "";
 
   const depsHtml =
     depNeeds.length > 0
@@ -887,6 +902,7 @@ function dashboardPage(deps: HttpServerDeps): string {
     <section>
       <h2>Needs decision <span class="count">${appNeeds.length}</span></h2>
       ${needsHtml}
+      ${pairedHtml}
       ${depsHtml}
       ${snoozedSection(all, now)}
       ${mutedAppsSection(deps)}
