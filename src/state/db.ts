@@ -164,6 +164,33 @@ CREATE TABLE IF NOT EXISTS muted_services (
   muted_at  INTEGER NOT NULL,
   PRIMARY KEY (stack, service)
 );
+
+-- Per-image check health. One row per image ref seen in a compose file:
+-- when it was last seen, when a registry check last SUCCEEDED, and the most
+-- recent failure. Powers the daily digest's "not checked" section — an image
+-- the scan cannot check (unknown registry, persistent errors, rate limits)
+-- used to be indistinguishable from one that is simply up to date.
+CREATE TABLE IF NOT EXISTS image_checks (
+  image            TEXT PRIMARY KEY,
+  used_by          TEXT,
+  first_seen_at    INTEGER NOT NULL,
+  last_seen_at     INTEGER NOT NULL,
+  last_success_at  INTEGER,
+  last_error       TEXT,
+  last_error_at    INTEGER
+);
+
+-- Version decoded for a manifest digest of a repository (from a version tag
+-- sharing the digest, or the image's OCI version label). Digests are
+-- immutable, so a decode is valid forever; caching it spares the tag probes
+-- on every scan while a floating-tag bump waits for a decision.
+CREATE TABLE IF NOT EXISTS digest_versions (
+  repo      TEXT NOT NULL,
+  digest    TEXT NOT NULL,
+  version   TEXT NOT NULL,
+  seen_at   INTEGER NOT NULL,
+  PRIMARY KEY (repo, digest)
+);
 `;
 
 /**
@@ -931,4 +958,116 @@ export function recordWatchedNotified(
        SET notified_tag = ?, notified_at = ?, advise_text = ?
      WHERE repo = ?`,
   ).run(notifiedTag, Date.now(), adviseText, repo);
+}
+
+// ─── image check health ──────────────────────────────────────────────────────
+
+export interface ImageCheckRow {
+  image: string;
+  used_by: string | null;
+  first_seen_at: number;
+  last_seen_at: number;
+  last_success_at: number | null;
+  last_error: string | null;
+  last_error_at: number | null;
+}
+
+/**
+ * Record the outcome of checking one image in a scan. `error` undefined means
+ * the check succeeded. `usedBy` is the `stack/service` list for display.
+ */
+export function recordImageCheck(
+  db: DB,
+  image: string,
+  usedBy: string[],
+  error?: string,
+  now = Date.now(),
+): void {
+  const used = usedBy.join(", ");
+  if (error === undefined) {
+    db.prepare(
+      `INSERT INTO image_checks (image, used_by, first_seen_at, last_seen_at, last_success_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(image) DO UPDATE SET
+         used_by = excluded.used_by,
+         last_seen_at = excluded.last_seen_at,
+         last_success_at = excluded.last_success_at`,
+    ).run(image, used, now, now, now);
+  } else {
+    db.prepare(
+      `INSERT INTO image_checks (image, used_by, first_seen_at, last_seen_at, last_error, last_error_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(image) DO UPDATE SET
+         used_by = excluded.used_by,
+         last_seen_at = excluded.last_seen_at,
+         last_error = excluded.last_error,
+         last_error_at = excluded.last_error_at`,
+    ).run(image, used, now, now, error.slice(0, 500), now);
+  }
+}
+
+/**
+ * Images still in use (seen by a scan within `seenWithinMs`) that have not
+ * been checked successfully for `staleAfterMs` — counting from when bumpsight
+ * first saw them if they never succeeded. Oldest success first.
+ */
+export function listStaleImageChecks(
+  db: DB,
+  opts: { staleAfterMs: number; seenWithinMs: number; now?: number },
+): ImageCheckRow[] {
+  const now = opts.now ?? Date.now();
+  return db
+    .prepare(
+      `SELECT * FROM image_checks
+       WHERE last_seen_at >= ?
+         AND COALESCE(last_success_at, first_seen_at) <= ?
+       ORDER BY COALESCE(last_success_at, 0) ASC, image ASC`,
+    )
+    .all(now - opts.seenWithinMs, now - opts.staleAfterMs) as ImageCheckRow[];
+}
+
+// ─── digest → version cache ─────────────────────────────────────────────────
+
+/** Cached decode for a digest. `version` is "" for a recorded miss, so the
+ *  caller can tell "never tried" (undefined) from "tried, nothing found". */
+export function getDigestVersion(
+  db: DB,
+  repo: string,
+  digest: string,
+): { version: string; seenAt: number } | undefined {
+  const row = db
+    .prepare(`SELECT version, seen_at FROM digest_versions WHERE repo = ? AND digest = ?`)
+    .get(repo, digest) as { version: string; seen_at: number } | undefined;
+  return row ? { version: row.version, seenAt: row.seen_at } : undefined;
+}
+
+export function saveDigestVersion(db: DB, repo: string, digest: string, version: string): void {
+  db.prepare(
+    `INSERT INTO digest_versions (repo, digest, version, seen_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(repo, digest) DO UPDATE SET version = excluded.version, seen_at = excluded.seen_at`,
+  ).run(repo, digest, version, Date.now());
+}
+
+/**
+ * Retire older still-open rows for a (stack, service) that track the same
+ * floating tag (same `family`), once a newer one lands. The floating-tag
+ * counterpart of {@link supersedeOlderDigestRows}, which only covers rows
+ * classified `digest`.
+ */
+export function supersedeOlderFamilyRows(
+  db: DB,
+  stack: string,
+  service: string,
+  family: string,
+  keepId: number,
+): number {
+  return db
+    .prepare(
+      `UPDATE updates SET superseded = 1, dismiss_reason = 'superseded'
+       WHERE stack = ? AND service = ? AND family = ?
+         AND id != ?
+         AND status IN ('pending','notified')
+         AND (superseded IS NULL OR superseded = 0)`,
+    )
+    .run(stack, service, family, keepId).changes;
 }

@@ -174,9 +174,12 @@ export async function applyOne(
   let log = result.log;
   const bundleLog = formatBundleLog(plan);
   if (bundleLog) log += `\n${bundleLog}`;
+  // A `pinned:` row (a `tag@digest` ref whose digest moved) carries versions,
+  // not tags, in current_tag — there is no `image:<current_tag>` to remove.
   const shouldPrune =
     result.ok &&
     !isMovingApply &&
+    !(row.family?.startsWith("pinned:") ?? false) &&
     deps.pruneAfterApply !== false &&
     row.current_tag !== row.target_tag;
   if (shouldPrune) {

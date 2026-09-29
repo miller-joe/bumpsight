@@ -25,6 +25,29 @@ export function isMovingTag(tag: string): boolean {
 }
 
 /**
+ * A tag that can point at a different image tomorrow without its name
+ * changing: a moving channel (`latest`), a partial version (`4.39`, `2`,
+ * `6-alpine`, `13.0-latest`), or any other non-version name (`release`,
+ * `main-stable`). A full version (`1.2.3`, `1.2.3-alpine`) and a date tag are
+ * treated as fixed.
+ *
+ * Tag-name comparison is blind to these: `4.39` stays `4.39` while 4.39.1,
+ * 4.39.2 … ship underneath it. They have to be checked by digest.
+ */
+export function isFloatingTag(tag: string): boolean {
+  if (isMovingTag(tag)) return true;
+  const parsed = parseTag(tag);
+  if (parsed.dateYMD !== undefined) return false;
+  if (parsed.numeric) {
+    if (parsed.numeric.length >= 3) return false;
+    // `1.2-r3-ls45` style build tags are LinuxServer build pins, not channels.
+    if (/-ls\d+/.test(parsed.suffix ?? "")) return false;
+    return true;
+  }
+  return true;
+}
+
+/**
  * Image references that are typically a dependency layer of another app
  * (databases, caches, brokers, secret stores). When a parent app's compose
  * pins one of these to a specific version, that pin reflects what the

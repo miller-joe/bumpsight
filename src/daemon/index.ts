@@ -1,7 +1,13 @@
 import { dirname, basename, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { Database as DB } from "better-sqlite3";
-import { loadComposeFile, parseImageRef, type ImageRef } from "../compose/parse.js";
+import {
+  interpolateImage,
+  loadComposeFile,
+  parseImageRef,
+  type ImageRef,
+  type ServiceDef,
+} from "../compose/parse.js";
 import {
   isSupportedRegistry,
   listTags,
@@ -14,6 +20,7 @@ import {
   classifyBump,
   decideAction,
   isDependencyImage,
+  isFloatingTag,
   isMovingTag,
 } from "./rules.js";
 import type { BumpKind, RulesConfig } from "./rules.js";
@@ -30,15 +37,24 @@ import {
   dismissRow,
   deleteUpdate,
   getMutedServices,
+  recordImageCheck,
+  supersedeOlderFamilyRows,
   type UpdateRow,
 } from "../state/db.js";
-import { fetchOciLabels } from "../registry/oci-config.js";
+import { extractVersion, fetchOciLabels } from "../registry/oci-config.js";
 import {
+  checkFloatingTag,
+  localRepoDigest,
+  resolveDigestToTag,
+} from "./floating.js";
+import { realRunner } from "../apply/docker.js";
+import {
+  looksLikeVersion,
   movingTagInfo,
   resolveMovingDelta,
   type MovingDelta,
 } from "../registry/moving-tag-label.js";
-import { fromDisplay, toDisplay } from "../util/display.js";
+import { floatingTagOf, fromDisplay, toDisplay } from "../util/display.js";
 import { notifyAll } from "../notify/index.js";
 import { archiveMessage } from "../notify/outbox.js";
 import type { Notifier, NotifyMessage, NotifyLink } from "../notify/types.js";
@@ -82,6 +98,15 @@ export interface ScanRunResult {
   skipped: number;
   /** Image refs skipped, grouped by registry. */
   skippedByRegistry: Record<string, string[]>;
+  /** Services whose image was checked against its registry successfully. */
+  checked: number;
+  /** Services whose check FAILED (registry error, rate limit, …). These
+   *  are not "up to date" — nothing is known about them this pass. Details
+   *  in `errors`. */
+  unchecked: number;
+  /** Services running a locally built image (a `build:` key, or a bare name
+   *  no registry knows). Nothing to check. */
+  localBuilds: number;
 }
 
 export interface ScanRunDeps {
@@ -134,6 +159,12 @@ export interface ScanRunDeps {
   ) => Promise<MovingDelta>;
   /** Test seam — sleep helper for the rate limiter. */
   sleepFn?: (ms: number) => Promise<void>;
+  /** Test seam — digest of the local image for a floating tag. Defaults to
+   *  `docker image inspect` through `runner`. */
+  localDigestFn?: (ref: ImageRef) => Promise<string | undefined>;
+  /** Test seam — version from OCI labels at a digest. Defaults to a registry
+   *  config-blob fetch. */
+  labelVersionFn?: (ref: ImageRef, digest: string) => Promise<string | undefined>;
 }
 
 /**
@@ -154,9 +185,16 @@ export async function runScanOnce(
     errors: {},
     skipped: 0,
     skippedByRegistry: {},
+    checked: 0,
+    unchecked: 0,
+    localBuilds: 0,
   };
   const lister = deps.listTagsFn ?? listTags;
   const manifestFetcher = deps.fetchManifestDigestFn ?? fetchManifestDigest;
+  const localDigest =
+    deps.localDigestFn ??
+    ((ref: ImageRef) => localRepoDigest(ref, deps.runner ?? realRunner));
+  const labelVersion = deps.labelVersionFn ?? ociLabelVersion;
   const sleep =
     deps.sleepFn ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const notifyIntervalMs = deps.notifyIntervalMs ?? 0;
@@ -169,269 +207,109 @@ export async function runScanOnce(
     getMutedServices(deps.db).map((m) => `${m.stack}::${m.service}`),
   );
 
-  for (const [stack, composePath] of Object.entries(deps.composeFiles)) {
-    let compose: ReturnType<typeof loadComposeFile>;
-    try {
-      compose = loadComposeFile(composePath);
-    } catch (err) {
-      result.errors[composePath] = (err as Error).message;
-      continue;
+  // Per-image check outcome, written to image_checks after the pass. An
+  // image used by several services is checked once per service; any failure
+  // wins so a flaky check is not masked by a later success.
+  const checks = new Map<string, { usedBy: string[]; error?: string }>();
+  const noteCheck = (image: string, usedBy: string, error?: string) => {
+    const c = checks.get(image) ?? { usedBy: [] };
+    if (!c.usedBy.includes(usedBy)) c.usedBy.push(usedBy);
+    if (error !== undefined && c.error === undefined) c.error = error;
+    checks.set(image, c);
+  };
+
+  type ServiceList = [string, ServiceDef][];
+
+  const scanService = async (
+    stack: string,
+    composePath: string,
+    services: ServiceList,
+    serviceName: string,
+    ref: ImageRef,
+  ): Promise<void> => {
+    const tags = await lister(ref, {});
+
+    // Path A: moving tag (latest / stable / edge / etc.) — track digest
+    // changes. Phase 2: try to resolve the digest to the most-precise
+    // semver tag sharing it. When both prior and new digests resolve, we
+    // classify the change as a normal patch / minor / major and let the
+    // stack's policy decide auto-apply vs hold. When resolution fails on
+    // either side, we fall back to Phase 1 behavior (always hold, with
+    // digest prefixes shown in the email).
+    // A moving tag pinned to a digest (`latest@sha256:…`) is not tracked here:
+    // the pin, not the last-seen digest, is what runs. Path C handles it.
+    if (isMovingTag(ref.tag) && !ref.digest) {
+      // Get the current digest of the moving tag. Docker Hub returns it
+      // inline in the tag list; GHCR doesn't, so fall back to a manifest
+      // probe.
+      const matching = tags.find((t) => t.name === ref.tag);
+      let newDigest = matching?.digest;
+      if (!newDigest) {
+        try {
+          newDigest = await manifestFetcher(ref, ref.tag);
+        } catch {
+          newDigest = undefined;
+        }
+      }
+      if (!newDigest) {
+      throw new Error(`registry returned no digest for :${ref.tag}`);
     }
-    const services = Object.entries(compose.services ?? {}).filter(
-      ([, svc]) => svc.image,
-    );
 
-    for (const [serviceName, svc] of services) {
-      if (mutedSet.has(`${stack}::${serviceName}`)) continue; // muted app — skip
-      result.scanned += 1;
-      const ref = parseImageRef(svc.image!);
-      if (!isSupportedRegistry(ref)) {
-        // Never a silent drop: an unsupported registry means this image is
-        // not being watched at all, which is strictly worse than an error.
-        const reg = ref.registry ?? "(none)";
-        result.skipped += 1;
-        (result.skippedByRegistry[reg] ??= []).push(ref.raw);
-        continue;
-      }
+      const prev = getStoredDigest(deps.db, ref.raw, ref.tag);
 
-      let tags: Awaited<ReturnType<typeof lister>>;
-      try {
-        tags = await lister(ref, {});
-      } catch (err) {
-        result.errors[ref.raw] = (err as Error).message;
-        continue;
-      }
-
-      // Path A: moving tag (latest / stable / edge / etc.) — track digest
-      // changes. Phase 2: try to resolve the digest to the most-precise
-      // semver tag sharing it. When both prior and new digests resolve, we
-      // classify the change as a normal patch / minor / major and let the
-      // stack's policy decide auto-apply vs hold. When resolution fails on
-      // either side, we fall back to Phase 1 behavior (always hold, with
-      // digest prefixes shown in the email).
-      if (isMovingTag(ref.tag)) {
-        // Get the current digest of the moving tag. Docker Hub returns it
-        // inline in the tag list; GHCR doesn't, so fall back to a manifest
-        // probe.
-        const matching = tags.find((t) => t.name === ref.tag);
-        let newDigest = matching?.digest;
-        if (!newDigest) {
-          try {
-            newDigest = await manifestFetcher(ref, ref.tag);
-          } catch {
-            newDigest = undefined;
-          }
-        }
-        if (!newDigest) continue;
-
-        const prev = getStoredDigest(deps.db, ref.raw, ref.tag);
-
-        if (!prev) {
-          // First observation — resolve and record silently for the next scan.
-          const resolved = await resolveDigestToTag(
-            ref,
-            tags,
-            newDigest,
-            ref.tag,
-            manifestFetcher,
-          );
-          saveDigest(deps.db, ref.raw, ref.tag, newDigest, resolved ?? null);
-          continue;
-        }
-        if (prev.digest === newDigest) continue;
-
-        // Digest changed. Try to resolve it to a semver tag.
-        const newResolved = await resolveDigestToTag(
+      if (!prev) {
+        // First observation — resolve and record silently for the next scan.
+        const resolved = await resolveDigestToTag(
           ref,
           tags,
           newDigest,
           ref.tag,
           manifestFetcher,
         );
+        saveDigest(deps.db, ref.raw, ref.tag, newDigest, resolved ?? null);
+        return;
+      }
+      if (prev.digest === newDigest) return;
 
-        let bump: BumpKind = "digest";
-        let currentTagForRow = prev.digest.replace(/^sha256:/, "").slice(0, 12);
-        let targetTagForRow = newDigest.replace(/^sha256:/, "").slice(0, 12);
-        // v0.4.2: For digest-class bumps where the source compose tag is a
-        // recognized moving tag (`:latest`, `:nightly`, etc.), mark the row
-        // as moving even when semver resolution fails. This is what tells
-        // applyOne to skip the compose-rewrite step (the file still says
-        // `:latest`); without this, the apply path tries to rewrite a 12-char
-        // digest prefix into a compose entry that says `latest` and fails
-        // with "image tag drift: expected <sha>, found latest".
-        let familyForRow: string | undefined = isMovingTag(ref.tag)
-          ? `moving:${ref.tag}`
-          : undefined;
+      // Digest changed. Try to resolve it to a semver tag.
+      const newResolved = await resolveDigestToTag(
+        ref,
+        tags,
+        newDigest,
+        ref.tag,
+        manifestFetcher,
+      );
 
-        // Phase 2 happy path: both sides resolve to a semver tag we can
-        // classify. Use the resolved pair as the row's current/target so the
-        // email shows "1.27.4 → 1.27.5" instead of digest prefixes, and so
-        // policy can auto-apply.
-        if (prev.resolvedTag && newResolved) {
-          const semverBump = classifyBump(prev.resolvedTag, newResolved);
-          if (semverBump !== "unknown") {
-            bump = semverBump;
-            currentTagForRow = prev.resolvedTag;
-            targetTagForRow = newResolved;
-            familyForRow = `moving:${ref.tag}`;
-          }
+      let bump: BumpKind = "digest";
+      let currentTagForRow = prev.digest.replace(/^sha256:/, "").slice(0, 12);
+      let targetTagForRow = newDigest.replace(/^sha256:/, "").slice(0, 12);
+      // v0.4.2: For digest-class bumps where the source compose tag is a
+      // recognized moving tag (`:latest`, `:nightly`, etc.), mark the row
+      // as moving even when semver resolution fails. This is what tells
+      // applyOne to skip the compose-rewrite step (the file still says
+      // `:latest`); without this, the apply path tries to rewrite a 12-char
+      // digest prefix into a compose entry that says `latest` and fails
+      // with "image tag drift: expected <sha>, found latest".
+      let familyForRow: string | undefined = isMovingTag(ref.tag)
+        ? `moving:${ref.tag}`
+        : undefined;
+
+      // Phase 2 happy path: both sides resolve to a semver tag we can
+      // classify. Use the resolved pair as the row's current/target so the
+      // email shows "1.27.4 → 1.27.5" instead of digest prefixes, and so
+      // policy can auto-apply.
+      // Equal names are not a bump: `v1 -> v1` classified as `patch` and was
+      // "applied" as a no-op while the pinned image stayed put.
+      if (prev.resolvedTag && newResolved && prev.resolvedTag !== newResolved) {
+        const semverBump = classifyBump(prev.resolvedTag, newResolved);
+        if (semverBump !== "unknown") {
+          bump = semverBump;
+          currentTagForRow = prev.resolvedTag;
+          targetTagForRow = newResolved;
+          familyForRow = `moving:${ref.tag}`;
         }
-
-        const isDep = isDependencyImage(
-          ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
-          {
-            stack,
-            service: serviceName,
-            siblingServices: services.map(([n]) => n),
-          },
-        );
-        const decision = decideAction(deps.rules, stack, bump, isDep);
-        // v0.6.0: dependency bumps are always surfaced in the GUI (see the
-        // semver-path note). Only a non-dependency skip stays invisible.
-        if (decision === "skip" && !isDep) {
-          // Still advance stored digest so we don't refire on every scan.
-          saveDigest(
-            deps.db,
-            ref.raw,
-            ref.tag,
-            newDigest,
-            newResolved ?? null,
-          );
-          continue;
-        }
-
-        // v0.6.0: mint a token for every discovered row (not just holds) so the
-        // dashboard can act on any row through the capability-token routes.
-        // Auto-apply rows getting a token is harmless (no approval link is
-        // embedded in their applied-emails) and lets the GUI re-apply/retry.
-        const token = randomBytes(18).toString("base64url");
-        const id = recordUpdate(deps.db, {
-          stack,
-          service: serviceName,
-          image: ref.raw,
-          currentTag: currentTagForRow,
-          targetTag: targetTagForRow,
-          family: familyForRow,
-          bump,
-          approvalToken: token,
-        });
-        const row = findUpdate(deps.db, id);
-        if (!row || row.status !== "pending") continue;
-        result.discovered += 1;
-
-        // v0.6.0: retire any older still-open digest rows for this service so
-        // the moving-tag app shows one current card, not a pile of stale ones.
-        supersedeOlderDigestRows(deps.db, stack, serviceName, row.id);
-
-        // Advance the stored digest now so a re-scan before the user acts
-        // doesn't keep refiring the same bump.
-        saveDigest(deps.db, ref.raw, ref.tag, newDigest, newResolved ?? null);
-
-        // v0.6.0: for true digest-class bumps (no semver pair resolved), decode
-        // the old + new digests into a version / build-date delta via OCI
-        // labels so the row shows `2.20.14 → 2.20.15` (or a date) instead of two
-        // opaque hashes. Display-only; independent of the LLM enrichment below.
-        if (bump === "digest") {
-          const delta = await (deps.movingDeltaFn ?? safeMovingDelta)(
-            ref,
-            prev.digest,
-            newDigest,
-          );
-          if (delta.sameVersion) {
-            // Phantom: the digest moved but the decoded version is unchanged
-            // (a rebuild of the same version). Not a real update — retire it so
-            // it never reaches the queue. The stored digest is already advanced.
-            dismissRow(deps.db, row.id, "unchanged");
-            continue;
-          }
-          if (delta.from || delta.to) {
-            setDisplayTags(deps.db, row.id, delta.from ?? null, delta.to ?? null);
-          }
-        }
-
-        // v0.5.5: for true digest-class bumps (no semver resolved), enrich
-        // the row with an OCI-label-driven commit-range summary. Falls back
-        // silently when labels are absent. The daily-digest renderer picks
-        // up `advise_text` automatically.
-        if (bump === "digest" && deps.llmUrl) {
-          const enrichment = await safeEnrichDigest(
-            {
-              image: ref.raw,
-              prevDigest: prev.digest,
-              newDigest,
-              llmUrl: deps.llmUrl,
-              llmKey: deps.llmKey,
-              model: deps.llmModel,
-              githubToken: deps.githubToken,
-            },
-            deps.enrichDigestFn,
-          );
-          if (enrichment.ok && enrichment.summary) {
-            setAdviseText(deps.db, row.id, enrichment.summary);
-          }
-        }
-
-        if (decision === "auto-apply") {
-          // applyOne sees row.family === `moving:${tag}` and skips the
-          // compose-file rewrite (the file still says `:latest`); it just
-          // pulls + restarts so the new digest gets picked up.
-          result.autoApplied += 1;
-          const after = await applyOne(
-            {
-              db: deps.db,
-              composeFiles: deps.composeFiles,
-              runner: deps.runner,
-              pruneAfterApply: deps.pruneAfterApply,
-              bundlePairedDeps:
-                deps.applyPairedDeps !== undefined &&
-                isPairedDepBundlingEnabled(deps.applyPairedDeps, stack),
-            },
-            row.id,
-          );
-          if (after.status === "applied") result.autoAppliedOk += 1;
-          await dispatchAppliedNotification(
-            deps.notifiers,
-            after,
-            deps.llmUrl
-              ? await safeAdvise(
-                  {
-                    image: ref.raw,
-                    from: currentTagForRow,
-                    to: targetTagForRow,
-                    composeFile: composePath,
-                    serviceName,
-                    stackName: stack,
-                    llmUrl: deps.llmUrl,
-                    llmKey: deps.llmKey,
-                    model: deps.llmModel,
-                    githubToken: deps.githubToken,
-                  },
-                  deps.adviseFn,
-                )
-              : null,
-            deps.outboxDir
-              ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
-              : undefined,
-          );
-        } else if (isDep) {
-          // Dependency held → GUI-visible, never emailed.
-          result.held += 1;
-          setNotified(deps.db, row.id);
-        } else {
-          result.held += 1;
-          heldRows.push({ row, composePath, serviceName });
-        }
-        continue;
       }
 
-      // Path B: semver tag — existing behavior
-      const latest = findLatestInFamily(
-        ref.tag,
-        tags.map((t) => t.name),
-      );
-      if (!latest || latest === ref.tag) continue;
-
-      const bump: BumpKind = classifyBump(ref.tag, latest);
       const isDep = isDependencyImage(
         ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
         {
@@ -441,30 +319,95 @@ export async function runScanOnce(
         },
       );
       const decision = decideAction(deps.rules, stack, bump, isDep);
-      // v0.6.0 dependency special case: dependency bumps are ALWAYS surfaced in
-      // the GUI for individual review/ignore, but stay out of email. So
-      // `deps: none` means "quiet + never auto-apply", not "invisible". A
-      // non-dependency `app: none` stays hidden as before.
-      if (decision === "skip" && !isDep) continue;
+      // v0.6.0: dependency bumps are always surfaced in the GUI (see the
+      // semver-path note). Only a non-dependency skip stays invisible.
+      if (decision === "skip" && !isDep) {
+        // Still advance stored digest so we don't refire on every scan.
+        saveDigest(
+          deps.db,
+          ref.raw,
+          ref.tag,
+          newDigest,
+          newResolved ?? null,
+        );
+        return;
+      }
 
-      // v0.6.0: every discovered row gets a token (see the digest-path note
-      // above) — the dashboard is now token-addressed for all actions.
+      // v0.6.0: mint a token for every discovered row (not just holds) so the
+      // dashboard can act on any row through the capability-token routes.
+      // Auto-apply rows getting a token is harmless (no approval link is
+      // embedded in their applied-emails) and lets the GUI re-apply/retry.
       const token = randomBytes(18).toString("base64url");
       const id = recordUpdate(deps.db, {
         stack,
         service: serviceName,
         image: ref.raw,
-        currentTag: ref.tag,
-        targetTag: latest,
+        currentTag: currentTagForRow,
+        targetTag: targetTagForRow,
+        family: familyForRow,
         bump,
         approvalToken: token,
       });
-
       const row = findUpdate(deps.db, id);
-      if (!row || row.status !== "pending") continue;
+      if (!row || row.status !== "pending") return;
       result.discovered += 1;
 
+      // v0.6.0: retire any older still-open digest rows for this service so
+      // the moving-tag app shows one current card, not a pile of stale ones.
+      supersedeOlderDigestRows(deps.db, stack, serviceName, row.id);
+
+      // Advance the stored digest now so a re-scan before the user acts
+      // doesn't keep refiring the same bump.
+      saveDigest(deps.db, ref.raw, ref.tag, newDigest, newResolved ?? null);
+
+      // v0.6.0: for true digest-class bumps (no semver pair resolved), decode
+      // the old + new digests into a version / build-date delta via OCI
+      // labels so the row shows `2.20.14 → 2.20.15` (or a date) instead of two
+      // opaque hashes. Display-only; independent of the LLM enrichment below.
+      if (bump === "digest") {
+        const delta = await (deps.movingDeltaFn ?? safeMovingDelta)(
+          ref,
+          prev.digest,
+          newDigest,
+        );
+        if (delta.sameVersion) {
+          // Phantom: the digest moved but the decoded version is unchanged
+          // (a rebuild of the same version). Not a real update — retire it so
+          // it never reaches the queue. The stored digest is already advanced.
+          dismissRow(deps.db, row.id, "unchanged");
+          return;
+        }
+        if (delta.from || delta.to) {
+          setDisplayTags(deps.db, row.id, delta.from ?? null, delta.to ?? null);
+        }
+      }
+
+      // v0.5.5: for true digest-class bumps (no semver resolved), enrich
+      // the row with an OCI-label-driven commit-range summary. Falls back
+      // silently when labels are absent. The daily-digest renderer picks
+      // up `advise_text` automatically.
+      if (bump === "digest" && deps.llmUrl) {
+        const enrichment = await safeEnrichDigest(
+          {
+            image: ref.raw,
+            prevDigest: prev.digest,
+            newDigest,
+            llmUrl: deps.llmUrl,
+            llmKey: deps.llmKey,
+            model: deps.llmModel,
+            githubToken: deps.githubToken,
+          },
+          deps.enrichDigestFn,
+        );
+        if (enrichment.ok && enrichment.summary) {
+          setAdviseText(deps.db, row.id, enrichment.summary);
+        }
+      }
+
       if (decision === "auto-apply") {
+        // applyOne sees row.family === `moving:${tag}` and skips the
+        // compose-file rewrite (the file still says `:latest`); it just
+        // pulls + restarts so the new digest gets picked up.
         result.autoApplied += 1;
         const after = await applyOne(
           {
@@ -479,12 +422,248 @@ export async function runScanOnce(
           row.id,
         );
         if (after.status === "applied") result.autoAppliedOk += 1;
-        const adviseForApplied = deps.llmUrl
+        await dispatchAppliedNotification(
+          deps.notifiers,
+          after,
+          deps.llmUrl
+            ? await safeAdvise(
+                {
+                  image: ref.raw,
+                  from: currentTagForRow,
+                  to: targetTagForRow,
+                  composeFile: composePath,
+                  serviceName,
+                  stackName: stack,
+                  llmUrl: deps.llmUrl,
+                  llmKey: deps.llmKey,
+                  model: deps.llmModel,
+                  githubToken: deps.githubToken,
+                },
+                deps.adviseFn,
+              )
+            : null,
+          deps.outboxDir
+            ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
+            : undefined,
+        );
+      } else if (isDep) {
+        // Dependency held → GUI-visible, never emailed.
+        result.held += 1;
+        setNotified(deps.db, row.id);
+      } else {
+        result.held += 1;
+        heldRows.push({ row, composePath, serviceName });
+      }
+      return;
+    }
+
+    // Path B: semver tag — existing behavior
+    const latest = findLatestInFamily(
+      ref.tag,
+      tags.map((t) => t.name),
+    );
+    if (!latest || latest === ref.tag) {
+      // Path C: nothing newer by NAME. For a floating tag that says nothing
+      // about whether the image under the tag moved — check the digest.
+      if (isFloatingTag(ref.tag)) {
+        await scanFloating(stack, composePath, services, serviceName, ref, tags);
+      }
+      return;
+    }
+
+    const bump: BumpKind = classifyBump(ref.tag, latest);
+    const isDep = isDependencyImage(
+      ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+      {
+        stack,
+        service: serviceName,
+        siblingServices: services.map(([n]) => n),
+      },
+    );
+    const decision = decideAction(deps.rules, stack, bump, isDep);
+    // v0.6.0 dependency special case: dependency bumps are ALWAYS surfaced in
+    // the GUI for individual review/ignore, but stay out of email. So
+    // `deps: none` means "quiet + never auto-apply", not "invisible". A
+    // non-dependency `app: none` stays hidden as before.
+    if (decision === "skip" && !isDep) return;
+
+    // v0.6.0: every discovered row gets a token (see the digest-path note
+    // above) — the dashboard is now token-addressed for all actions.
+    const token = randomBytes(18).toString("base64url");
+    // A `tag@sha256:…` ref must have its digest rewritten with the tag, or
+    // the old digest keeps winning and the "bump" pulls the old image.
+    const targetImage = ref.digest
+      ? await pinnedTargetRef(ref, latest, tags, manifestFetcher)
+      : undefined;
+    const id = recordUpdate(deps.db, {
+      stack,
+      service: serviceName,
+      image: ref.raw,
+      currentTag: ref.tag,
+      targetTag: latest,
+      bump,
+      approvalToken: token,
+      targetImage,
+    });
+
+    const row = findUpdate(deps.db, id);
+    if (!row || row.status !== "pending") return;
+    result.discovered += 1;
+
+    if (decision === "auto-apply") {
+      result.autoApplied += 1;
+      const after = await applyOne(
+        {
+          db: deps.db,
+          composeFiles: deps.composeFiles,
+          runner: deps.runner,
+          pruneAfterApply: deps.pruneAfterApply,
+          bundlePairedDeps:
+            deps.applyPairedDeps !== undefined &&
+            isPairedDepBundlingEnabled(deps.applyPairedDeps, stack),
+        },
+        row.id,
+      );
+      if (after.status === "applied") result.autoAppliedOk += 1;
+      const adviseForApplied = deps.llmUrl
+        ? await safeAdvise(
+            {
+              image: ref.raw,
+              from: ref.tag,
+              to: latest,
+              composeFile: composePath,
+              serviceName,
+              stackName: stack,
+              llmUrl: deps.llmUrl,
+              llmKey: deps.llmKey,
+              model: deps.llmModel,
+              githubToken: deps.githubToken,
+            },
+            deps.adviseFn,
+          )
+        : null;
+      await dispatchAppliedNotification(
+        deps.notifiers,
+        after,
+        adviseForApplied,
+        deps.outboxDir
+          ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
+          : undefined,
+      );
+    } else if (isDep) {
+      // Dependency held → GUI-visible for individual review, never emailed
+      // (not added to heldRows, so it skips the email dispatch entirely).
+      result.held += 1;
+      setNotified(deps.db, row.id);
+    } else {
+      result.held += 1;
+      heldRows.push({ row, composePath, serviceName });
+    }
+  };
+
+  /**
+   * Path C: a floating tag (`4.39`, `6-alpine`, `release`, or anything pinned
+   * as `tag@sha256:…`). Compare the digest the registry serves for the tag
+   * with the digest we run, decode both to versions, and record a bump that
+   * carries the real versions. See `floating.ts`.
+   */
+  const scanFloating = async (
+    stack: string,
+    composePath: string,
+    services: ServiceList,
+    serviceName: string,
+    ref: ImageRef,
+    tags: RemoteTag[],
+  ): Promise<void> => {
+    const outcome = await checkFloatingTag(ref, tags, {
+      db: deps.db,
+      fetchDigest: manifestFetcher,
+      localDigest,
+      labelVersion,
+    });
+    if (outcome.kind !== "bump") return;
+
+    const short = (d: string) => d.replace(/^sha256:/, "").slice(0, 12);
+    const currentTag = outcome.fromVersion ?? short(outcome.fromDigest);
+    const targetTag = outcome.toVersion ?? short(outcome.toDigest);
+    // `pinned:` rows rewrite the digest in the compose file; `moving:` rows
+    // keep the compose line and pull + recreate (see applyOne).
+    const family = ref.digest ? `pinned:${ref.tag}` : `moving:${ref.tag}`;
+    const targetImage = ref.digest
+      ? `${ref.raw.slice(0, ref.raw.indexOf("@"))}@${outcome.toDigest}`
+      : undefined;
+
+    const isDep = isDependencyImage(
+      ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name,
+      {
+        stack,
+        service: serviceName,
+        siblingServices: services.map(([n]) => n),
+      },
+    );
+    const decision = decideAction(deps.rules, stack, outcome.bump, isDep);
+    const advanceStored = () => {
+      if (!ref.digest) saveDigest(deps.db, ref.raw, ref.tag, outcome.toDigest, null);
+    };
+    if (decision === "skip" && !isDep) {
+      advanceStored();
+      return;
+    }
+
+    const id = recordUpdate(deps.db, {
+      stack,
+      service: serviceName,
+      image: ref.raw,
+      currentTag,
+      targetTag,
+      family,
+      bump: outcome.bump,
+      approvalToken: randomBytes(18).toString("base64url"),
+      targetImage,
+    });
+    const row = findUpdate(deps.db, id);
+    if (!row || row.status !== "pending") return;
+    result.discovered += 1;
+    supersedeOlderFamilyRows(deps.db, stack, serviceName, family, row.id);
+    advanceStored();
+
+    // A side we could not decode to a version still gets a readable build
+    // date instead of a bare hash prefix.
+    if (!outcome.fromVersion || !outcome.toVersion) {
+      const delta = await (deps.movingDeltaFn ?? safeMovingDelta)(
+        ref,
+        outcome.fromDigest,
+        outcome.toDigest,
+      );
+      const from = outcome.fromVersion ?? delta.from ?? null;
+      const to = outcome.toVersion ?? delta.to ?? null;
+      if (from || to) setDisplayTags(deps.db, row.id, from, to);
+    }
+
+    if (decision === "auto-apply") {
+      result.autoApplied += 1;
+      const after = await applyOne(
+        {
+          db: deps.db,
+          composeFiles: deps.composeFiles,
+          runner: deps.runner,
+          pruneAfterApply: deps.pruneAfterApply,
+          bundlePairedDeps:
+            deps.applyPairedDeps !== undefined &&
+            isPairedDepBundlingEnabled(deps.applyPairedDeps, stack),
+        },
+        row.id,
+      );
+      if (after.status === "applied") result.autoAppliedOk += 1;
+      await dispatchAppliedNotification(
+        deps.notifiers,
+        after,
+        deps.llmUrl && outcome.fromVersion && outcome.toVersion
           ? await safeAdvise(
               {
                 image: ref.raw,
-                from: ref.tag,
-                to: latest,
+                from: outcome.fromVersion,
+                to: outcome.toVersion,
                 composeFile: composePath,
                 serviceName,
                 stackName: stack,
@@ -495,24 +674,77 @@ export async function runScanOnce(
               },
               deps.adviseFn,
             )
-          : null;
-        await dispatchAppliedNotification(
-          deps.notifiers,
-          after,
-          adviseForApplied,
-          deps.outboxDir
-            ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
-            : undefined,
-        );
-      } else if (isDep) {
-        // Dependency held → GUI-visible for individual review, never emailed
-        // (not added to heldRows, so it skips the email dispatch entirely).
-        result.held += 1;
-        setNotified(deps.db, row.id);
-      } else {
-        result.held += 1;
-        heldRows.push({ row, composePath, serviceName });
+          : null,
+        deps.outboxDir
+          ? { dir: deps.outboxDir, keepCount: deps.outboxKeepCount }
+          : undefined,
+      );
+    } else if (isDep) {
+      result.held += 1;
+      setNotified(deps.db, row.id);
+    } else {
+      result.held += 1;
+      // Re-read so the hold email sees the display override set above.
+      heldRows.push({ row: findUpdate(deps.db, row.id) ?? row, composePath, serviceName });
+    }
+  };
+
+  for (const [stack, composePath] of Object.entries(deps.composeFiles)) {
+    let compose: ReturnType<typeof loadComposeFile>;
+    try {
+      compose = loadComposeFile(composePath);
+    } catch (err) {
+      result.errors[composePath] = (err as Error).message;
+      continue;
+    }
+    const services = Object.entries(compose.services ?? {}).filter(
+      ([, svc]) => svc.image,
+    ) as ServiceList;
+
+    for (const [serviceName, svc] of services) {
+      if (mutedSet.has(`${stack}::${serviceName}`)) continue; // muted app — skip
+      result.scanned += 1;
+      // A service with `build:` is built from local source; there is no
+      // registry copy to compare against.
+      if (svc.build !== undefined) {
+        result.localBuilds += 1;
+        continue;
       }
+      const ref = parseImageRef(interpolateImage(svc.image!, composePath));
+      const usedBy = `${stack}/${serviceName}`;
+      if (!isSupportedRegistry(ref)) {
+        // Never a silent drop: an unsupported registry means this image is
+        // not being watched at all, which is strictly worse than an error.
+        const reg = ref.registry ?? "(none)";
+        result.skipped += 1;
+        (result.skippedByRegistry[reg] ??= []).push(ref.raw);
+        noteCheck(ref.raw, usedBy, `skipped: registry ${reg} has no client`);
+        continue;
+      }
+      try {
+        await scanService(stack, composePath, services, serviceName, ref);
+        result.checked += 1;
+        noteCheck(ref.raw, usedBy);
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (isLocalOnlyImage(ref, msg)) {
+          // A bare name Docker Hub has never heard of (`myapp:local`) is an
+          // image built on this host — not a failed check.
+          result.localBuilds += 1;
+          continue;
+        }
+        result.unchecked += 1;
+        result.errors[ref.raw] = msg;
+        noteCheck(ref.raw, usedBy, msg);
+      }
+    }
+  }
+
+  for (const [image, c] of checks) {
+    try {
+      recordImageCheck(deps.db, image, c.usedBy, c.error);
+    } catch {
+      // bookkeeping must never fail a scan
     }
   }
 
@@ -682,12 +914,12 @@ async function dispatchBumpNotification(
     text.push(`Digest:  sha256:${row.current_tag}… → sha256:${row.target_tag}…`);
     text.push(`Kind:    digest change (no semver classification — fallback)`);
   } else {
-    text.push(`From:    ${row.current_tag}`);
-    text.push(`To:      ${row.target_tag}`);
+    text.push(`From:    ${fromDisplay(row)}`);
+    text.push(`To:      ${toDisplay(row)}`);
     text.push(`Kind:    ${row.bump} bump`);
   }
-  if (row.bump !== "digest" && row.family?.startsWith("moving:")) {
-    const movingTag = row.family.slice("moving:".length);
+  const movingTag = floatingTagOf(row.family);
+  if (row.bump !== "digest" && movingTag) {
     text.push(`Origin:  digest change on :${movingTag}`);
   }
   if (others.length > 0) {
@@ -840,12 +1072,12 @@ function buildHoldHtml(opts: HoldHtmlOpts): string {
             .join("<br>")}</td></tr>`
     }
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Image</td>   <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.image)}</code></td></tr>
-    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.current_tag)}</code></td></tr>
-    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(row.target_tag)}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">From</td>    <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(fromDisplay(row))}</code></td></tr>
+    <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(toDisplay(row))}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Bump</td>    <td>${e(row.bump)}</td></tr>
     ${
-      row.bump !== "digest" && row.family?.startsWith("moving:")
-        ? `<tr><td style="padding:2px 14px 2px 0;color:#64748b;">Origin</td>  <td>digest change on <code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">:${e(row.family.slice("moving:".length))}</code></td></tr>`
+      row.bump !== "digest" && floatingTagOf(row.family)
+        ? `<tr><td style="padding:2px 14px 2px 0;color:#64748b;">Origin</td>  <td>digest change on <code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">:${e(floatingTagOf(row.family)!)}</code></td></tr>`
         : ""
     }
   </table>
@@ -921,72 +1153,51 @@ async function safeMovingDelta(
   }
 }
 
-/**
- * Given a digest from a moving tag (e.g. `:latest`), return the most-precise
- * semver-shaped tag in the registry that shares it. Used to classify
- * digest changes as a normal patch / minor / major bump.
- *
- * Strategy:
- *   - Take all semver-shaped candidate tags (skip the moving tag itself and
- *     any other moving channels — those have no `numeric` part).
- *   - Sort by descending precision (most-specific first), then alphabetically
- *     so within the same precision the higher-version name wins.
- *   - Fast path: if the registry returned digests inline (Docker Hub), match
- *     directly.
- *   - Slow path: probe candidate manifests one by one, capped at MAX_PROBES
- *     to avoid runaway requests on a registry without inline digests (GHCR).
- *
- * Returns undefined when nothing matches — callers fall back to the
- * Phase 1 digest-only behavior (always hold).
- */
-async function resolveDigestToTag(
+/** Version from an image's OCI labels at `digest`, when it reads like one. */
+async function ociLabelVersion(
   ref: ImageRef,
-  tags: RemoteTag[],
   digest: string,
-  movingTag: string,
-  fetchFn: typeof fetchManifestDigest,
 ): Promise<string | undefined> {
-  interface Candidate {
-    name: string;
-    precision: number;
-    digest?: string;
-  }
-  const candidates: Candidate[] = [];
-  for (const t of tags) {
-    if (t.name.toLowerCase() === movingTag.toLowerCase()) continue;
-    const parsed = parseTag(t.name);
-    if (!parsed.numeric) continue; // skip other moving / opaque tags
-    candidates.push({
-      name: t.name,
-      precision: parsed.numeric.length,
-      digest: t.digest,
-    });
-  }
-  candidates.sort((a, b) => {
-    if (a.precision !== b.precision) return b.precision - a.precision;
-    return b.name.localeCompare(a.name);
-  });
+  const oci = await fetchOciLabels(ref, digest);
+  const v = extractVersion(oci.labels);
+  return looksLikeVersion(v) ? v!.trim() : undefined;
+}
 
-  // Fast path: inline digests (Docker Hub).
-  for (const c of candidates) {
-    if (c.digest && c.digest === digest) return c.name;
-  }
-
-  // Slow path: probe manifests for tags without inline digests (GHCR).
-  const MAX_PROBES = 30;
-  let probed = 0;
-  for (const c of candidates) {
-    if (c.digest !== undefined) continue;
-    if (probed >= MAX_PROBES) break;
-    probed += 1;
+/**
+ * Full target ref for a tag bump on a `tag@sha256:…` pin: the new tag plus
+ * the digest it points at, so the pin stays a pin. Falls back to the bare
+ * new tag when the registry won't say (a stale digest must never survive a
+ * tag rewrite — Docker resolves the digest and would silently pull the old
+ * image).
+ */
+async function pinnedTargetRef(
+  ref: ImageRef,
+  newTag: string,
+  tags: RemoteTag[],
+  fetchFn: typeof fetchManifestDigest,
+): Promise<string> {
+  const head = ref.raw.slice(0, ref.raw.indexOf("@"));
+  const lastSlash = head.lastIndexOf("/");
+  const lastColon = head.lastIndexOf(":");
+  const base = lastColon > lastSlash ? head.slice(0, lastColon) : head;
+  let digest = tags.find((t) => t.name === newTag)?.digest;
+  if (!digest) {
     try {
-      const probed_digest = await fetchFn(ref, c.name);
-      if (probed_digest === digest) return c.name;
+      digest = await fetchFn(ref, newTag);
     } catch {
-      // ignore probe failure, keep trying others
+      digest = undefined;
     }
   }
-  return undefined;
+  return digest ? `${base}:${newTag}@${digest}` : `${base}:${newTag}`;
+}
+
+/**
+ * True when a failed lookup means "this image only exists on this host": a
+ * bare name (no registry, no namespace) that Docker Hub's official-image
+ * namespace does not have.
+ */
+export function isLocalOnlyImage(ref: ImageRef, error: string): boolean {
+  return !ref.registry && !ref.namespace && /Docker Hub: 404\b/.test(error);
 }
 
 export async function dispatchAppliedNotification(
@@ -1021,8 +1232,8 @@ export async function dispatchAppliedNotification(
   text.push(`From:    ${fromDisplay(row)}`);
   text.push(`To:      ${toDisplay(row)}`);
   text.push(`Kind:    ${row.bump} bump`);
-  if (row.bump !== "digest" && row.family?.startsWith("moving:")) {
-    text.push(`Origin:  digest change on :${row.family.slice("moving:".length)}`);
+  if (row.bump !== "digest" && floatingTagOf(row.family)) {
+    text.push(`Origin:  digest change on :${floatingTagOf(row.family)}`);
   }
   text.push(`Status:  ${row.status}`);
   if (row.apply_log) {
@@ -1151,8 +1362,8 @@ function buildAppliedHtml(opts: AppliedHtmlOpts): string {
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">To</td>      <td><code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">${e(toDisplay(row))}</code></td></tr>
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Bump</td>    <td>${e(row.bump)}</td></tr>
     ${
-      row.bump !== "digest" && row.family?.startsWith("moving:")
-        ? `<tr><td style="padding:2px 14px 2px 0;color:#64748b;">Origin</td>  <td>digest change on <code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">:${e(row.family.slice("moving:".length))}</code></td></tr>`
+      row.bump !== "digest" && floatingTagOf(row.family)
+        ? `<tr><td style="padding:2px 14px 2px 0;color:#64748b;">Origin</td>  <td>digest change on <code style="background:#f1f5f9;padding:1px 6px;border-radius:3px;">:${e(floatingTagOf(row.family)!)}</code></td></tr>`
         : ""
     }
     <tr><td style="padding:2px 14px 2px 0;color:#64748b;">Status</td>  <td>${e(row.status)}</td></tr>
@@ -1408,7 +1619,7 @@ export function reconcileOpenRows(
 ): { dismissed: number; requeued: number; stale: number } {
   const rows = db
     .prepare(
-      `SELECT id, stack, service, image, bump, current_tag, origin FROM updates
+      `SELECT id, stack, service, image, bump, current_tag, origin, family FROM updates
        WHERE status IN ('pending','notified')
          AND (superseded IS NULL OR superseded = 0)`,
     )
@@ -1421,6 +1632,7 @@ export function reconcileOpenRows(
     | "bump"
     | "current_tag"
     | "origin"
+    | "family"
   >[];
   let dismissed = 0;
   let requeued = 0;
@@ -1429,7 +1641,7 @@ export function reconcileOpenRows(
   // v0.6.4: one compose parse per stack, shared across that stack's rows.
   // `null` means "could not read it" — treated as no signal, never as drift.
   const composeCache = new Map<string, ReturnType<typeof loadComposeFile> | null>();
-  const livePinnedTag = (stack: string, service: string): string | null => {
+  const liveImage = (stack: string, service: string): string | null => {
     const path = composeFiles?.[stack];
     if (!path) return null;
     if (!composeCache.has(stack)) {
@@ -1441,7 +1653,11 @@ export function reconcileOpenRows(
     }
     const image = composeCache.get(stack)?.services?.[service]?.image;
     if (typeof image !== "string") return null;
-    return parseImageRef(image).tag ?? null;
+    return interpolateImage(image, path).trim();
+  };
+  const livePinnedTag = (stack: string, service: string): string | null => {
+    const image = liveImage(stack, service);
+    return image === null ? null : (parseImageRef(image).tag ?? null);
   };
 
   for (const r of rows) {
@@ -1459,8 +1675,26 @@ export function reconcileOpenRows(
     //
     // A missing service (renamed/removed) is NOT treated as drift — the tag
     // lookup returns null and the row is left for policy to decide.
-    const livePin = livePinnedTag(r.stack, r.service);
-    if (livePin !== null && r.current_tag !== null && livePin !== r.current_tag) {
+    // A row tracking a floating tag by digest carries VERSIONS (or digest
+    // prefixes) in current_tag, never the tag the compose file holds — so
+    // compare the tag it tracks instead, and for a `tag@digest` pin the whole
+    // ref (the pin moving is exactly what an out-of-band upgrade looks like).
+    // Comparing current_tag here used to retire every such row on the next
+    // pass, because `1.7.1` is never equal to `latest`.
+    const floatTag = floatingTagOf(r.family);
+    let drifted: boolean;
+    if (floatTag !== undefined) {
+      const live = liveImage(r.stack, r.service);
+      drifted =
+        live !== null &&
+        (r.family!.startsWith("pinned:")
+          ? live !== r.image.trim()
+          : parseImageRef(live).tag !== floatTag);
+    } else {
+      const livePin = livePinnedTag(r.stack, r.service);
+      drifted = livePin !== null && r.current_tag !== null && livePin !== r.current_tag;
+    }
+    if (drifted) {
       dismissRow(db, r.id, "out-of-band");
       stale += 1;
       continue;

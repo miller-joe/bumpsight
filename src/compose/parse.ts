@@ -1,5 +1,5 @@
 import { parse as parseYaml } from "yaml";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 export interface ComposeFile {
   version?: string;
@@ -118,4 +118,59 @@ export function parseImageRef(ref: string): ImageRef {
     tag,
     digest,
   };
+}
+
+/**
+ * Resolve compose variable references in an image string —
+ * `${VAR}`, `${VAR:-default}`, `${VAR-default}` and `$VAR` — against the
+ * stack's `.env` file (next to the compose file), falling back to the
+ * default. A reference with neither is left as-is.
+ *
+ * Without this, `image: ghcr.io/org/app:${APP_VERSION:-release}` parsed as
+ * tag `${APP_VERSION:-release}`, which no registry has, so the image was
+ * never checked.
+ */
+export function interpolateImage(image: string, composePath?: string): string {
+  if (!image.includes("$")) return image;
+  const env = composePath ? readDotEnv(composePath) : {};
+  return image.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?-)([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (whole, braced: string | undefined, op: string | undefined, def: string | undefined, bare: string | undefined) => {
+      const name = braced ?? bare!;
+      const v = env[name];
+      if (op === ":-") return v ? v : (def ?? "");
+      if (op === "-") return v !== undefined ? v : (def ?? "");
+      return v !== undefined ? v : whole;
+    },
+  );
+}
+
+const dotEnvCache = new Map<string, { mtimeMs: number; vars: Record<string, string> }>();
+
+function readDotEnv(composePath: string): Record<string, string> {
+  const file = `${composePath.replace(/\/[^/]*$/, "")}/.env`;
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(file).mtimeMs;
+  } catch {
+    return {};
+  }
+  const cached = dotEnvCache.get(file);
+  if (cached && cached.mtimeMs === mtimeMs) return cached.vars;
+  const vars: Record<string, string> = {};
+  try {
+    for (const line of readFileSync(file, "utf-8").split(/\r?\n/)) {
+      const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (!m) continue;
+      let v = m[2]!.trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+        v = v.slice(1, -1);
+      }
+      vars[m[1]!] = v;
+    }
+  } catch {
+    return {};
+  }
+  dotEnvCache.set(file, { mtimeMs, vars });
+  return vars;
 }

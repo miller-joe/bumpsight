@@ -974,10 +974,12 @@ describe("runScanOnce — unsupported-registry accounting", () => {
       notifiers: [],
       rules: { default: { app: "none", dependencies: "none" }, stacks: {} },
       composeFiles: { [stack]: file },
-      listTagsFn: (async () => [{ name: "1.27" }]) as never,
+      listTagsFn: (async () => [{ name: "1.27", digest: "sha256:same" }]) as never,
+      localDigestFn: async () => "sha256:same",
     });
 
     expect(result.skipped).toBe(0);
+    expect(result.checked).toBe(1);
     expect(result.skippedByRegistry).toEqual({});
     rmSync(file, { force: true });
   });
