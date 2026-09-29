@@ -142,6 +142,7 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 | `BUMPSIGHT_LLM_TIMEOUT_MS` | `180000` | Per-call LLM request timeout (ms). Default 180s since v0.4.2. Routers like LiteLLM walk fallback chains server-side and can exceed shorter timeouts; bump higher for slow local Ollama on CPU, lower for stricter SLAs. |
 | `OLLAMA_HOST` | (none) | Legacy Ollama base URL. Used as `<host>/v1` when `BUMPSIGHT_LLM_URL` is unset. |
 | `GITHUB_TOKEN` | (none) | Optional. Lifts the GitHub-anonymous rate limit when fetching upstream release notes. |
+| `BUMPSIGHT_DOCKERHUB_USER` / `BUMPSIGHT_DOCKERHUB_TOKEN` | (none) | Optional Docker Hub username + personal access token (read-only scope is enough). Authenticates tag listing and registry token requests, lifting the anonymous rate limit. `BUMPSIGHT_DOCKERHUB_USER_FILE` / `BUMPSIGHT_DOCKERHUB_TOKEN_FILE` read either value from a file instead. Rate-limited requests are retried with back-off either way. |
 | `BUMPSIGHT_DIGEST_HOUR` | `18` | Hour-of-day (0–23, local TZ) the daily-digest email fires. Set to a negative value (`-1`) to disable. Empty days produce no email. |
 | `BUMPSIGHT_OUTBOX_DIR` | `/var/lib/bumpsight/outbox` | Where every dispatched notification is archived as JSON (per-event + daily-digest). |
 | `BUMPSIGHT_OUTBOX_KEEP` | `200` | Most recent N outbox files retained; older ones unlinked on every write. |
@@ -305,7 +306,9 @@ summary: 1 error, 2 warn, 1 info
 
 ### `bumpsight scan <compose-file>`
 
-For each image, checks Docker Hub or `ghcr.io` for the highest tag in the same family.
+For each image, checks its registry for the highest tag in the same family. Docker Hub and `ghcr.io` have dedicated clients; any other registry that speaks the OCI Distribution API (quay.io, mcr.microsoft.com, a self-hosted Gitea or Forgejo registry, …) is read through a generic client using anonymous pull tokens.
+
+The daemon also follows **floating tags** — partial versions like `4.39` or `6-alpine`, channels like `latest` or `release`, and any `tag@sha256:…` pin — by digest: when the registry's digest for the tag differs from the one you run, both digests are decoded to versions (from a version tag sharing the digest, or the image's `org.opencontainers.image.version` label) and the change is classified like any other bump. Unclassifiable changes are held as `unknown`. Approving a pinned ref rewrites its digest; a bare floating tag is pulled and recreated.
 
 ```
 $ bumpsight scan compose.yaml
@@ -379,7 +382,6 @@ Planned:
 - Apply-time bundling of paired dep changes — let Approve on a major bundle the dep pin rewrites alongside the app rewrite, atomically
 - Rule ignore-file for `doctor`
 - Podman and `nerdctl` socket support
-- `quay.io` registry
 - Multi-hop family walks (e.g. `4.0.14` → through `4.0.x` → `4.1.x` breakage map)
 
 ## License

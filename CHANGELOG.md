@@ -2,6 +2,48 @@
 
 All notable changes to bumpsight are documented here.
 
+## Unreleased
+
+### Added
+
+- **Generic OCI registry client.** Registries without a dedicated client used
+  to be skipped outright (`scan-skip: registry … has no client`). Any registry
+  speaking the OCI Distribution API is now checked: `/v2/` probe, Bearer
+  challenge to an anonymous pull token, paginated `tags/list`, manifest `HEAD`
+  for digests. OCI label lookups work for every registry too.
+- **Floating-tag digest checks.** Tags that keep their name while the image
+  moves (`4.39`, `2`, `6-alpine`, `release`, `main-stable`, and any
+  `tag@sha256:…` pin) are compared by digest against what runs — the pinned
+  digest, else the local image's RepoDigest, else the last digest seen. A
+  moved digest is decoded to versions and classified; unclassifiable moves are
+  `unknown` and held. Pinned rows apply by rewriting the digest; bare floating
+  tags by pull + recreate.
+- **Optional Docker Hub credentials** (`BUMPSIGHT_DOCKERHUB_USER` /
+  `BUMPSIGHT_DOCKERHUB_TOKEN`, or `_FILE` variants).
+- **"Not checked" section in the daily digest.** Every image's last
+  successful check is recorded; images still deployed but not checked for
+  3+ days (or skipped outright) are listed with their last error.
+
+### Fixed
+
+- Docker Hub 429s silently dropped images from a scan. Rate-limited calls are
+  retried with back-off, then fall back to the registry's own tag list.
+- The scan summary said `0 new` whether or not images failed to check. It now
+  reports checked, NOT checked, skipped and local-build counts.
+- GHCR tag listing stopped at one page, cutting off the newest releases of
+  long-lived repos.
+- Resolving a moving tag's digest to a version probed tags in name order, so
+  `v1.9.0` came before `v1.11.2`; the probe budget ran out and `:latest`
+  resolved to the bare `v1`. An equal resolved pair (`v1 -> v1`) was then
+  classified as a patch and "applied" as a no-op.
+- A tag bump on a `tag@digest` ref kept the old digest, so the new tag never
+  took effect.
+- Reconcile retired open moving-tag rows on the next pass, because it
+  compared a version against the compose file's `latest`.
+- `${VAR:-default}` in an `image:` line is resolved against the stack's `.env`.
+- Services with `build:`, and bare names Docker Hub does not know, count as
+  local builds instead of errors.
+
 ## 0.6.4 — 2026-08-19
 
 The theme: bumpsight trusted its own stored record of the world instead of
