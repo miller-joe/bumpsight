@@ -221,11 +221,28 @@ describe("fetchOciLabels", () => {
     expect(result.labels).toEqual({});
   });
 
-  it("returns empty labels when registry is unsupported", async () => {
+  it("reads labels from a registry without a dedicated client", async () => {
     const ref = parseImageRef("quay.io/owner/app:v1");
+    fetchMock
+      // /v2/ probe: open registry, no token needed
+      .mockResolvedValueOnce(new Response("", { status: 200 }))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          { config: { digest: "sha256:cfg" } },
+          "application/vnd.oci.image.manifest.v1+json",
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          { config: { Labels: { "org.opencontainers.image.version": "1.2.3" } } },
+          "application/vnd.oci.image.config.v1+json",
+        ),
+      );
     const result = await fetchOciLabels(ref, "sha256:abc");
-    expect(result.labels).toEqual({});
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.labels["org.opencontainers.image.version"]).toBe("1.2.3");
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
+      "https://quay.io/v2/owner/app/manifests/sha256%3Aabc",
+    );
   });
 
   it("returns empty labels when digest is empty", async () => {

@@ -942,25 +942,26 @@ describe("v0.6.0 policy overrides + GUI-first notify", () => {
 });
 
 describe("runScanOnce — unsupported-registry accounting", () => {
-  it("counts and reports a skipped registry instead of dropping it silently", async () => {
+  it("scans a registry without a dedicated client instead of skipping it", async () => {
     const { stack, file } = makeStack("exporter", "quay.io/prometheus/node-exporter:v1.8.1");
     const db = openDb({ path: ":memory:" });
+    const seen: string[] = [];
 
     const result = await runScanOnce({
       db,
       notifiers: [],
-      rules: { default: { app: "minor", dependencies: "none" }, stacks: {} },
+      rules: { default: { app: "notify", dependencies: "none" }, stacks: {} },
       composeFiles: { [stack]: file },
-      listTagsFn: (async () => {
-        throw new Error("must not be called for an unsupported registry");
+      listTagsFn: (async (ref: { raw: string }) => {
+        seen.push(ref.raw);
+        return [{ name: "v1.8.1" }, { name: "v1.9.0" }];
       }) as never,
     });
 
-    expect(result.skipped).toBe(1);
-    expect(result.skippedByRegistry["quay.io"]).toEqual([
-      "quay.io/prometheus/node-exporter:v1.8.1",
-    ]);
-    expect(result.discovered).toBe(0);
+    expect(result.skipped).toBe(0);
+    expect(result.skippedByRegistry).toEqual({});
+    expect(seen).toEqual(["quay.io/prometheus/node-exporter:v1.8.1"]);
+    expect(result.discovered).toBe(1);
     rmSync(file, { force: true });
   });
 

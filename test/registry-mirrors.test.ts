@@ -71,8 +71,9 @@ describe("isSupportedRegistry", () => {
     expect(isSupportedRegistry(parseImageRef("ghcr.io/immich-app/server:release"))).toBe(true);
   });
 
-  it("still rejects registries with no client", () => {
-    expect(isSupportedRegistry(parseImageRef("quay.io/prometheus/node-exporter:v1"))).toBe(false);
+  it("covers registries without a dedicated client via the generic v2 client", () => {
+    expect(isSupportedRegistry(parseImageRef("quay.io/prometheus/node-exporter:v1"))).toBe(true);
+    expect(isSupportedRegistry(parseImageRef("mcr.microsoft.com/playwright/mcp:latest"))).toBe(true);
   });
 });
 
@@ -97,9 +98,19 @@ describe("listTags for a mirrored registry", () => {
     expect(url).not.toContain("lscr.io");
   });
 
-  it("throws for a registry that genuinely has no client", async () => {
-    await expect(
-      listTags(parseImageRef("quay.io/prometheus/node-exporter:v1")),
-    ).rejects.toThrow(/registry not supported yet: quay\.io/);
+  it("lists a registry without a dedicated client over the v2 API", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "https://quay.io/v2/") return new Response("", { status: 200 });
+      return new Response(JSON.stringify({ tags: ["v1.8.0", "v1.8.1"] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const tags = await listTags(parseImageRef("quay.io/prometheus/node-exporter:v1.8.0"));
+    expect(tags.map((t) => t.name)).toEqual(["v1.8.0", "v1.8.1"]);
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
+      "https://quay.io/v2/prometheus/node-exporter/tags/list?n=1000",
+    );
   });
 });

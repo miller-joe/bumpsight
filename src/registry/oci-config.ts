@@ -20,7 +20,7 @@
  */
 
 import type { ImageRef } from "../compose/parse.js";
-import { isDockerHubRegistry } from "./mirrors.js";
+import { RegistrySession, registryTarget } from "./v2.js";
 
 const MANIFEST_ACCEPT = [
   "application/vnd.docker.distribution.manifest.v2+json",
@@ -81,9 +81,9 @@ interface ImageConfigBlob {
 }
 
 /**
- * Resolve OCI labels for `image` at `digest`. Supports docker.io (including
- * its mirrors, see `mirrors.ts`) and ghcr.io. Anything else returns
- * `{ labels: {} }`.
+ * Resolve OCI labels for `image` at `digest`. Works for any registry — Docker
+ * Hub (including its mirrors, see `mirrors.ts`), GHCR, and anything else via
+ * the generic v2 client. Never throws; failures return `{ labels: {} }`.
  */
 export async function fetchOciLabels(
   ref: ImageRef,
@@ -91,118 +91,61 @@ export async function fetchOciLabels(
   opts: FetchOciLabelsOptions = {},
 ): Promise<OciImageLabels> {
   if (!digest) return { labels: {} };
-  const auth = await acquireToken(ref, opts.signal);
-  if (!auth) return { labels: {} };
-  return fetchLabelsWithToken(ref, digest, auth.token, auth.host, opts.signal);
-}
-
-interface RegistryAuth {
-  token: string;
-  host: string;
-}
-
-async function acquireToken(
-  ref: ImageRef,
-  signal?: AbortSignal,
-): Promise<RegistryAuth | null> {
-  const reg = ref.registry;
-  if (isDockerHubRegistry(reg)) {
-    const namespace = ref.namespace ?? "library";
-    const repoPath = `${namespace}/${ref.name}`;
-    const tokenUrl = `https://auth.docker.io/token?service=registry.docker.io&scope=repository:${encodeURIComponent(repoPath)}:pull`;
-    const token = await fetchToken(tokenUrl, signal);
-    if (!token) return null;
-    return { token, host: "registry-1.docker.io" };
-  }
-  if (reg === "ghcr.io") {
-    const repoPath = ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name;
-    const tokenUrl = `https://ghcr.io/token?scope=repository:${encodeURIComponent(repoPath)}:pull&service=ghcr.io`;
-    const token = await fetchToken(tokenUrl, signal);
-    if (!token) return null;
-    return { token, host: "ghcr.io" };
-  }
-  return null;
-}
-
-async function fetchToken(
-  url: string,
-  signal?: AbortSignal,
-): Promise<string | null> {
+  const session = new RegistrySession(registryTarget(ref), opts.signal);
   try {
-    const res = await fetch(url, { signal });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { token?: string; access_token?: string };
-    return body.token ?? body.access_token ?? null;
+    if (!(await session.authenticate())) return { labels: {} };
   } catch {
-    return null;
+    return { labels: {} };
   }
+  return fetchLabelsWithSession(session, digest);
 }
 
-async function fetchLabelsWithToken(
-  ref: ImageRef,
+async function fetchLabelsWithSession(
+  session: RegistrySession,
   digest: string,
-  token: string,
-  host: string,
-  signal?: AbortSignal,
 ): Promise<OciImageLabels> {
-  const repoPath = repoPathFor(ref);
-  const manifestUrl = `https://${host}/v2/${repoPath}/manifests/${encodeURIComponent(digest)}`;
   const manifestRes = await fetchJson<SingleManifest | ManifestIndex>(
-    manifestUrl,
-    token,
+    session,
+    `manifests/${encodeURIComponent(digest)}`,
     MANIFEST_ACCEPT,
-    signal,
   );
   if (!manifestRes) return { labels: {} };
   const { body, mediaType } = manifestRes;
 
+  const isIndex =
+    (mediaType && INDEX_MEDIA_TYPES.has(mediaType)) ||
+    // Some registries omit Content-Type; sniff by shape.
+    (!mediaType || !SINGLE_MANIFEST_MEDIA_TYPES.has(mediaType)
+      ? Array.isArray((body as ManifestIndex).manifests)
+      : false);
+
   let singleManifest: SingleManifest | null = null;
-  if (mediaType && INDEX_MEDIA_TYPES.has(mediaType)) {
-    const index = body as ManifestIndex;
-    const archDigest = pickArchDigest(index);
+  if (isIndex) {
+    const archDigest = pickArchDigest(body as ManifestIndex);
     if (!archDigest) return { labels: {} };
-    const archUrl = `https://${host}/v2/${repoPath}/manifests/${encodeURIComponent(archDigest)}`;
     const archRes = await fetchJson<SingleManifest>(
-      archUrl,
-      token,
+      session,
+      `manifests/${encodeURIComponent(archDigest)}`,
       MANIFEST_ACCEPT,
-      signal,
     );
     if (!archRes) return { labels: {} };
     singleManifest = archRes.body;
-  } else if (mediaType && SINGLE_MANIFEST_MEDIA_TYPES.has(mediaType)) {
+  } else if (
+    (mediaType && SINGLE_MANIFEST_MEDIA_TYPES.has(mediaType)) ||
+    (body as SingleManifest).config?.digest
+  ) {
     singleManifest = body as SingleManifest;
   } else {
-    // Some registries omit Content-Type; sniff by shape.
-    if ((body as ManifestIndex).manifests) {
-      const index = body as ManifestIndex;
-      const archDigest = pickArchDigest(index);
-      if (!archDigest) return { labels: {} };
-      const archUrl = `https://${host}/v2/${repoPath}/manifests/${encodeURIComponent(archDigest)}`;
-      const archRes = await fetchJson<SingleManifest>(
-        archUrl,
-        token,
-        MANIFEST_ACCEPT,
-        signal,
-      );
-      if (!archRes) return { labels: {} };
-      singleManifest = archRes.body;
-    } else if ((body as SingleManifest).config?.digest) {
-      singleManifest = body as SingleManifest;
-    } else {
-      return { labels: {} };
-    }
+    return { labels: {} };
   }
 
   const configDigest = singleManifest?.config?.digest;
   if (!configDigest) return { labels: {} };
 
-  const blobUrl = `https://${host}/v2/${repoPath}/blobs/${encodeURIComponent(configDigest)}`;
   const blobRes = await fetchJson<ImageConfigBlob>(
-    blobUrl,
-    token,
+    session,
+    `blobs/${encodeURIComponent(configDigest)}`,
     BLOB_ACCEPT,
-    signal,
   );
   if (!blobRes) return { labels: {} };
   const labels = blobRes.body.config?.Labels ?? blobRes.body.Labels ?? null;
@@ -213,15 +156,6 @@ async function fetchLabelsWithToken(
     (typeof blobRes.body.created === "string" ? blobRes.body.created : undefined);
   if (!labels || typeof labels !== "object") return { labels: {}, created };
   return { labels, created };
-}
-
-function repoPathFor(ref: ImageRef): string {
-  const reg = ref.registry;
-  if (!reg || reg === "docker.io" || reg === "index.docker.io") {
-    const namespace = ref.namespace ?? "library";
-    return `${namespace}/${ref.name}`;
-  }
-  return ref.namespace ? `${ref.namespace}/${ref.name}` : ref.name;
 }
 
 interface ManifestIndexEntry {
@@ -253,16 +187,12 @@ function isAttestation(m: ManifestIndexEntry): boolean {
 }
 
 async function fetchJson<T>(
-  url: string,
-  token: string,
+  session: RegistrySession,
+  path: string,
   accept: string,
-  signal?: AbortSignal,
 ): Promise<{ body: T; mediaType: string | null } | null> {
   try {
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}`, Accept: accept },
-      signal,
-    });
+    const res = await session.fetch(path, { accept });
     if (!res.ok) return null;
     const mediaType = (res.headers.get("content-type") ?? "")
       .split(";")[0]!
