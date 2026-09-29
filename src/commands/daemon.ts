@@ -203,6 +203,13 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
   );
   // v0.6.0: optional shared secret gating the dashboard + POST action routes.
   const uiToken = process.env.BUMPSIGHT_UI_TOKEN ?? fileShape.ui_token ?? undefined;
+  // Opt-in: an update to a service that is not running is re-pinned and
+  // pulled, but the service is left stopped. Off by default.
+  const leaveStoppedEnv = process.env.BUMPSIGHT_LEAVE_STOPPED;
+  const leaveStopped =
+    leaveStoppedEnv !== undefined
+      ? /^(true|1|yes|on)$/i.test(leaveStoppedEnv.trim())
+      : fileShape.leave_stopped === true;
 
   const cfg: DaemonConfig = {
     dbPath,
@@ -228,6 +235,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     depDriftIntervalMs,
     notifyMode,
     uiToken,
+    leaveStopped,
   };
 
   const db = openDb({ path: cfg.dbPath });
@@ -259,6 +267,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       `digest=${cfg.digestHour < 0 ? "off" : `${String(cfg.digestHour).padStart(2, "0")}:00 local`}, ` +
       `prune=${cfg.pruneIntervalMs > 0 ? `every ${pruneScheduleRaw}` : "off"}, ` +
       `bundle_paired_deps=${describeBundling(cfg.applyPairedDeps)}, ` +
+      `leave_stopped=${cfg.leaveStopped ? "on" : "off"}, ` +
       `watched_releases=${cfg.watchedReleases.length > 0 ? `${cfg.watchedReleases.length} repo(s) every ${watchIntervalRaw}` : "off"}, ` +
       `notify_mode=${cfg.notifyMode}, ui_auth=${cfg.uiToken ? "on" : "off"}, ` +
       `dockerhub_auth=${dockerHubCredentials() ? "on" : "off (anonymous)"}`,
@@ -283,6 +292,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       outboxDir: cfg.outboxDir,
       outboxKeepCount: cfg.outboxKeepCount,
       applyPairedDeps: cfg.applyPairedDeps,
+      leaveStopped: cfg.leaveStopped,
     });
     for (const line of formatScanReport(result)) log(line);
     if (cfg.watchedReleases.length > 0) {
@@ -324,6 +334,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     outboxDir: cfg.outboxDir,
     outboxKeepCount: cfg.outboxKeepCount,
     applyPairedDeps: cfg.applyPairedDeps,
+    leaveStopped: cfg.leaveStopped,
     rules: cfg.rules,
     publicUrl: cfg.publicUrl,
     uiToken: cfg.uiToken,
@@ -342,6 +353,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
     outboxKeepCount: cfg.outboxKeepCount,
     log,
     applyPairedDeps: cfg.applyPairedDeps,
+    leaveStopped: cfg.leaveStopped,
   });
 
   // v0.6.0: the daily digest is the one email channel that survives the

@@ -52,12 +52,22 @@ export interface ApplyOptions {
   timeoutMs?: number;
   /** Test indirection. Defaults to the real spawn-based runner. */
   runner?: CommandRunner;
+  /** When true, a service that is not currently running is pulled but not
+   *  started: after the pull, `ps --status running -q` decides whether `up`
+   *  runs. Protects deliberately stopped services (and inactive compose
+   *  profiles) from being brought up by an update. If the `ps` check itself
+   *  fails, `up` runs as usual. Default false. */
+  leaveStopped?: boolean;
 }
 
 export interface ApplyResult {
   ok: boolean;
   pull: DockerCommandResult;
+  /** Only set when `leaveStopped` is on. */
+  ps?: DockerCommandResult;
   up?: DockerCommandResult;
+  /** True when `leaveStopped` skipped `up` because nothing was running. */
+  leftStopped?: boolean;
   log: string;
 }
 
@@ -92,16 +102,51 @@ export async function pullAndUp(opts: ApplyOptions): Promise<ApplyResult> {
     };
   }
 
+  let ps: DockerCommandResult | undefined;
+  if (opts.leaveStopped) {
+    ps = await runner(
+      "docker",
+      [
+        "compose",
+        "-f",
+        opts.composePath,
+        "ps",
+        "--status",
+        "running",
+        "-q",
+        ...services,
+      ],
+      { timeoutMs },
+    );
+    if (ps.exitCode === 0 && ps.combinedOutput.trim() === "") {
+      return {
+        ok: true,
+        pull,
+        ps,
+        leftStopped: true,
+        log:
+          formatStep("pull", pull) +
+          `\n==== up: skipped — ${services.join(", ")} not running; ` +
+          `image pulled and re-pinned, service left stopped ====`,
+      };
+    }
+  }
+
   const up = await runner(
     "docker",
     ["compose", "-f", opts.composePath, "up", "-d", ...services],
     { timeoutMs },
   );
+  const psLog =
+    ps && ps.exitCode !== 0
+      ? "\n" + formatStep("ps", ps) + "\n==== ps failed; running up anyway ===="
+      : "";
   return {
     ok: up.exitCode === 0,
     pull,
+    ps,
     up,
-    log: formatStep("pull", pull) + "\n" + formatStep("up", up),
+    log: formatStep("pull", pull) + psLog + "\n" + formatStep("up", up),
   };
 }
 

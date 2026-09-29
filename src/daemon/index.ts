@@ -143,6 +143,8 @@ export interface ScanRunDeps {
   /** v0.4.2: forwarded to applyOne. When false, skip the post-apply
    *  targeted prune. Default true. Tests usually pass false. */
   pruneAfterApply?: boolean;
+  /** Forwarded to applyOne: pull but don't start services that aren't running. */
+  leaveStopped?: boolean;
   /** v0.5.4: per-stack opt-in for apply-time paired-dep bundling. Off when
    *  missing. Forwarded to applyOne after the stack lookup. */
   applyPairedDeps?: ApplyPairedDepsConfig;
@@ -415,6 +417,7 @@ export async function runScanOnce(
             composeFiles: deps.composeFiles,
             runner: deps.runner,
             pruneAfterApply: deps.pruneAfterApply,
+            leaveStopped: deps.leaveStopped,
             bundlePairedDeps:
               deps.applyPairedDeps !== undefined &&
               isPairedDepBundlingEnabled(deps.applyPairedDeps, stack),
@@ -518,6 +521,7 @@ export async function runScanOnce(
           composeFiles: deps.composeFiles,
           runner: deps.runner,
           pruneAfterApply: deps.pruneAfterApply,
+          leaveStopped: deps.leaveStopped,
           bundlePairedDeps:
             deps.applyPairedDeps !== undefined &&
             isPairedDepBundlingEnabled(deps.applyPairedDeps, stack),
@@ -648,6 +652,7 @@ export async function runScanOnce(
           composeFiles: deps.composeFiles,
           runner: deps.runner,
           pruneAfterApply: deps.pruneAfterApply,
+          leaveStopped: deps.leaveStopped,
           bundlePairedDeps:
             deps.applyPairedDeps !== undefined &&
             isPairedDepBundlingEnabled(deps.applyPairedDeps, stack),
@@ -1403,6 +1408,8 @@ export interface StartDaemonDeps {
   adviseFn?: typeof getAdviseSummary;
   /** v0.5.4: per-stack opt-in for paired-dep bundling. Forwarded to scans. */
   applyPairedDeps?: ApplyPairedDepsConfig;
+  /** Forwarded to scans: pull but don't start services that aren't running. */
+  leaveStopped?: boolean;
   /** v0.5.5: test seam — override digest-class enrichment. */
   enrichDigestFn?: typeof enrichDigestBump;
 }
@@ -1466,6 +1473,7 @@ export function startDaemon(
           runner: deps.runner,
           adviseFn: deps.adviseFn,
           applyPairedDeps: deps.applyPairedDeps,
+          leaveStopped: deps.leaveStopped,
           enrichDigestFn: deps.enrichDigestFn,
         });
         for (const line of formatScanReport(result, Date.now() - started)) deps.log(line);

@@ -76,6 +76,9 @@ export interface DaemonConfig {
    *  Unset (default) leaves the server open, matching the pre-v0.6.0 LAN-only
    *  posture. The email approve/deny GET links are never gated by this. */
   uiToken?: string;
+  /** Apply-time: a service that is not running is re-pinned and pulled but
+   *  not started. Off by default. BUMPSIGHT_LEAVE_STOPPED / leave_stopped. */
+  leaveStopped: boolean;
 }
 
 /** v0.6.0: email verbosity. See DaemonConfig.notifyMode. */
@@ -168,6 +171,8 @@ export interface FileConfigShape {
   notify_mode?: string;
   /** v0.6.0: optional shared secret gating the dashboard + POST actions. */
   ui_token?: string;
+  /** Pull but don't start services that aren't running. Default false. */
+  leave_stopped?: boolean;
 }
 
 export interface WatchedReleaseFileShape {

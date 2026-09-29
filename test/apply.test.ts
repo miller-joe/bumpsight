@@ -157,6 +157,101 @@ describe("pullAndUp", () => {
   });
 });
 
+describe("pullAndUp leaveStopped", () => {
+  function scripted(psResult: { exitCode: number; combinedOutput: string }) {
+    const calls: string[][] = [];
+    const runner: CommandRunner = async (_command, args) => {
+      calls.push(args);
+      if (args.includes("ps")) return psResult;
+      return { exitCode: 0, combinedOutput: "" };
+    };
+    return { calls, runner };
+  }
+
+  it("does not run ps when leaveStopped is off", async () => {
+    const { calls, runner } = scripted({ exitCode: 0, combinedOutput: "" });
+    const r = await pullAndUp({ composePath: "/x.yaml", serviceName: "app", runner });
+    expect(r.ok).toBe(true);
+    expect(calls.map((a) => a[3])).toEqual(["pull", "up"]);
+  });
+
+  it("skips up when no service container is running", async () => {
+    const { calls, runner } = scripted({ exitCode: 0, combinedOutput: "\n" });
+    const r = await pullAndUp({
+      composePath: "/x.yaml",
+      serviceName: ["app", "db"],
+      runner,
+      leaveStopped: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.leftStopped).toBe(true);
+    expect(r.up).toBeUndefined();
+    expect(calls.map((a) => a[3])).toEqual(["pull", "ps"]);
+    expect(calls[1]).toEqual([
+      "compose", "-f", "/x.yaml", "ps", "--status", "running", "-q", "app", "db",
+    ]);
+    expect(r.log).toContain("not running");
+    expect(r.log).toContain("left stopped");
+  });
+
+  it("runs up when a service container is running", async () => {
+    const { calls, runner } = scripted({ exitCode: 0, combinedOutput: "abc123\n" });
+    const r = await pullAndUp({
+      composePath: "/x.yaml",
+      serviceName: "app",
+      runner,
+      leaveStopped: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.leftStopped).toBeUndefined();
+    expect(calls.map((a) => a[3])).toEqual(["pull", "ps", "up"]);
+  });
+
+  it("falls back to up when ps fails", async () => {
+    const { calls, runner } = scripted({ exitCode: 1, combinedOutput: "boom" });
+    const r = await pullAndUp({
+      composePath: "/x.yaml",
+      serviceName: "app",
+      runner,
+      leaveStopped: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.up?.exitCode).toBe(0);
+    expect(calls.map((a) => a[3])).toEqual(["pull", "ps", "up"]);
+    expect(r.log).toContain("ps failed");
+  });
+
+  it("applyOne forwards leaveStopped and still re-pins the compose file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bumpsight-apply-"));
+    const file = join(dir, "compose.yaml");
+    writeFileSync(file, `services:\n  app:\n    image: nginx:1.27\n`, "utf-8");
+    const db = openDb({ path: ":memory:" });
+    const id = recordUpdate(db, {
+      stack: "appstack",
+      service: "app",
+      image: "nginx:1.27",
+      currentTag: "1.27",
+      targetTag: "1.28",
+      bump: "minor",
+    });
+    const { calls, runner } = scripted({ exitCode: 0, combinedOutput: "" });
+    const after = await applyOne(
+      {
+        db,
+        composeFiles: { appstack: file },
+        runner,
+        pruneAfterApply: false,
+        leaveStopped: true,
+      },
+      id,
+    );
+    expect(after.status).toBe("applied");
+    expect(readFileSync(file, "utf-8")).toContain("nginx:1.28");
+    expect(calls.some((a) => a.includes("up"))).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe("applyOne", () => {
   it("rewrites file, runs docker, marks applied", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bumpsight-apply-"));

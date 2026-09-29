@@ -20,6 +20,10 @@ export interface ApplyDeps {
   runner?: CommandRunner;
   /** v0.4.2: when false, skip the post-apply targeted prune. Default true. */
   pruneAfterApply?: boolean;
+  /** When true, a service that is not running when the update is applied is
+   *  re-pinned and pulled but not started. Falls back to the
+   *  BUMPSIGHT_LEAVE_STOPPED env flag. Default false. */
+  leaveStopped?: boolean;
   /** v0.5.4: when true for this row's stack, atomically rewrite paired dep
    *  pins alongside the primary pin using the recommendations captured at
    *  hold time. Default false. */
@@ -154,6 +158,10 @@ export async function applyOne(
     composePath,
     serviceName: services,
     runner: deps.runner,
+    leaveStopped:
+      deps.leaveStopped ??
+      (process.env.BUMPSIGHT_LEAVE_STOPPED === "true" ||
+        process.env.BUMPSIGHT_LEAVE_STOPPED === "1"),
   });
 
   // On ANY docker failure, roll the compose back to its pre-apply state. A

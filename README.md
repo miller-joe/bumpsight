@@ -147,6 +147,7 @@ Three sources, in precedence order: CLI flags > environment variables > `/config
 | `BUMPSIGHT_OUTBOX_DIR` | `/var/lib/bumpsight/outbox` | Where every dispatched notification is archived as JSON (per-event + daily-digest). |
 | `BUMPSIGHT_OUTBOX_KEEP` | `200` | Most recent N outbox files retained; older ones unlinked on every write. |
 | `BUMPSIGHT_PRUNE_SCHEDULE` | (unset) | Opt-in deep prune interval — `24h`, `7d`, etc. When set, bumpsight runs `docker image prune --filter until=168h -af`, `docker volume prune -f`, and `docker builder prune -af` on that interval and logs total reclaimed bytes. Off by default. |
+| `BUMPSIGHT_LEAVE_STOPPED` | `false` | Opt-in. When an update is applied to a service that is not running (deliberately stopped, or in an inactive compose profile), bumpsight still rewrites the tag and pulls the image but does not start the service. If the running-state check fails, it starts the service as before. Also `leave_stopped: true` in the config file. |
 | `BUMPSIGHT_WATCH_INTERVAL` | (scan interval) | Poll cadence for `watched_releases` — `6h`, `1d`, etc. Only used when `watched_releases` is configured. Defaults to `BUMPSIGHT_INTERVAL`. |
 
 ### `/config/bumpsight.yaml`

@@ -56,6 +56,8 @@ export interface HttpServerDeps {
   /** v0.4.2: forwarded to applyOne. When false, skip the post-apply
    *  targeted prune. Default true. Tests usually pass false. */
   pruneAfterApply?: boolean;
+  /** Forwarded to applyOne: pull but don't start services that aren't running. */
+  leaveStopped?: boolean;
   log?: (msg: string) => void;
   /** v0.4.1: notifiers used to send the apply-completion email after a click-Approve runs. */
   notifiers?: Notifier[];
@@ -422,6 +424,7 @@ async function applyRowsAndNotify(
           composeFiles: deps.composeFiles,
           runner: deps.runner,
           pruneAfterApply: deps.pruneAfterApply,
+          leaveStopped: deps.leaveStopped,
           bundlePairedDeps:
             deps.applyPairedDeps !== undefined &&
             isPairedDepBundlingEnabled(deps.applyPairedDeps, r.stack),

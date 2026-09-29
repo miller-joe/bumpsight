@@ -20,6 +20,9 @@ All notable changes to bumpsight are documented here.
   tags by pull + recreate.
 - **Optional Docker Hub credentials** (`BUMPSIGHT_DOCKERHUB_USER` /
   `BUMPSIGHT_DOCKERHUB_TOKEN`, or `_FILE` variants).
+- **Leave stopped services stopped** (`BUMPSIGHT_LEAVE_STOPPED=true`, opt-in).
+  Applying an update to a service that isn't running re-pins and pulls the
+  image without starting the service.
 - **"Not checked" section in the daily digest.** Every image's last
   successful check is recorded; images still deployed but not checked for
   3+ days (or skipped outright) are listed with their last error.
