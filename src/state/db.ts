@@ -1009,7 +1009,8 @@ export function recordImageCheck(
 /**
  * Images still in use (seen by a scan within `seenWithinMs`) that have not
  * been checked successfully for `staleAfterMs` — counting from when bumpsight
- * first saw them if they never succeeded. Oldest success first.
+ * first saw them if they never succeeded — plus any image the scan skipped
+ * outright. Oldest success first.
  */
 export function listStaleImageChecks(
   db: DB,
@@ -1020,7 +1021,11 @@ export function listStaleImageChecks(
     .prepare(
       `SELECT * FROM image_checks
        WHERE last_seen_at >= ?
-         AND COALESCE(last_success_at, first_seen_at) <= ?
+         AND (
+           COALESCE(last_success_at, first_seen_at) <= ?
+           -- a skip is a certainty, not a transient: report it at once
+           OR (last_error LIKE 'skipped:%' AND last_error_at >= COALESCE(last_success_at, 0))
+         )
        ORDER BY COALESCE(last_success_at, 0) ASC, image ASC`,
     )
     .all(now - opts.seenWithinMs, now - opts.staleAfterMs) as ImageCheckRow[];

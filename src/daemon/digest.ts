@@ -4,6 +4,7 @@ import {
   findUndigestedSuppressed,
   getLastDigestSent,
   listNeedsDecision,
+  listStaleImageChecks,
   markDigested,
   recordDigestFired,
 } from "../state/db.js";
@@ -50,7 +51,13 @@ export interface DigestSchedulerDeps {
   log: (msg: string) => void;
   /** Test seam — overrides Date.now() for the scheduler. */
   now?: () => number;
+  /** Flag images not checked successfully for this long. Default 3 days. */
+  staleAfterMs?: number;
 }
+
+const DEFAULT_STALE_AFTER_MS = 3 * 24 * 60 * 60 * 1000;
+/** An image counts as still deployed if a scan saw it this recently. */
+const STILL_IN_USE_MS = 2 * 24 * 60 * 60 * 1000;
 
 export interface DigestRuntime {
   /** Stop the scheduler. Resolves after the in-flight (if any) digest
@@ -117,7 +124,16 @@ export async function runDigestOnce(
       { stack: r.stack, service: r.service },
     );
   });
-  if (rows.length === 0 && needsDecision.length === 0) {
+  // Images the scan has not managed to check in a while. Without this an
+  // image on an unreachable registry, or one that errors on every pass, looks
+  // exactly like one that is up to date.
+  const staleAfterMs = deps.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  const unchecked = listStaleImageChecks(deps.db, {
+    staleAfterMs,
+    seenWithinMs: STILL_IN_USE_MS,
+    now: nowMs,
+  });
+  if (rows.length === 0 && needsDecision.length === 0 && unchecked.length === 0) {
     deps.log("digest: nothing to report — skipping send");
     return false;
   }
@@ -126,6 +142,8 @@ export async function runDigestOnce(
     needsDecision,
     date: new Date(nowMs),
     publicUrl: deps.publicUrl,
+    unchecked,
+    staleAfterDays: Math.round(staleAfterMs / 86_400_000),
   });
   if (!built) return false;
   if (deps.notifiers.length === 0) {
@@ -162,7 +180,7 @@ export async function runDigestOnce(
         `${built.sections.appliedApproved.length} approved, ` +
         `${built.sections.failures.length} failed, ` +
         `${built.sections.suppressedDigests.length} digest-class, ` +
-        `${needsDecision.length} awaiting)`,
+        `${needsDecision.length} awaiting, ${unchecked.length} not checked)`,
     );
     return true;
   }

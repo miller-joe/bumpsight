@@ -1468,21 +1468,7 @@ export function startDaemon(
           applyPairedDeps: deps.applyPairedDeps,
           enrichDigestFn: deps.enrichDigestFn,
         });
-        const ms = Date.now() - started;
-        deps.log(
-          `scan: ${result.scanned} services` +
-            (result.skipped > 0 ? ` (${result.skipped} skipped)` : "") +
-            `, ${result.discovered} new ` +
-            `(${result.autoApplied} auto, ${result.autoAppliedOk} applied ok, ${result.held} held), ${ms}ms`,
-        );
-        for (const [reg, refs] of Object.entries(result.skippedByRegistry)) {
-          deps.log(
-            `scan-skip: registry ${reg} has no client — ${refs.length} image(s) NOT checked: ${refs.join(", ")}`,
-          );
-        }
-        for (const [k, v] of Object.entries(result.errors)) {
-          deps.log(`scan-error: ${k}: ${v}`);
-        }
+        for (const line of formatScanReport(result, Date.now() - started)) deps.log(line);
 
         // v0.6.4: dependency-drift pass. Asks what the parent app's own
         // upstream compose pins at the version we ALREADY run — the question
@@ -1734,6 +1720,33 @@ export function reconcileOpenRows(
     }
   }
   return { dismissed, requeued, stale };
+}
+
+/**
+ * Log lines for a finished scan. The headline separates services that were
+ * checked from ones that could not be — "0 new" alone used to cover both,
+ * so a pass that silently lost a dozen images to rate limits read the same
+ * as a clean one.
+ */
+export function formatScanReport(result: ScanRunResult, ms?: number): string[] {
+  const parts = [`${result.checked} checked`];
+  if (result.unchecked > 0) parts.push(`${result.unchecked} NOT checked (errors)`);
+  if (result.skipped > 0) parts.push(`${result.skipped} skipped`);
+  if (result.localBuilds > 0) parts.push(`${result.localBuilds} local`);
+  const lines = [
+    `scan: ${result.scanned} services (${parts.join(", ")}), ${result.discovered} new ` +
+      `(${result.autoApplied} auto, ${result.autoAppliedOk} applied ok, ${result.held} held)` +
+      (ms !== undefined ? `, ${ms}ms` : ""),
+  ];
+  for (const [reg, refs] of Object.entries(result.skippedByRegistry)) {
+    lines.push(
+      `scan-skip: registry ${reg} has no client — ${refs.length} image(s) NOT checked: ${refs.join(", ")}`,
+    );
+  }
+  for (const [k, v] of Object.entries(result.errors)) {
+    lines.push(`scan-error: ${k}: ${v}`);
+  }
+  return lines;
 }
 
 export function buildComposeFileMap(paths: string[]): Record<string, string> {

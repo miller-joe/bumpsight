@@ -3,10 +3,12 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import {
   startDaemon,
   runScanOnce,
+  formatScanReport,
   buildComposeFileMap,
   reconcileOpenRows,
 } from "../daemon/index.js";
 import { startDigestScheduler } from "../daemon/digest.js";
+import { dockerHubCredentials } from "../registry/http.js";
 import { startDeepPruneScheduler } from "../daemon/deep-prune.js";
 import {
   runWatchedReleasesOnce,
@@ -258,12 +260,13 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       `prune=${cfg.pruneIntervalMs > 0 ? `every ${pruneScheduleRaw}` : "off"}, ` +
       `bundle_paired_deps=${describeBundling(cfg.applyPairedDeps)}, ` +
       `watched_releases=${cfg.watchedReleases.length > 0 ? `${cfg.watchedReleases.length} repo(s) every ${watchIntervalRaw}` : "off"}, ` +
-      `notify_mode=${cfg.notifyMode}, ui_auth=${cfg.uiToken ? "on" : "off"}`,
+      `notify_mode=${cfg.notifyMode}, ui_auth=${cfg.uiToken ? "on" : "off"}, ` +
+      `dockerhub_auth=${dockerHubCredentials() ? "on" : "off (anonymous)"}`,
   );
 
   if (opts.once) {
     const onceRules = applyStackPolicyOverrides(cfg.rules, getAllStackPolicies(db));
-    const rec = reconcileOpenRows(db, onceRules);
+    const rec = reconcileOpenRows(db, onceRules, composeMap);
     if (rec.dismissed + rec.requeued > 0)
       log(`reconcile: ${rec.dismissed} dismissed, ${rec.requeued} requeued for auto-apply`);
     const result = await runScanOnce({
@@ -281,19 +284,7 @@ export async function runDaemon(opts: DaemonCliOptions): Promise<number> {
       outboxKeepCount: cfg.outboxKeepCount,
       applyPairedDeps: cfg.applyPairedDeps,
     });
-    log(
-      `scan: ${result.scanned} services` +
-        (result.skipped > 0 ? ` (${result.skipped} skipped)` : "") +
-        `, ${result.discovered} new (${result.autoApplied} auto, ${result.held} held)`,
-    );
-    for (const [reg, refs] of Object.entries(result.skippedByRegistry)) {
-      log(
-        `scan-skip: registry ${reg} has no client — ${refs.length} image(s) NOT checked: ${refs.join(", ")}`,
-      );
-    }
-    for (const [k, v] of Object.entries(result.errors)) {
-      log(`scan-error: ${k}: ${v}`);
-    }
+    for (const line of formatScanReport(result)) log(line);
     if (cfg.watchedReleases.length > 0) {
       const watch = await runWatchedReleasesOnce({
         db,

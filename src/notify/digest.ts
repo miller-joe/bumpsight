@@ -1,4 +1,4 @@
-import type { UpdateRow } from "../state/db.js";
+import type { ImageCheckRow, UpdateRow } from "../state/db.js";
 import type { NotifyMessage } from "./types.js";
 import { fromDisplay, toDisplay } from "../util/display.js";
 
@@ -97,6 +97,12 @@ export interface BuildDigestOptions {
   date?: Date;
   /** Optional public URL — adds a "/queue" link to the email footer. */
   publicUrl?: string;
+  /** Images the scan has not managed to check for a while (see
+   *  `listStaleImageChecks`). Not consumed — they repeat daily until a check
+   *  succeeds, because each day unchecked is a day an update can hide. */
+  unchecked?: ImageCheckRow[];
+  /** Threshold behind `unchecked`, for the section heading. */
+  staleAfterDays?: number;
 }
 
 export interface DigestEmail {
@@ -111,7 +117,8 @@ export function buildDigestEmail(opts: BuildDigestOptions): DigestEmail | null {
   const sections = categorize(opts.rows);
   const total = totalCount(sections);
   const needsDecision = opts.needsDecision ?? [];
-  if (total === 0 && needsDecision.length === 0) return null;
+  const unchecked = opts.unchecked ?? [];
+  if (total === 0 && needsDecision.length === 0 && unchecked.length === 0) return null;
 
   const date = opts.date ?? new Date();
   const label = dateLabel(date);
@@ -127,11 +134,21 @@ export function buildDigestEmail(opts: BuildDigestOptions): DigestEmail | null {
     summary.push(`${sections.failures.length} failed`);
   if (sections.suppressedDigests.length > 0)
     summary.push(`${sections.suppressedDigests.length} digest-class`);
+  if (unchecked.length > 0) summary.push(`${unchecked.length} not checked`);
 
   const subject = `bumpsight daily digest — ${label} — ${summary.join(", ")}`;
 
-  const body = renderText(sections, label, opts.publicUrl, needsDecision);
-  const htmlBody = renderHtml(sections, label, opts.publicUrl, needsDecision);
+  const staleDays = opts.staleAfterDays ?? 3;
+  const body =
+    renderText(sections, label, opts.publicUrl, needsDecision) +
+    renderUncheckedText(unchecked, staleDays, date);
+  const htmlBody = renderHtml(
+    sections,
+    label,
+    opts.publicUrl,
+    needsDecision,
+    renderUncheckedHtml(unchecked, staleDays, date),
+  );
 
   const rowIds: number[] = [
     ...sections.appliedAuto,
@@ -200,11 +217,57 @@ interface SectionCfg {
   border: string;
 }
 
+function uncheckedWhy(c: ImageCheckRow, now: Date): string {
+  const since = c.last_success_at
+    ? `last checked ${ageLabel(now.getTime() - c.last_success_at)} ago`
+    : "never checked successfully";
+  return c.last_error ? `${since} — ${c.last_error.slice(0, 200)}` : since;
+}
+
+function ageLabel(ms: number): string {
+  const days = Math.floor(ms / 86_400_000);
+  if (days >= 1) return `${days}d`;
+  return `${Math.max(1, Math.floor(ms / 3_600_000))}h`;
+}
+
+function uncheckedHeading(n: number, staleDays: number): string {
+  return `Not checked for ${staleDays}+ days (${n})`;
+}
+
+function renderUncheckedText(rows: ImageCheckRow[], staleDays: number, now: Date): string {
+  if (rows.length === 0) return "";
+  const lines: string[] = [""];
+  lines.push(`───── ${uncheckedHeading(rows.length, staleDays)} ─────`);
+  lines.push("Updates to these images cannot be seen until a check succeeds.");
+  for (const c of rows) {
+    lines.push(`  • ${c.image}${c.used_by ? `  (${c.used_by})` : ""}`);
+    lines.push(`    ${uncheckedWhy(c, now)}`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+function renderUncheckedHtml(rows: ImageCheckRow[], staleDays: number, now: Date): string {
+  if (rows.length === 0) return "";
+  const e = escapeHtml;
+  return `
+      <div style="margin-top:18px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:14px 16px;">
+        <div style="font-size:13px;font-weight:600;color:#991b1b;margin-bottom:8px;">${e(uncheckedHeading(rows.length, staleDays))}</div>
+        <div style="font-size:12px;color:#991b1b;margin-bottom:8px;">Updates to these images cannot be seen until a check succeeds.</div>
+        ${rows
+          .map(
+            (c) =>
+              `<div style="font-size:13px;color:#0f172a;padding:3px 0;"><code style="background:#f1f5f9;padding:1px 5px;border-radius:3px;font-size:12px;">${e(c.image)}</code>${c.used_by ? ` <span style="color:#94a3b8;">·</span> ${e(c.used_by)}` : ""}<div style="font-size:12px;color:#64748b;">${e(uncheckedWhy(c, now))}</div></div>`,
+          )
+          .join("")}
+      </div>`;
+}
+
 function renderHtml(
   sections: DigestSections,
   label: string,
   publicUrl?: string,
   needsDecision: UpdateRow[] = [],
+  uncheckedHtml = "",
 ): string {
   const e = escapeHtml;
   const cfgs: SectionCfg[] = [
@@ -317,6 +380,7 @@ function renderHtml(
   </table>
   <div style="font-size:12px;color:#64748b;">${e(label)}</div>
   ${needsHtml}
+  ${uncheckedHtml}
   ${cfgs.map(sectionHtml).join("")}
   ${queueFooter}
 </td></tr>

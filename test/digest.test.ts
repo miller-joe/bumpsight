@@ -10,6 +10,7 @@ import {
   findUndigestedSuppressed,
   getLastDigestSent,
   markDigested,
+  recordImageCheck,
   type UpdateRow,
 } from "../src/state/db.js";
 import type { Database as DB } from "better-sqlite3";
@@ -421,5 +422,64 @@ describe("v0.6.0 needs-your-decision section", () => {
     const row = findUpdate(db, id)!;
     expect(row.status).toBe("notified");
     expect(row.digested_at).toBeNull();
+  });
+});
+
+describe("not-checked images in the daily digest", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const NOW = 1_800_000_000_000;
+
+  it("flags an image with no successful check for 3+ days, and only that one", async () => {
+    // Failing since first seen five days ago, still deployed (seen today).
+    recordImageCheck(db, "registry.example.com/org/app:1.25.5", ["git/server"], "boom", NOW - 5 * DAY);
+    recordImageCheck(db, "registry.example.com/org/app:1.25.5", ["git/server"], "429 Too Many Requests", NOW - DAY / 4);
+    // Checked fine an hour ago.
+    recordImageCheck(db, "nginx:1.27", ["web/nginx"], undefined, NOW - 3_600_000);
+    // Failing, but only for a day: not yet stale.
+    recordImageCheck(db, "someorg/new:1.0.0", ["new/app"], "boom", NOW - DAY);
+    // Stale but no longer deployed (not seen for a week).
+    recordImageCheck(db, "someorg/gone:1.0.0", ["old/app"], "boom", NOW - 7 * DAY);
+
+    const sent: NotifyMessage[] = [];
+    const notifier: Notifier = { name: "stub", send: async (m) => void sent.push(m) };
+    const ok = await runDigestOnce({
+      db,
+      notifiers: [notifier],
+      hour: 18,
+      log: () => {},
+      now: () => NOW,
+    });
+    expect(ok).toBe(true);
+    const msg = sent[0]!;
+    expect(msg.subject).toContain("1 not checked");
+    expect(msg.body).toContain("Not checked for 3+ days (1)");
+    expect(msg.body).toContain("registry.example.com/org/app:1.25.5  (git/server)");
+    expect(msg.body).toContain("never checked successfully — 429 Too Many Requests");
+    expect(msg.body).not.toContain("nginx:1.27");
+    expect(msg.body).not.toContain("someorg/new");
+    expect(msg.body).not.toContain("someorg/gone");
+    expect(msg.htmlBody).toContain("Not checked for 3+ days (1)");
+  });
+
+  it("reports a skipped image immediately", () => {
+    recordImageCheck(db, "odd.example/app:1", ["x/app"], "skipped: registry odd.example has no client", NOW);
+    const built = buildDigestEmail({
+      rows: [],
+      unchecked: [
+        {
+          image: "odd.example/app:1",
+          used_by: "x/app",
+          first_seen_at: NOW,
+          last_seen_at: NOW,
+          last_success_at: null,
+          last_error: "skipped: registry odd.example has no client",
+          last_error_at: NOW,
+        },
+      ],
+      date: new Date(NOW),
+    });
+    expect(built).not.toBeNull();
+    expect(built!.rowIds).toEqual([]);
+    expect(built!.message.body).toContain("skipped: registry odd.example has no client");
   });
 });

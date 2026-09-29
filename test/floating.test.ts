@@ -412,3 +412,26 @@ describe("scan accounting", () => {
     expect(stale[0]!.last_success_at).toBeNull();
   });
 });
+
+describe("formatScanReport", () => {
+  it("says how many services were NOT checked instead of only '0 new'", async () => {
+    const { formatScanReport } = await import("../src/daemon/index.js");
+    const lines = formatScanReport({
+      scanned: 10,
+      discovered: 0,
+      autoApplied: 0,
+      autoAppliedOk: 0,
+      held: 0,
+      errors: { "someorg/app:1.0.0": "Docker Hub: 429 Too Many Requests" },
+      skipped: 0,
+      skippedByRegistry: {},
+      checked: 7,
+      unchecked: 1,
+      localBuilds: 2,
+    });
+    expect(lines[0]).toBe(
+      "scan: 10 services (7 checked, 1 NOT checked (errors), 2 local), 0 new (0 auto, 0 applied ok, 0 held)",
+    );
+    expect(lines[1]).toBe("scan-error: someorg/app:1.0.0: Docker Hub: 429 Too Many Requests");
+  });
+});
