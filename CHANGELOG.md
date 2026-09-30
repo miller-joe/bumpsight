@@ -2,7 +2,10 @@
 
 All notable changes to bumpsight are documented here.
 
-## Unreleased
+## 0.7.0 — 2026-09-29
+
+0.6.4 was never published, so this release also ships everything listed under
+0.6.4 below.
 
 ### Added
 
@@ -46,8 +49,11 @@ All notable changes to bumpsight are documented here.
 - `${VAR:-default}` in an `image:` line is resolved against the stack's `.env`.
 - Services with `build:`, and bare names Docker Hub does not know, count as
   local builds instead of errors.
+- Committing a compose bump failed with `env: can't execute 'python3'` in any
+  stack repo whose pre-commit hook is a Python script. The image now includes
+  `python3`, so those hooks run on bumpsight's commits.
 
-## 0.6.4 — 2026-08-19
+## 0.6.4 — 2026-08-19 (never published; shipped in 0.7.0)
 
 The theme: bumpsight trusted its own stored record of the world instead of
 re-reading the world, and only ever asked the registry's question.
