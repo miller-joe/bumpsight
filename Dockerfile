@@ -28,7 +28,9 @@ FROM node:20-alpine AS runtime
 # any TZ as UTC.
 # git: optional, for BUMPSIGHT_GIT_COMMIT — commits the rewritten compose when
 # the target stack dir is a git working copy. No-op when the feature is off.
-RUN apk add --no-cache docker-cli docker-cli-compose tini tzdata git
+# python3: so a stack repo's Python pre-commit hook (e.g. a leak guard) can run
+# on bumpsight's commits instead of failing them with "can't execute python3".
+RUN apk add --no-cache docker-cli docker-cli-compose tini tzdata git python3
 
 ENV NODE_ENV=production
 WORKDIR /app
